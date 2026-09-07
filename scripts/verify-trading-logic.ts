@@ -24,8 +24,9 @@ const fakeConfig = {
 };
 
 const fakeGamma = {
+  currentIntervalStartTimestampSec: () => 700,
   currentIntervalCloseTimestampSec: () => 1000,
-  buildSlugForClose: (ts: number) => `btc-updown-5m-${ts}`,
+  buildSlugForStart: (ts: number) => `btc-updown-5m-${ts}`,
   fetchMarketBySlug: async () => null,
   fetchOutcome: async () => null,
 };

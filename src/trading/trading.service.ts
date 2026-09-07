@@ -158,8 +158,9 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async discoveryTick(): Promise<void> {
+    const startTs = this.gamma.currentIntervalStartTimestampSec();
     const closeTs = this.gamma.currentIntervalCloseTimestampSec();
-    const slug = this.gamma.buildSlugForClose(closeTs);
+    const slug = this.gamma.buildSlugForStart(startTs);
 
     if (this.activeMarket?.slug === slug) return; // уже отслеживаем этот интервал
 

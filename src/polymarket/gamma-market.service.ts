@@ -43,22 +43,28 @@ export class GammaMarketService {
   }
 
   /**
-   * Слаг текущего 5-минутного интервала — совпадает с таймстампом его закрытия,
-   * например btc-updown-5m-1788724500.
+   * Слаг 5-минутного интервала — по факту (проверено на живых данных)
+   * совпадает с таймстампом НАЧАЛА интервала, не закрытия:
+   * https://polymarket.com/event/btc-updown-5m-1788782100 — это интервал,
+   * который НАЧАЛСЯ в 1788782100 и закрывается в 1788782100+300.
    */
-  buildSlugForClose(closeTimestampSec: number): string {
-    return `${this.slugPrefix}-${closeTimestampSec}`;
+  buildSlugForStart(startTimestampSec: number): string {
+    return `${this.slugPrefix}-${startTimestampSec}`;
+  }
+
+  currentIntervalStartTimestampSec(nowMs = Date.now()): number {
+    const nowSec = Math.floor(nowMs / 1000);
+    return Math.floor(nowSec / this.intervalSec) * this.intervalSec;
   }
 
   currentIntervalCloseTimestampSec(nowMs = Date.now()): number {
-    const nowSec = Math.floor(nowMs / 1000);
-    const slotStart = Math.floor(nowSec / this.intervalSec) * this.intervalSec;
-    return slotStart + this.intervalSec;
+    return this.currentIntervalStartTimestampSec(nowMs) + this.intervalSec;
   }
 
   async fetchCurrentMarket(): Promise<CurrentMarketInfo | null> {
-    const closeTs = this.currentIntervalCloseTimestampSec();
-    const slug = this.buildSlugForClose(closeTs);
+    const startTs = this.currentIntervalStartTimestampSec();
+    const closeTs = startTs + this.intervalSec;
+    const slug = this.buildSlugForStart(startTs);
     return this.fetchMarketBySlug(slug, closeTs);
   }
 
