@@ -12,6 +12,9 @@ export interface BestQuote {
   bestBid: BookLevel | null;
   tickSize: string | null;
   negRisk: boolean;
+  // Реальный минимум биржи для этого маркета (штук токена), из поля
+  // min_order_size REST-ответа. Используется и для маркет-, и для лимит-ордеров.
+  minOrderSize: number | null;
 }
 
 /**
@@ -58,6 +61,9 @@ export class ClobPublicService {
         bestBid,
         tickSize: data?.tick_size ?? null,
         negRisk: Boolean(data?.neg_risk),
+        minOrderSize: Number.isFinite(parseFloat(data?.min_order_size))
+          ? parseFloat(data.min_order_size)
+          : null,
       };
     } catch (err) {
       // 404 "No orderbook exists" — нормально для только что созданного маркета.

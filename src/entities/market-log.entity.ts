@@ -14,9 +14,16 @@ export type MarketLogStatus =
   | 'win'
   | 'loss'
   | 'skipped'
+  | 'unfilled'
   | 'error';
 
 export type ChosenOutcome = 'YES' | 'NO' | null;
+
+export type OrderKind =
+  | 'FAK' // реальный маркет-тейк (Правило A)
+  | 'GTD' // реальная лимитка (Правило B)
+  | 'SIMULATED_MARKET' // смоук-эмуляция Правила A
+  | 'SIMULATED_LIMIT'; // смоук-эмуляция Правила B
 
 @Entity('market_logs')
 export class MarketLog {
@@ -53,15 +60,19 @@ export class MarketLog {
   @Column({ type: 'double precision', default: 1 })
   betAmount: number;
 
-  // true = ордер (реальный или симулированный) был отправлен; false = шаг пропущен фильтрами
+  // true = ордер (реальный или симулированный) реально исполнился (хотя бы частично)
   @Column({ type: 'boolean', default: false })
   executed: boolean;
 
   @Column({ type: 'boolean' })
   isSmoke: boolean;
 
-  @Column({ type: 'varchar', length: 16, nullable: true })
-  orderType: 'FOK' | 'SIMULATED' | null;
+  @Column({ type: 'varchar', length: 24, nullable: true })
+  orderType: OrderKind | null;
+
+  // Для лимиток (Правило B): какой ценовой уровень был выставлен последним (T1/T2/T3).
+  @Column({ type: 'varchar', length: 8, nullable: true })
+  limitTier: 'T1' | 'T2' | 'T3' | null;
 
   @Column({ type: 'varchar', length: 128, nullable: true })
   orderId: string | null;

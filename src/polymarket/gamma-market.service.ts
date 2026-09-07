@@ -53,7 +53,7 @@ export class GammaMarketService {
   currentIntervalCloseTimestampSec(nowMs = Date.now()): number {
     const nowSec = Math.floor(nowMs / 1000);
     const slotStart = Math.floor(nowSec / this.intervalSec) * this.intervalSec;
-    return slotStart;
+    return slotStart + this.intervalSec;
   }
 
   async fetchCurrentMarket(): Promise<CurrentMarketInfo | null> {

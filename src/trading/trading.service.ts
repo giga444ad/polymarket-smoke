@@ -1,30 +1,60 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Attempt } from '../entities/attempt.entity';
-import { MarketLog } from '../entities/market-log.entity';
+import { ChosenOutcome, MarketLog, MarketLogStatus, OrderKind } from '../entities/market-log.entity';
 import { GammaMarketService } from '../polymarket/gamma-market.service';
 import { ClobPublicService } from '../polymarket/clob-public.service';
 import { PolymarketTraderService } from '../polymarket/polymarket-trader.service';
+import { LiveQuote, MarketWsStream, Outcome } from '../polymarket/market-ws-stream';
+
+type LimitTier = 'T1' | 'T2' | 'T3';
+
+interface RestingOrder {
+  tier: LimitTier;
+  outcome: Outcome;
+  price: number;
+  // null в смоуке (ничего реального не выставляли)
+  orderId: string | null;
+}
+
+interface MarketState {
+  slug: string;
+  closesAt: Date;
+  yesTokenId: string;
+  noTokenId: string;
+  negRisk: boolean;
+  minOrderSize: number;
+  stream: MarketWsStream;
+  quotes: Record<Outcome, LiveQuote>;
+  positioned: boolean;
+  finalized: boolean;
+  logWritten: boolean;
+  restingOrder: RestingOrder | null;
+  lastMarketAttemptAt: number;
+  closeTimer: NodeJS.Timeout;
+}
 
 @Injectable()
-export class TradingService implements OnModuleInit {
+export class TradingService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(TradingService.name);
 
   private isSmoke: boolean;
   private betAmount: number;
-  private minPrice: number;
-  private maxPrice: number;
-  private secondsBeforeClose: number;
+  private minMarketPrice: number;
+  private maxMarketPrice: number;
+  private favoriteBidThreshold: number;
+  private tierPrices: Record<LimitTier, number>;
+  private tier2Seconds: number;
+  private tier3Seconds: number;
+  private maxOverspendMultiplier: number;
   private targetSteps: number;
-  private pollFarMs: number;
-  private pollNearMs: number;
+  private discoveryPollMs: number;
   private resolvePollMs: number;
-  private nearWindowSec: number;
 
   private currentAttempt: Attempt;
-  private lastProcessedSlug = '';
+  private activeMarket: MarketState | null = null;
   private stopped = false;
 
   constructor(
@@ -33,40 +63,28 @@ export class TradingService implements OnModuleInit {
     private readonly clobPublic: ClobPublicService,
     private readonly trader: PolymarketTraderService,
     @InjectRepository(Attempt) private readonly attemptRepo: Repository<Attempt>,
-    @InjectRepository(MarketLog)
-    private readonly marketLogRepo: Repository<MarketLog>,
+    @InjectRepository(MarketLog) private readonly marketLogRepo: Repository<MarketLog>,
   ) {
     this.isSmoke = this.config.get<string>('SMOKE_START', 'true') === 'true';
     this.betAmount = parseFloat(this.config.get<string>('BET_AMOUNT', '1'));
-    this.minPrice = parseFloat(
-      this.config.get<string>('MIN_ENTRY_PRICE', '0.98'),
+    this.minMarketPrice = parseFloat(this.config.get<string>('MIN_MARKET_PRICE', '0.99'));
+    this.maxMarketPrice = parseFloat(this.config.get<string>('MAX_MARKET_PRICE', '0.999'));
+    this.favoriteBidThreshold = parseFloat(
+      this.config.get<string>('FAVORITE_BID_THRESHOLD', '0.90'),
     );
-    this.maxPrice = parseFloat(
-      this.config.get<string>('MAX_ENTRY_PRICE', '0.99'),
+    this.tierPrices = {
+      T1: parseFloat(this.config.get<string>('LIMIT_TIER1_PRICE', '0.99')),
+      T2: parseFloat(this.config.get<string>('LIMIT_TIER2_PRICE', '0.995')),
+      T3: parseFloat(this.config.get<string>('LIMIT_TIER3_PRICE', '0.999')),
+    };
+    this.tier2Seconds = parseInt(this.config.get<string>('LIMIT_TIER2_SECONDS', '150'), 10);
+    this.tier3Seconds = parseInt(this.config.get<string>('LIMIT_TIER3_SECONDS', '60'), 10);
+    this.maxOverspendMultiplier = parseFloat(
+      this.config.get<string>('MAX_OVERSPEND_MULTIPLIER', '1.5'),
     );
-    this.secondsBeforeClose = parseInt(
-      this.config.get<string>('SECONDS_BEFORE_CLOSE', '5'),
-      10,
-    );
-    this.targetSteps = parseInt(
-      this.config.get<string>('TARGET_STEPS', '500'),
-      10,
-    );
-    this.pollFarMs = parseInt(
-      this.config.get<string>('POLL_INTERVAL_MS_FAR', '2000'),
-      10,
-    );
-    this.pollNearMs = parseInt(
-      this.config.get<string>('POLL_INTERVAL_MS_NEAR', '500'),
-      10,
-    );
-    this.resolvePollMs = parseInt(
-      this.config.get<string>('RESOLVE_POLL_INTERVAL_MS', '10000'),
-      10,
-    );
-    // Начинаем следить за рынком чуть раньше, чем реально готовы покупать,
-    // чтобы не проспать узкое окно секунд.
-    this.nearWindowSec = Math.max(10, this.secondsBeforeClose + 5);
+    this.targetSteps = parseInt(this.config.get<string>('TARGET_STEPS', '500'), 10);
+    this.discoveryPollMs = parseInt(this.config.get<string>('MARKET_DISCOVERY_POLL_MS', '1500'), 10);
+    this.resolvePollMs = parseInt(this.config.get<string>('RESOLVE_POLL_INTERVAL_MS', '10000'), 10);
   }
 
   async onModuleInit() {
@@ -76,7 +94,7 @@ export class TradingService implements OnModuleInit {
       } catch (err) {
         this.logger.error(
           `Не удалось инициализировать боевой торговый клиент — принудительно ` +
-            `переключаюсь в SMOKE-режим, чтобы не остаться без защиты ночью. Причина: ${this.errMsg(err)}`,
+            `переключаюсь в SMOKE-режим. Причина: ${this.errMsg(err)}`,
         );
         this.isSmoke = true;
       }
@@ -86,15 +104,20 @@ export class TradingService implements OnModuleInit {
     this.logger.log(
       `Старт. Режим: ${this.isSmoke ? 'SMOKE (без реальных ордеров)' : 'LIVE (реальные деньги)'}. ` +
         `Попытка #${this.currentAttempt.attemptNumber}, шаг ${this.currentAttempt.currentStep}/${this.currentAttempt.targetSteps}. ` +
-        `Диапазон входа [¢${this.minPrice * 100}-¢${this.maxPrice * 100}], вход за ${this.secondsBeforeClose}с до закрытия.`,
+        `Маркет-тейк [¢${this.minMarketPrice * 100}-¢${this.maxMarketPrice * 100}], ` +
+        `лимитки-фолбэк от ¢${this.favoriteBidThreshold * 100} (тиры ${this.tierPrices.T1 * 100}/${this.tierPrices.T2 * 100}/${this.tierPrices.T3 * 100}).`,
     );
 
-    this.startEngineLoop();
+    this.startDiscoveryLoop();
     this.startResolverLoop();
   }
 
   onModuleDestroy() {
     this.stopped = true;
+    if (this.activeMarket) {
+      clearTimeout(this.activeMarket.closeTimer);
+      this.activeMarket.stream.close();
+    }
   }
 
   private async getOrCreateActiveAttempt(): Promise<Attempt> {
@@ -120,234 +143,429 @@ export class TradingService implements OnModuleInit {
   }
 
   // ---------------------------------------------------------------------
-  // Основной цикл: находим текущий 5м маркет и ловим последние секунды.
+  // Обнаружение маркета: раз в discoveryPollMs проверяем, не начался ли
+  // новый 5-минутный интервал, и если да — открываем WS на весь его срок.
   // ---------------------------------------------------------------------
-  private async startEngineLoop() {
+  private async startDiscoveryLoop() {
     while (!this.stopped) {
       try {
-        await this.tick();
+        await this.discoveryTick();
       } catch (err) {
-        this.logger.error(`Сбой в основном цикле: ${this.errMsg(err)}`);
-        await this.sleep(this.pollFarMs);
+        this.logger.error(`Сбой в цикле обнаружения маркета: ${this.errMsg(err)}`);
       }
+      await this.sleep(this.discoveryPollMs);
     }
   }
 
-  private async tick(): Promise<void> {
-    const market = await this.gamma.fetchCurrentMarket();
-    if (!market) {
-      await this.sleep(this.pollFarMs);
-      return;
-    }
+  private async discoveryTick(): Promise<void> {
+    const closeTs = this.gamma.currentIntervalCloseTimestampSec();
+    const slug = this.gamma.buildSlugForClose(closeTs);
 
-    if (market.slug === this.lastProcessedSlug) {
-      await this.sleep(this.pollNearMs);
-      return;
-    }
+    if (this.activeMarket?.slug === slug) return; // уже отслеживаем этот интервал
 
-    const timeLeftSec = (market.closesAt.getTime() - Date.now()) / 1000;
+    const market = await this.gamma.fetchMarketBySlug(slug, closeTs);
+    if (!market) return; // маркет ещё не создан на Gamma — попробуем на следующем тике
 
-    if (timeLeftSec > this.nearWindowSec) {
-      await this.sleep(this.pollFarMs);
-      return;
-    }
-
-    if (timeLeftSec <= 0) {
-      // Проспали окно (например, после сбоя сети) — фиксируем как пропуск и едем дальше.
-      await this.recordSkippedMarket(market.slug, market.closesAt, 'Окно входа пропущено (timeLeftSec <= 0)');
-      this.lastProcessedSlug = market.slug;
-      return;
-    }
-
-    if (timeLeftSec > this.secondsBeforeClose) {
-      await this.sleep(this.pollNearMs);
-      return;
-    }
-
-    // Финальное окно — принимаем решение и больше не возвращаемся к этому слагу.
-    this.lastProcessedSlug = market.slug;
-    await this.evaluateAndAct(market.slug, market.closesAt, market.yesTokenId, market.noTokenId, market.negRisk);
+    await this.openMarket(market.slug, market.closesAt, market.yesTokenId, market.noTokenId, market.negRisk);
   }
 
-  private async evaluateAndAct(
+  private async openMarket(
     slug: string,
     closesAt: Date,
     yesTokenId: string,
     noTokenId: string,
     negRisk: boolean,
   ): Promise<void> {
-    const [yesQuote, noQuote] = await Promise.all([
+    // Разовый REST-бутстрап: тик-сайз + официальный минимальный размер ордера биржи.
+    const [yesBoot, noBoot] = await Promise.all([
       this.clobPublic.getBestQuote(yesTokenId),
       this.clobPublic.getBestQuote(noTokenId),
     ]);
+    const initialTickSize = yesBoot?.tickSize ?? noBoot?.tickSize ?? '0.01';
+    const minOrderSize = yesBoot?.minOrderSize ?? noBoot?.minOrderSize ?? 5;
 
-    type Candidate = {
-      outcome: 'YES' | 'NO';
-      tokenId: string;
-      price: number;
-      tickSize: string;
+    const marketState: MarketState = {
+      slug,
+      closesAt,
+      yesTokenId,
+      noTokenId,
+      negRisk,
+      minOrderSize,
+      stream: null as any, // назначим сразу ниже
+      quotes: {
+        YES: {
+          bestBid: yesBoot?.bestBid?.price ?? null,
+          bestAsk: yesBoot?.bestAsk?.price ?? null,
+          tickSize: initialTickSize,
+        },
+        NO: {
+          bestBid: noBoot?.bestBid?.price ?? null,
+          bestAsk: noBoot?.bestAsk?.price ?? null,
+          tickSize: initialTickSize,
+        },
+      },
+      positioned: false,
+      finalized: false,
+      logWritten: false,
+      restingOrder: null,
+      lastMarketAttemptAt: 0,
+      closeTimer: null as any,
     };
 
-    const candidates: Candidate[] = [];
+    const stream = new MarketWsStream(
+      yesTokenId,
+      noTokenId,
+      initialTickSize,
+      (outcome, quote) => this.onQuoteUpdate(marketState, outcome, quote),
+    );
+    marketState.stream = stream;
 
-    for (const [outcome, tokenId, quote] of [
-      ['YES', yesTokenId, yesQuote],
-      ['NO', noTokenId, noQuote],
-    ] as const) {
-      if (!quote?.bestAsk) continue;
-      const { price, size } = quote.bestAsk;
-      const hasDepth = price * size >= this.betAmount;
-      if (price >= this.minPrice && price <= this.maxPrice && hasDepth) {
-        candidates.push({
-          outcome,
-          tokenId,
-          price,
-          tickSize: quote.tickSize ?? '0.01',
+    const msUntilClose = Math.max(0, closesAt.getTime() - Date.now());
+    marketState.closeTimer = setTimeout(() => this.finalizeMarket(marketState), msUntilClose);
+
+    this.activeMarket = marketState;
+    stream.connect();
+
+    this.logger.log(
+      `[Market] ${slug}: открыт WS-поток (закрытие через ${(msUntilClose / 1000).toFixed(0)}с, min_order_size=${minOrderSize}, tick=${initialTickSize})`,
+    );
+  }
+
+  // ---------------------------------------------------------------------
+  // Реакция на каждое обновление стакана (book / best_bid_ask / price_change / tick_size_change)
+  // ---------------------------------------------------------------------
+  private onQuoteUpdate(marketState: MarketState, outcome: Outcome, quote: LiveQuote): void {
+    marketState.quotes[outcome] = quote;
+    if (marketState.positioned || marketState.finalized) return;
+
+    const timeLeftSec = (marketState.closesAt.getTime() - Date.now()) / 1000;
+    if (timeLeftSec <= 0) return; // finalizeMarket сам разберётся по таймеру
+
+    // 0) Если по этому исходу уже стоит наша (смоук-)лимитка — проверяем, не "исполнилась" ли она.
+    //    В смоуке мы не отправляем реальный ордер, поэтому эмулируем исполнение: если чужой
+    //    ask опустился до нашей цены или ниже — считаем, что нас бы исполнили.
+    if (this.isSmoke && marketState.restingOrder?.outcome === outcome) {
+      const resting = marketState.restingOrder;
+      if (quote.bestAsk != null && quote.bestAsk <= resting.price) {
+        marketState.positioned = true;
+        marketState.restingOrder = null;
+        void this.writeLog(marketState, {
+          chosenOutcome: outcome,
+          chosenTokenId: outcome === 'YES' ? marketState.yesTokenId : marketState.noTokenId,
+          entryPrice: resting.price,
+          executed: true,
+          orderType: 'SIMULATED_LIMIT',
+          limitTier: resting.tier,
+          status: 'pending_resolve',
+          logMessage: 'SMOKE: лимитка не отправлялась на биржу, только эмуляция исполнения.',
         });
+        this.logger.log(
+          `[SMOKE][Limit fill] ${marketState.slug}: ${outcome} по ¢${(resting.price * 100).toFixed(2)} (тир ${resting.tier})`,
+        );
+        return;
       }
     }
 
-    if (candidates.length === 0) {
-      const reason = this.describeSkip(yesQuote?.bestAsk?.price, noQuote?.bestAsk?.price);
-      await this.recordSkippedMarket(slug, closesAt, reason);
-      this.logger.log(`[Skip] ${slug}: ${reason}`);
-      return;
+    // 1) Правило A — агрессивный маркет-тейк с потолком цены.
+    for (const oc of ['YES', 'NO'] as const) {
+      const q = marketState.quotes[oc];
+      if (q.bestAsk != null && q.bestAsk >= this.minMarketPrice && q.bestAsk <= this.maxMarketPrice) {
+        const now = Date.now();
+        if (now - marketState.lastMarketAttemptAt < 800) continue; // не долбим биржу на каждом тике подряд
+        marketState.lastMarketAttemptAt = now;
+        void this.tryMarketBuy(marketState, oc, q);
+        return;
+      }
     }
 
-    // Из подходящих исходов берём тот, что ближе к ¢99 — он "увереннее".
-    const chosen = candidates.reduce((best, c) => (c.price > best.price ? c : best));
+    // 2) Правило B — лимитка-фолбэк, если у фаворита реально нет предложений на продажу.
+    const favorite = this.pickFavorite(marketState.quotes);
+    if (!favorite) return;
+    const fq = marketState.quotes[favorite];
+    if (fq.bestBid == null || fq.bestBid < this.favoriteBidThreshold) return;
+    if (fq.bestAsk != null && fq.bestAsk <= this.maxMarketPrice) return; // предложение есть — им займётся Правило A
 
-    if (this.isSmoke) {
-      await this.recordSimulatedBuy(slug, closesAt, chosen.outcome, chosen.tokenId, chosen.price);
-      this.logger.log(
-        `[SMOKE] ${slug}: выставлена бы лимитка ${chosen.outcome} по ¢${(chosen.price * 100).toFixed(1)} — возможен выигрыш.`,
-      );
-      return;
+    const tier = this.computeTier(timeLeftSec);
+    const desiredPrice = this.roundToTick(this.tierPrices[tier], fq.tickSize);
+    const existing = marketState.restingOrder;
+    if (existing && existing.tier === tier && existing.outcome === favorite) return; // уже стоит нужный уровень
+
+    void this.placeOrReplaceLimit(marketState, favorite, tier, desiredPrice, fq.tickSize);
+  }
+
+  private pickFavorite(quotes: Record<Outcome, LiveQuote>): Outcome | null {
+    const yes = quotes.YES.bestBid;
+    const no = quotes.NO.bestBid;
+    if (yes == null && no == null) return null;
+    if (yes == null) return 'NO';
+    if (no == null) return 'YES';
+    return yes >= no ? 'YES' : 'NO';
+  }
+
+  private computeTier(timeLeftSec: number): LimitTier {
+    if (timeLeftSec > this.tier2Seconds) return 'T1';
+    if (timeLeftSec > this.tier3Seconds) return 'T2';
+    return 'T3';
+  }
+
+  private roundToTick(price: number, tickSizeStr: string): number {
+    const tick = parseFloat(tickSizeStr) || 0.01;
+    const decimals = (tickSizeStr.split('.')[1] ?? '').length || 2;
+    let rounded = Math.round(price / tick) * tick;
+    const max = 1 - tick;
+    rounded = Math.min(Math.max(rounded, tick), max);
+    return Number(rounded.toFixed(decimals));
+  }
+
+  // ---------------------------------------------------------------------
+  // Правило A: маркет-тейк (FAK) с потолком цены maxMarketPrice
+  // ---------------------------------------------------------------------
+  private async tryMarketBuy(marketState: MarketState, outcome: Outcome, quote: LiveQuote): Promise<void> {
+    const tokenId = outcome === 'YES' ? marketState.yesTokenId : marketState.noTokenId;
+    const estimatedShares = this.betAmount / quote.bestAsk!;
+
+    if (estimatedShares < marketState.minOrderSize) {
+      const neededUsd = marketState.minOrderSize * quote.bestAsk!;
+      if (neededUsd > this.betAmount * this.maxOverspendMultiplier) {
+        this.logger.debug(
+          `[Market] ${marketState.slug}: пропуск ${outcome} по ¢${(quote.bestAsk! * 100).toFixed(2)} — ` +
+            `нужно ~$${neededUsd.toFixed(2)} для минимума биржи (${marketState.minOrderSize} шт.), больше допустимого перерасхода.`,
+        );
+        return;
+      }
     }
 
     try {
-      const size = Number((this.betAmount / chosen.price).toFixed(2));
-      const result = await this.trader.placeFokBuy({
-        tokenId: chosen.tokenId,
-        price: chosen.price,
-        size,
-        tickSize: chosen.tickSize,
-        negRisk,
+      if (this.isSmoke) {
+        marketState.positioned = true;
+        await this.cancelRestingIfAny(marketState);
+        await this.writeLog(marketState, {
+          chosenOutcome: outcome,
+          chosenTokenId: tokenId,
+          entryPrice: quote.bestAsk,
+          executed: true,
+          orderType: 'SIMULATED_MARKET',
+          status: 'pending_resolve',
+          logMessage: 'SMOKE: маркет-ордер не отправлялся, только эмуляция.',
+        });
+        this.logger.log(
+          `[SMOKE][Market] ${marketState.slug}: ${outcome} по ¢${(quote.bestAsk! * 100).toFixed(2)}`,
+        );
+        return;
+      }
+
+      const result = await this.trader.placeMarketBuy({
+        tokenId,
+        amountUsd: this.betAmount,
+        worstPrice: this.maxMarketPrice,
+        tickSize: quote.tickSize,
+        negRisk: marketState.negRisk,
       });
-      await this.recordRealBuy(slug, closesAt, chosen.outcome, chosen.tokenId, chosen.price, result.orderId);
+
+      if (!result.success) {
+        this.logger.warn(`[LIVE][Market] ${marketState.slug}: ордер не исполнился (success=false), пробуем дальше`);
+        return;
+      }
+
+      marketState.positioned = true;
+      await this.cancelRestingIfAny(marketState);
+      await this.writeLog(marketState, {
+        chosenOutcome: outcome,
+        chosenTokenId: tokenId,
+        entryPrice: quote.bestAsk,
+        executed: true,
+        orderType: 'FAK',
+        orderId: result.orderId,
+        status: 'pending_resolve',
+      });
       this.logger.log(
-        `[LIVE] ${slug}: ордер отправлен, ${chosen.outcome} по ¢${(chosen.price * 100).toFixed(1)}, orderId=${result.orderId}`,
+        `[LIVE][Market] ${marketState.slug}: ${outcome} ордер отправлен (потолок ¢${(this.maxMarketPrice * 100).toFixed(1)}), orderId=${result.orderId}`,
       );
     } catch (err) {
-      await this.recordErrorMarket(slug, closesAt, chosen.outcome, chosen.price, this.errMsg(err));
-      this.logger.error(`[Error] ${slug}: не удалось отправить ордер — ${this.errMsg(err)}`);
+      this.logger.error(`[Error][Market] ${marketState.slug}: ${this.errMsg(err)}`);
     }
   }
 
-  private describeSkip(yesAsk?: number, noAsk?: number): string {
-    const fmt = (p?: number) => (p === undefined ? 'нет стакана' : `¢${(p * 100).toFixed(1)}`);
-    return `цена вне диапазона [¢${this.minPrice * 100}-¢${this.maxPrice * 100}] или нет глубины (YES ask=${fmt(yesAsk)}, NO ask=${fmt(noAsk)})`;
+  // ---------------------------------------------------------------------
+  // Правило B: лимитка-фолбэк, переставляется по тирам T1(¢99)/T2(¢99.5)/T3(¢99.9)
+  // ---------------------------------------------------------------------
+  private async placeOrReplaceLimit(
+    marketState: MarketState,
+    outcome: Outcome,
+    tier: LimitTier,
+    price: number,
+    tickSize: string,
+  ): Promise<void> {
+    try {
+      const tokenId = outcome === 'YES' ? marketState.yesTokenId : marketState.noTokenId;
+      let size = Number((this.betAmount / price).toFixed(2));
+
+      if (size < marketState.minOrderSize) {
+        const neededUsd = marketState.minOrderSize * price;
+        if (neededUsd > this.betAmount * this.maxOverspendMultiplier) {
+          this.logger.debug(
+            `[Limit] ${marketState.slug}: пропуск тира ${tier} — нужно ~$${neededUsd.toFixed(2)} для минимума биржи, больше допустимого.`,
+          );
+          return;
+        }
+        size = marketState.minOrderSize;
+      }
+
+      if (this.isSmoke) {
+        marketState.restingOrder = { tier, outcome, price, orderId: null };
+        this.logger.log(
+          `[SMOKE][Limit] ${marketState.slug}: тир ${tier} — ${outcome} по ¢${(price * 100).toFixed(2)} (эмуляция, ждём пересечения)`,
+        );
+        return;
+      }
+
+      await this.cancelRestingIfAny(marketState);
+      const result = await this.trader.placeLimitBuy({
+        tokenId,
+        price,
+        size,
+        tickSize,
+        negRisk: marketState.negRisk,
+        expirationUnixSec: Math.floor(marketState.closesAt.getTime() / 1000),
+      });
+
+      if (!result.success || !result.orderId) {
+        this.logger.warn(`[LIVE][Limit] ${marketState.slug}: не удалось выставить тир ${tier}`);
+        return;
+      }
+
+      marketState.restingOrder = { tier, outcome, price, orderId: result.orderId };
+      this.logger.log(
+        `[LIVE][Limit] ${marketState.slug}: тир ${tier} — ${outcome} по ¢${(price * 100).toFixed(2)} выставлен, orderId=${result.orderId}`,
+      );
+    } catch (err) {
+      this.logger.error(`[Error][Limit] ${marketState.slug}: ${this.errMsg(err)}`);
+    }
+  }
+
+  private async cancelRestingIfAny(marketState: MarketState): Promise<void> {
+    if (marketState.restingOrder?.orderId) {
+      await this.trader.cancelOrder(marketState.restingOrder.orderId);
+    }
+    marketState.restingOrder = null;
   }
 
   // ---------------------------------------------------------------------
-  // Запись в БД
+  // Закрытие окна: ровно один терминальный MarketLog на маркет.
   // ---------------------------------------------------------------------
-  private async recordSkippedMarket(slug: string, closesAt: Date, reason: string) {
-    await this.marketLogRepo.save(
-      this.marketLogRepo.create({
-        attemptId: this.currentAttempt.id,
-        stepNumber: this.currentAttempt.currentStep + 1,
-        slug,
-        closesAt,
+  private async finalizeMarket(marketState: MarketState): Promise<void> {
+    if (marketState.finalized) return;
+    marketState.finalized = true;
+    marketState.stream.close();
+
+    try {
+      if (marketState.positioned) {
+        // Лог уже записан в момент исполнения — на всякий случай подчищаем возможный "хвост".
+        await this.cancelRestingIfAny(marketState);
+        return;
+      }
+
+      if (marketState.restingOrder) {
+        const resting = marketState.restingOrder;
+        const tokenId = resting.outcome === 'YES' ? marketState.yesTokenId : marketState.noTokenId;
+
+        if (this.isSmoke) {
+          await this.writeLog(marketState, {
+            chosenOutcome: resting.outcome,
+            chosenTokenId: tokenId,
+            entryPrice: null,
+            executed: false,
+            orderType: 'SIMULATED_LIMIT',
+            limitTier: resting.tier,
+            status: 'unfilled',
+            skipReason: 'Симулированная лимитка не была перекрыта встречной ценой до конца окна.',
+          });
+          return;
+        }
+
+        const status = resting.orderId ? await this.trader.getOrderStatus(resting.orderId) : null;
+        if (status && status.sizeMatched > 0) {
+          await this.writeLog(marketState, {
+            chosenOutcome: resting.outcome,
+            chosenTokenId: tokenId,
+            entryPrice: resting.price,
+            executed: true,
+            orderType: 'GTD',
+            limitTier: resting.tier,
+            orderId: resting.orderId,
+            status: 'pending_resolve',
+            logMessage: `Исполнено ${status.sizeMatched}/${status.originalSize} шт.`,
+          });
+        } else {
+          await this.writeLog(marketState, {
+            chosenOutcome: resting.outcome,
+            chosenTokenId: tokenId,
+            entryPrice: resting.price,
+            executed: false,
+            orderType: 'GTD',
+            limitTier: resting.tier,
+            orderId: resting.orderId,
+            status: 'unfilled',
+            skipReason: 'Лимитка не исполнилась до истечения (GTD).',
+          });
+        }
+        await this.cancelRestingIfAny(marketState); // подчистка на случай, если GTD почему-то не сработал сам
+        return;
+      }
+
+      await this.writeLog(marketState, {
         chosenOutcome: null,
         executed: false,
-        isSmoke: this.isSmoke,
         status: 'skipped',
-        skipReason: reason,
-        betAmount: this.betAmount,
-      }),
-    );
+        skipReason: 'Ни один исход не вошёл в диапазон маркет-тейка, фаворит не определился.',
+      });
+    } catch (err) {
+      this.logger.error(`Ошибка финализации ${marketState.slug}: ${this.errMsg(err)}`);
+    }
   }
 
-  private async recordSimulatedBuy(
-    slug: string,
-    closesAt: Date,
-    outcome: 'YES' | 'NO',
-    tokenId: string,
-    price: number,
-  ) {
+  private async writeLog(
+    marketState: MarketState,
+    fields: {
+      chosenOutcome: ChosenOutcome;
+      chosenTokenId?: string | null;
+      entryPrice?: number | null;
+      executed: boolean;
+      orderType?: OrderKind | null;
+      limitTier?: LimitTier | null;
+      orderId?: string | null;
+      status: MarketLogStatus;
+      skipReason?: string | null;
+      logMessage?: string | null;
+    },
+  ): Promise<void> {
+    if (marketState.logWritten) return;
+    marketState.logWritten = true;
+
     await this.marketLogRepo.save(
       this.marketLogRepo.create({
         attemptId: this.currentAttempt.id,
         stepNumber: this.currentAttempt.currentStep + 1,
-        slug,
-        closesAt,
-        chosenOutcome: outcome,
-        chosenTokenId: tokenId,
-        entryPrice: price,
+        slug: marketState.slug,
+        closesAt: marketState.closesAt,
         betAmount: this.betAmount,
-        executed: true,
-        isSmoke: true,
-        orderType: 'SIMULATED',
-        status: 'pending_resolve',
-        logMessage: 'SMOKE: лимитка не отправлялась на биржу, только эмуляция.',
-      }),
-    );
-  }
-
-  private async recordRealBuy(
-    slug: string,
-    closesAt: Date,
-    outcome: 'YES' | 'NO',
-    tokenId: string,
-    price: number,
-    orderId: string | null,
-  ) {
-    await this.marketLogRepo.save(
-      this.marketLogRepo.create({
-        attemptId: this.currentAttempt.id,
-        stepNumber: this.currentAttempt.currentStep + 1,
-        slug,
-        closesAt,
-        chosenOutcome: outcome,
-        chosenTokenId: tokenId,
-        entryPrice: price,
-        betAmount: this.betAmount,
-        executed: true,
-        isSmoke: false,
-        orderType: 'FOK',
-        orderId,
-        status: 'pending_resolve',
-      }),
-    );
-  }
-
-  private async recordErrorMarket(
-    slug: string,
-    closesAt: Date,
-    outcome: 'YES' | 'NO',
-    price: number,
-    errorMessage: string,
-  ) {
-    await this.marketLogRepo.save(
-      this.marketLogRepo.create({
-        attemptId: this.currentAttempt.id,
-        stepNumber: this.currentAttempt.currentStep + 1,
-        slug,
-        closesAt,
-        chosenOutcome: outcome,
-        entryPrice: price,
-        betAmount: this.betAmount,
-        executed: false,
         isSmoke: this.isSmoke,
-        status: 'error',
-        errorMessage,
+        chosenOutcome: fields.chosenOutcome,
+        chosenTokenId: fields.chosenTokenId ?? null,
+        entryPrice: fields.entryPrice ?? null,
+        executed: fields.executed,
+        orderType: fields.orderType ?? null,
+        limitTier: fields.limitTier ?? null,
+        orderId: fields.orderId ?? null,
+        status: fields.status,
+        skipReason: fields.skipReason ?? null,
+        logMessage: fields.logMessage ?? null,
       }),
     );
   }
 
   // ---------------------------------------------------------------------
-  // Резолвер: проверяет исход закрытых рынков и продвигает счётчик шагов.
+  // Резолвер: REST-опрос Gamma API по закрытым маркетам, продвигает шаги.
   // ---------------------------------------------------------------------
   private async startResolverLoop() {
     while (!this.stopped) {

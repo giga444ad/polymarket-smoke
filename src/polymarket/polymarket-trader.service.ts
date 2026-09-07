@@ -3,17 +3,39 @@ import { ConfigService } from '@nestjs/config';
 import { ClobClient, OrderType, Side } from '@polymarket/clob-client';
 import { Wallet } from 'ethers';
 
-export interface PlaceOrderParams {
+export interface PlaceMarketOrderParams {
+  tokenId: string;
+  /** $$$-сумма к покупке (не количество токенов) — см. UserMarketOrder.amount в SDK. */
+  amountUsd: number;
+  /** Худшая цена, дальше которой не идём (у нас — верхняя граница входа, напр. 0.999). */
+  worstPrice: number;
+  tickSize: string;
+  negRisk: boolean;
+}
+
+export interface PlaceLimitOrderParams {
   tokenId: string;
   price: number;
   size: number;
   tickSize: string;
   negRisk: boolean;
+  /** unix-секунды, после которых биржа сама снимет ордер (обычно = закрытие маркета). */
+  expirationUnixSec: number;
 }
 
 export interface PlaceOrderResult {
   orderId: string | null;
+  success: boolean;
+  takingAmount: string | null;
+  makingAmount: string | null;
   raw: unknown;
+}
+
+export interface OrderStatus {
+  id: string;
+  status: string;
+  originalSize: number;
+  sizeMatched: number;
 }
 
 /**
@@ -114,27 +136,91 @@ export class PolymarketTraderService {
   }
 
   /**
-   * FOK-ордер на покупку по конкретной цене (снятие ликвидности из последнего
-   * известного стакана). Если не исполнится целиком мгновенно — биржа отменит его сама.
+   * Правило A (агрессивный вход): "рыночный" ордер с потолком цены.
+   * У Polymarket нет чистого market-ордера без ценового потолка — ближайший
+   * аналог это FAK (fill-and-kill = IOC): берёт всё, что есть в стакане по
+   * цене <= worstPrice, остаток снимает сам. amount передаём в $$$, а не в
+   * штуках токена — так работает UserMarketOrder в SDK.
    */
-  async placeFokBuy(params: PlaceOrderParams): Promise<PlaceOrderResult> {
+  async placeMarketBuy(params: PlaceMarketOrderParams): Promise<PlaceOrderResult> {
     const client = await this.ensureClient();
 
-    const order = await client.createOrder(
+    const resp: any = await client.createAndPostMarketOrder(
+      {
+        tokenID: params.tokenId,
+        price: params.worstPrice,
+        amount: params.amountUsd,
+        side: Side.BUY,
+        orderType: OrderType.FAK,
+      },
+      { tickSize: params.tickSize as any, negRisk: params.negRisk },
+      OrderType.FAK,
+    );
+
+    return this.toResult(resp);
+  }
+
+  /**
+   * Правило B (лимитка на случай отсутствия предложений): GTD-ордер
+   * (good-till-date) с истечением ровно на закрытии маркета — если не
+   * успели сами отменить/переставить, биржа снимет его сама и деньги не
+   * повиснут в воздухе после резолва маркета.
+   */
+  async placeLimitBuy(params: PlaceLimitOrderParams): Promise<PlaceOrderResult> {
+    const client = await this.ensureClient();
+
+    const resp: any = await client.createAndPostOrder(
       {
         tokenID: params.tokenId,
         price: params.price,
         size: params.size,
         side: Side.BUY,
+        expiration: params.expirationUnixSec,
       },
       { tickSize: params.tickSize as any, negRisk: params.negRisk },
+      OrderType.GTD,
     );
 
-    const resp: any = await client.postOrder(order, OrderType.FOK);
+    return this.toResult(resp);
+  }
 
+  async cancelOrder(orderId: string): Promise<void> {
+    const client = await this.ensureClient();
+    try {
+      await client.cancelOrder({ orderID: orderId });
+    } catch (err) {
+      // Ордер мог уже исполниться/истечь сам — это не критично, просто логируем.
+      this.logger.warn(`Не удалось отменить ордер ${orderId}: ${this.errMsg(err)}`);
+    }
+  }
+
+  async getOrderStatus(orderId: string): Promise<OrderStatus | null> {
+    const client = await this.ensureClient();
+    try {
+      const order = await client.getOrder(orderId);
+      return {
+        id: order.id,
+        status: order.status,
+        originalSize: parseFloat(order.original_size),
+        sizeMatched: parseFloat(order.size_matched),
+      };
+    } catch (err) {
+      this.logger.warn(`Не удалось получить статус ордера ${orderId}: ${this.errMsg(err)}`);
+      return null;
+    }
+  }
+
+  private toResult(resp: any): PlaceOrderResult {
     return {
       orderId: resp?.orderID ?? resp?.orderId ?? null,
+      success: resp?.success !== false,
+      takingAmount: resp?.takingAmount ?? null,
+      makingAmount: resp?.makingAmount ?? null,
       raw: resp,
     };
+  }
+
+  private errMsg(err: unknown): string {
+    return err instanceof Error ? err.message : String(err);
   }
 }
