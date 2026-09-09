@@ -6,6 +6,7 @@ import { TradingService } from './trading.service';
 import { GammaMarketService } from '../polymarket/gamma-market.service';
 import { ClobPublicService } from '../polymarket/clob-public.service';
 import { PolymarketTraderService } from '../polymarket/polymarket-trader.service';
+import { PriceFeedService } from '../polymarket/price-feed.service';
 
 @Module({
   imports: [TypeOrmModule.forFeature([Attempt, MarketLog])],
@@ -14,6 +15,7 @@ import { PolymarketTraderService } from '../polymarket/polymarket-trader.service
     GammaMarketService,
     ClobPublicService,
     PolymarketTraderService,
+    PriceFeedService,
   ],
   exports: [TypeOrmModule],
 })

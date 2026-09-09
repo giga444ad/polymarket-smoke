@@ -36,6 +36,10 @@ const fakeGamma: any = {
 
 const fakeClobPublic = { getBestQuote: async () => null };
 
+const fakePriceFeed: any = {
+  getSnapshot: () => ({ price: null, priceAt: null, atr: null, candleCount: 0 }),
+};
+
 const fakeTrader = {
   ensureClient: async () => {
     throw new Error('boom');
@@ -91,6 +95,8 @@ function makeMarketState(overrides: any = {}) {
     skippedLimitTier: null,
     lastMarketAttemptAt: 0,
     closeTimer: setTimeout(() => {}, 999_999),
+    referencePrice: null,
+    marketLogId: null,
     ...overrides,
   };
 }
@@ -112,6 +118,7 @@ async function main() {
     fakeGamma as any,
     fakeClobPublic as any,
     fakeTrader as any,
+    fakePriceFeed as any,
     fakeAttemptRepo as any,
     fakeMarketLogRepo as any,
   );

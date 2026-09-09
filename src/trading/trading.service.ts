@@ -1,7 +1,7 @@
 import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { LessThan, Repository } from 'typeorm';
 import { Attempt } from '../entities/attempt.entity';
 import { ChosenOutcome, MarketLog, MarketLogStatus, OrderKind } from '../entities/market-log.entity';
 import { GammaMarketService } from '../polymarket/gamma-market.service';
@@ -9,6 +9,7 @@ import { ClobPublicService } from '../polymarket/clob-public.service';
 import { PolymarketTraderService } from '../polymarket/polymarket-trader.service';
 import { LiveBook, MarketWsStream, Outcome } from '../polymarket/market-ws-stream';
 import { cumulativeUsdAtOrBelow, walkAsksForFill } from '../polymarket/book-fill.util';
+import { PriceFeedService } from '../polymarket/price-feed.service';
 
 type LimitTier = 'T1' | 'T2' | 'T3';
 
@@ -18,6 +19,13 @@ interface RestingOrder {
   price: number;
   // null в смоуке (ничего реального не выставляли)
   orderId: string | null;
+}
+
+interface EntryDiagnostics {
+  referencePrice: number | null;
+  priceAtEntry: number | null;
+  atrAtEntry: number | null;
+  atrRatioAtEntry: number | null;
 }
 
 interface MarketState {
@@ -39,6 +47,12 @@ interface MarketState {
   skippedLimitTier: LimitTier | null;
   lastMarketAttemptAt: number;
   closeTimer: NodeJS.Timeout;
+  // Цена по внешнему ценовому фиду (Binance, proxy) на момент открытия окна —
+  // наш локальный ориентир "точки старта" для UP/DOWN. null, если фид ещё не готов.
+  referencePrice: number | null;
+  // id уже записанного MarketLog — нужен, чтобы дописать close-диагностику
+  // (priceAtClose/atrAtClose) в finalizeMarket, не создавая второй лог.
+  marketLogId: string | null;
 }
 
 const EMPTY_BOOK = (outcome: Outcome, tickSize: string): LiveBook => ({
@@ -69,6 +83,16 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
   private resolvePollMs: number;
   private assetPrefixes: string[];
 
+  // --- ATR-гейт входа (см. README/обсуждение) ---
+  // По умолчанию выключен (SHADOW-режим): диагностика считается и пишется в
+  // каждый лог всегда, а блокировка входа включается явно через .env только
+  // после того, как накопится статистика по реальным сливам.
+  private entryFilterEnabled: boolean;
+  private minDistanceAtrRatio: number;
+  // Порог "зависшего" резолва — сколько может провисеть pending_resolve лог,
+  // прежде чем мы начнём предупреждать в логах/на фронте (не блокирует торговлю).
+  private staleResolveWarnMs: number;
+
   private currentAttempt: Attempt;
   private activeMarkets = new Map<string, MarketState>();
   private stopped = false;
@@ -78,6 +102,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     private readonly gamma: GammaMarketService,
     private readonly clobPublic: ClobPublicService,
     private readonly trader: PolymarketTraderService,
+    private readonly priceFeed: PriceFeedService,
     @InjectRepository(Attempt) private readonly attemptRepo: Repository<Attempt>,
     @InjectRepository(MarketLog) private readonly marketLogRepo: Repository<MarketLog>,
   ) {
@@ -107,6 +132,10 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean);
+
+    this.entryFilterEnabled = this.config.get<string>('ENTRY_FILTER_ENABLED', 'false') === 'true';
+    this.minDistanceAtrRatio = parseFloat(this.config.get<string>('MIN_DISTANCE_ATR_RATIO', '1.5'));
+    this.staleResolveWarnMs = parseInt(this.config.get<string>('STALE_RESOLVE_WARN_MS', '180000'), 10);
   }
 
   async onModuleInit() {
@@ -128,7 +157,8 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
         `Активы: ${this.assetPrefixes.join(', ')}. ` +
         `Попытка #${this.currentAttempt.attemptNumber}, шаг ${this.currentAttempt.currentStep}/${this.currentAttempt.targetSteps}. ` +
         `Маркет-тейк [¢${this.minMarketPrice * 100}-¢${this.maxMarketPrice * 100}] (минимум заполнения ${this.minFillRatio * 100}%), ` +
-        `лимитки-фолбэк от ¢${this.favoriteBidThreshold * 100} (тиры ${this.tierPrices.T1 * 100}/${this.tierPrices.T2 * 100}/${this.tierPrices.T3 * 100}).`,
+        `лимитки-фолбэк от ¢${this.favoriteBidThreshold * 100} (тиры ${this.tierPrices.T1 * 100}/${this.tierPrices.T2 * 100}/${this.tierPrices.T3 * 100}). ` +
+        `ATR-гейт входа: ${this.entryFilterEnabled ? `ВКЛЮЧЁН (мин. ${this.minDistanceAtrRatio}x ATR)` : 'выключен (только диагностика в логах)'}.`,
     );
 
     this.startDiscoveryLoop();
@@ -210,6 +240,18 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     const initialTickSize = yesBoot?.tickSize ?? noBoot?.tickSize ?? '0.01';
     const minOrderSize = yesBoot?.minOrderSize ?? noBoot?.minOrderSize ?? 5;
 
+    // Фиксируем ориентир по внешнему фиду в момент открытия окна — от него будем
+    // считать дельту/ATR-рацио на входе и на закрытии. Если фид ещё не успел
+    // прогреться (нет ни одного тика), просто останется null — вся диагностика
+    // и гейт в этом случае молча отключаются для конкретного окна (fail-open).
+    const referenceSnapshot = this.priceFeed.getSnapshot(assetPrefix);
+    if (referenceSnapshot.price == null) {
+      this.logger.warn(
+        `[${assetPrefix}] ${slug}: внешний ценовой фид ещё не отдал ни одного тика — ` +
+          `диагностика/ATR-гейт для этого окна будут недоступны.`,
+      );
+    }
+
     const marketState: MarketState = {
       assetPrefix,
       slug,
@@ -230,6 +272,8 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       skippedLimitTier: null,
       lastMarketAttemptAt: 0,
       closeTimer: null as any,
+      referencePrice: referenceSnapshot.price,
+      marketLogId: null,
     };
 
     const stream = new MarketWsStream(
@@ -247,7 +291,8 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     stream.connect();
 
     this.logger.log(
-      `[${assetPrefix}] ${slug}: открыт WS-поток (закрытие через ${(msUntilClose / 1000).toFixed(0)}с, min_order_size=${minOrderSize}, tick=${initialTickSize})`,
+      `[${assetPrefix}] ${slug}: открыт WS-поток (закрытие через ${(msUntilClose / 1000).toFixed(0)}с, min_order_size=${minOrderSize}, tick=${initialTickSize}, ` +
+        `referencePrice=${referenceSnapshot.price ?? 'н/д'})`,
     );
   }
 
@@ -263,6 +308,9 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
 
     // 0) Если по этому исходу уже стоит наша (смоук-)лимитка — проверяем, накопилось
     //    ли ДОСТАТОЧНО объёма продавцов по нашей цене или ниже (а не просто "касание").
+    //    Гейт по ATR здесь НЕ применяем повторно — он уже был проверен в момент
+    //    выставления резюм-лимитки (placeOrReplaceLimit); здесь только фиксируем
+    //    диагностику на момент фактического исполнения для лога.
     if (this.isSmoke && marketState.restingOrder?.outcome === outcome) {
       const resting = marketState.restingOrder;
       const targetUsd = this.limitOrderTargetUsd(marketState, resting.price);
@@ -271,6 +319,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
         marketState.positioned = true;
         marketState.restingOrder = null;
         const filledShares = targetUsd / resting.price;
+        const diagnostics = this.captureDiagnostics(marketState);
         void this.writeLog(marketState, {
           chosenOutcome: outcome,
           chosenTokenId: outcome === 'YES' ? marketState.yesTokenId : marketState.noTokenId,
@@ -282,6 +331,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
           limitTier: resting.tier,
           status: 'pending_resolve',
           logMessage: `SMOKE: лимитка не отправлялась на биржу — эмуляция; накопленный объём продавцов по ¢${(resting.price * 100).toFixed(2)} и ниже составил $${availableUsd.toFixed(2)}, взяли ${filledShares.toFixed(2)} шт.`,
+          ...diagnostics,
         });
         this.logger.log(
           `[${marketState.assetPrefix}][SMOKE][Limit fill] ${marketState.slug}: ${outcome} по ¢${(resting.price * 100).toFixed(2)} (тир ${resting.tier})`,
@@ -352,6 +402,47 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
   }
 
   // ---------------------------------------------------------------------
+  // ATR-гейт: считает диагностику по внешнему фиду и (если включено через
+  // .env) решает, достаточно ли убедительно цена отошла от точки старта окна
+  // относительно недавней волатильности. Fail-open: если фида/референса/ATR
+  // нет — гейт не блокирует (лучше торговать без фильтра, чем не торговать
+  // из-за временной недоступности WS Binance).
+  // ---------------------------------------------------------------------
+  private captureDiagnostics(marketState: MarketState): EntryDiagnostics {
+    const snap = this.priceFeed.getSnapshot(marketState.assetPrefix);
+    const referencePrice = marketState.referencePrice;
+    const priceAtEntry = snap.price;
+    const atrAtEntry = snap.atr;
+    let atrRatioAtEntry: number | null = null;
+    if (referencePrice != null && priceAtEntry != null && atrAtEntry != null && atrAtEntry > 0) {
+      atrRatioAtEntry = Math.abs(priceAtEntry - referencePrice) / atrAtEntry;
+    }
+    return { referencePrice, priceAtEntry, atrAtEntry, atrRatioAtEntry };
+  }
+
+  private evaluateEntryGate(marketState: MarketState): { allow: boolean; diagnostics: EntryDiagnostics; reason: string | null } {
+    const diagnostics = this.captureDiagnostics(marketState);
+
+    if (!this.entryFilterEnabled) {
+      return { allow: true, diagnostics, reason: null };
+    }
+    if (diagnostics.atrRatioAtEntry == null) {
+      // Нет данных для оценки (фид/референс/ATR ещё не готовы) — не блокируем.
+      return { allow: true, diagnostics, reason: null };
+    }
+    if (diagnostics.atrRatioAtEntry < this.minDistanceAtrRatio) {
+      return {
+        allow: false,
+        diagnostics,
+        reason:
+          `ATR-гейт: дистанция до референса ${diagnostics.atrRatioAtEntry.toFixed(2)}x ATR ` +
+          `меньше требуемых ${this.minDistanceAtrRatio}x — похоже на болтанку у границы, а не уверенное движение.`,
+      };
+    }
+    return { allow: true, diagnostics, reason: null };
+  }
+
+  // ---------------------------------------------------------------------
   // Правило A: маркет-тейк — честно проходим по уровням стакана (VWAP),
   // не выше maxMarketPrice, и не принимаем сделку, если реальной глубины
   // хватает меньше чем на minFillRatio от заявленной ставки (иначе легко
@@ -380,11 +471,17 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
+    const gate = this.evaluateEntryGate(marketState);
+    if (!gate.allow) {
+      this.logger.log(`[${marketState.assetPrefix}][Market] ${marketState.slug}: ${outcome} — вход заблокирован. ${gate.reason}`);
+      return;
+    }
+
     try {
       if (this.isSmoke) {
         marketState.positioned = true;
         await this.cancelRestingIfAny(marketState);
-        await this.writeLog(marketState, {
+        const savedId = await this.writeLog(marketState, {
           chosenOutcome: outcome,
           chosenTokenId: tokenId,
           entryPrice: fill.vwapPrice,
@@ -397,7 +494,9 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
             fill.filledRatio < 0.999
               ? `SMOKE: частичное исполнение — забрали $${fill.filledUsd.toFixed(2)} из $${this.betAmount} (${(fill.filledRatio * 100).toFixed(0)}%) по VWAP ¢${(fill.vwapPrice! * 100).toFixed(2)}.`
               : `SMOKE: маркет-ордер не отправлялся, только эмуляция прохода по стакану (VWAP ¢${(fill.vwapPrice! * 100).toFixed(2)}).`,
+          ...gate.diagnostics,
         });
+        marketState.marketLogId = savedId;
         this.logger.log(
           `[${marketState.assetPrefix}][SMOKE][Market] ${marketState.slug}: ${outcome} по VWAP ¢${(fill.vwapPrice! * 100).toFixed(2)} ` +
             `($${fill.filledUsd.toFixed(2)}${fill.filledRatio < 0.999 ? `, ${(fill.filledRatio * 100).toFixed(0)}% от заявки` : ''})`,
@@ -425,7 +524,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       // по стакану как честное приближение (и явно это помечаем в логе).
       const raw: any = result.raw;
       const actualUsd = this.parseFloatSafe(raw?.makingAmount) ?? fill.filledUsd;
-      await this.writeLog(marketState, {
+      const savedId = await this.writeLog(marketState, {
         chosenOutcome: outcome,
         chosenTokenId: tokenId,
         entryPrice: fill.vwapPrice,
@@ -435,7 +534,9 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
         orderType: 'FAK',
         orderId: result.orderId,
         status: 'pending_resolve',
+        ...gate.diagnostics,
       });
+      marketState.marketLogId = savedId;
       this.logger.log(
         `[${marketState.assetPrefix}][LIVE][Market] ${marketState.slug}: ${outcome} ордер отправлен (потолок ¢${(this.maxMarketPrice * 100).toFixed(1)}), orderId=${result.orderId}`,
       );
@@ -465,6 +566,14 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
         );
         return;
       }
+
+      const gate = this.evaluateEntryGate(marketState);
+      if (!gate.allow) {
+        marketState.skippedLimitTier = tier;
+        this.logger.log(`[${marketState.assetPrefix}][Limit] ${marketState.slug}: тир ${tier} — выставление заблокировано. ${gate.reason}`);
+        return;
+      }
+
       const size = Number((targetUsd / price).toFixed(2));
 
       if (this.isSmoke) {
@@ -519,6 +628,16 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     try {
       if (marketState.positioned) {
         await this.cancelRestingIfAny(marketState);
+        // Лог уже записан в момент входа — дописываем только "фото" цены/ATR
+        // на момент закрытия окна, чтобы потом было видно, что произошло с
+        // ценой между входом и резолвом (это и есть материал для разбора сливов).
+        if (marketState.marketLogId) {
+          const closeSnap = this.priceFeed.getSnapshot(marketState.assetPrefix);
+          await this.marketLogRepo.update(marketState.marketLogId, {
+            priceAtClose: closeSnap.price,
+            atrAtClose: closeSnap.atr,
+          });
+        }
         return;
       }
 
@@ -543,7 +662,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
         const status = resting.orderId ? await this.trader.getOrderStatus(resting.orderId) : null;
         if (status && status.sizeMatched > 0) {
           const filledAmount = status.sizeMatched * resting.price;
-          await this.writeLog(marketState, {
+          const savedId = await this.writeLog(marketState, {
             chosenOutcome: resting.outcome,
             chosenTokenId: tokenId,
             entryPrice: resting.price,
@@ -556,6 +675,13 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
             status: 'pending_resolve',
             logMessage: `Исполнено ${status.sizeMatched}/${status.originalSize} шт.`,
           });
+          if (savedId) {
+            const closeSnap = this.priceFeed.getSnapshot(marketState.assetPrefix);
+            await this.marketLogRepo.update(savedId, {
+              priceAtClose: closeSnap.price,
+              atrAtClose: closeSnap.atr,
+            });
+          }
         } else {
           await this.writeLog(marketState, {
             chosenOutcome: resting.outcome,
@@ -599,12 +725,16 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       status: MarketLogStatus;
       skipReason?: string | null;
       logMessage?: string | null;
+      referencePrice?: number | null;
+      priceAtEntry?: number | null;
+      atrAtEntry?: number | null;
+      atrRatioAtEntry?: number | null;
     },
-  ): Promise<void> {
-    if (marketState.logWritten) return;
+  ): Promise<string | null> {
+    if (marketState.logWritten) return null;
     marketState.logWritten = true;
 
-    await this.marketLogRepo.save(
+    const saved = await this.marketLogRepo.save(
       this.marketLogRepo.create({
         attemptId: this.currentAttempt.id,
         stepNumber: this.currentAttempt.currentStep + 1,
@@ -625,8 +755,13 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
         status: fields.status,
         skipReason: fields.skipReason ?? null,
         logMessage: fields.logMessage ?? null,
+        referencePrice: fields.referencePrice ?? null,
+        priceAtEntry: fields.priceAtEntry ?? null,
+        atrAtEntry: fields.atrAtEntry ?? null,
+        atrRatioAtEntry: fields.atrRatioAtEntry ?? null,
       }),
     );
+    return saved.id;
   }
 
   // ---------------------------------------------------------------------
@@ -637,10 +772,35 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     while (!this.stopped) {
       try {
         await this.resolvePendingMarkets();
+        await this.warnStaleUnresolved();
       } catch (err) {
         this.logger.error(`Сбой резолвера: ${this.errMsg(err)}`);
       }
       await this.sleep(this.resolvePollMs);
+    }
+  }
+
+  /**
+   * Отдельная, независимая от "горячего пути" входа проверка: не завис ли
+   * какой-то маркет в pending_resolve дольше разумного. НЕ блокирует открытие
+   * новых окон (см. discoveryTick) — только предупреждает в логах и попадает
+   * в /analytics/summary, чтобы это было видно на фронте, а не только "по ощущениям".
+   */
+  private async warnStaleUnresolved(): Promise<void> {
+    const staleBefore = new Date(Date.now() - this.staleResolveWarnMs);
+    const stale = await this.marketLogRepo.find({
+      where: { status: 'pending_resolve', createdAt: LessThan(staleBefore) },
+      order: { createdAt: 'ASC' },
+      take: 20,
+    });
+    if (stale.length === 0) return;
+
+    for (const log of stale) {
+      const ageSec = Math.round((Date.now() - log.createdAt.getTime()) / 1000);
+      this.logger.warn(
+        `[STALE] ${log.assetPrefix} ${log.slug}: висит в pending_resolve уже ${ageSec}с — ` +
+          `резолв Gamma задерживается сильнее обычного (текущее окно закрытия ~30с). Проверь вручную.`,
+      );
     }
   }
 
@@ -664,6 +824,9 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       log.status = won ? 'win' : 'loss';
       log.resolvedAt = new Date();
       log.profit = won ? (spentUsd / entryPrice) * (1 - entryPrice) : -spentUsd;
+      if (!won) {
+        log.failReason = this.buildFailReason(log);
+      }
       await this.marketLogRepo.save(log);
 
       const attempt = await this.attemptRepo.findOneOrFail({ where: { id: log.attemptId } });
@@ -684,7 +847,8 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
         attempt.finishedAt = new Date();
         await this.attemptRepo.save(attempt);
         this.logger.warn(
-          `[LOSS] Попытка #${attempt.attemptNumber} (${attempt.isSmoke ? 'smoke' : 'live'}) слита на шаге ${attempt.currentStep} (${log.assetPrefix}, профит шага $${log.profit.toFixed(2)}). Открываю новую попытку.`,
+          `[LOSS] Попытка #${attempt.attemptNumber} (${attempt.isSmoke ? 'smoke' : 'live'}) слита на шаге ${attempt.currentStep} ` +
+            `(${log.assetPrefix}, профит шага $${log.profit.toFixed(2)}, ${log.resolvedAt.toISOString()}). ${log.failReason ?? ''} Открываю новую попытку.`,
         );
 
         const next = this.attemptRepo.create({
@@ -698,6 +862,50 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
         this.currentAttempt = await this.attemptRepo.save(next);
       }
     }
+  }
+
+  /**
+   * Собирает человекочитаемое объяснение слива из уже накопленной по фиду
+   * диагностики (референс/цена на входе/ATR/цена на закрытии). Если фида на
+   * момент входа или закрытия не было — честно об этом пишет, а не гадает.
+   */
+  private buildFailReason(log: MarketLog): string {
+    const { referencePrice, priceAtEntry, atrAtEntry, atrRatioAtEntry, priceAtClose, atrAtClose } = log;
+
+    if (referencePrice == null || priceAtEntry == null) {
+      return 'Слив без диагностики фида (referencePrice/priceAtEntry недоступны на момент входа — ' +
+        'см. логи PriceFeedService, вероятно WS Binance был недоступен в этот момент).';
+    }
+
+    const deltaAtEntry = priceAtEntry - referencePrice;
+    const entrySide = deltaAtEntry >= 0 ? 'YES (цена была выше референса)' : 'NO (цена была ниже референса)';
+    const chosenMatchesEntrySide =
+      (log.chosenOutcome === 'YES' && deltaAtEntry >= 0) || (log.chosenOutcome === 'NO' && deltaAtEntry < 0);
+
+    const parts: string[] = [
+      `На входе: цена ${priceAtEntry}, референс окна ${referencePrice} (дельта ${deltaAtEntry.toFixed(2)}, сторона ${entrySide})` +
+        (atrRatioAtEntry != null ? `, ATR-рацио ${atrRatioAtEntry.toFixed(2)}x` : ', ATR недоступен'),
+    ];
+
+    if (!chosenMatchesEntrySide) {
+      parts.push('ВНИМАНИЕ: выбранный исход не совпадает со стороной фида на входе — проверить рассинхрон фида/страйка вручную.');
+    }
+
+    if (priceAtClose != null) {
+      const deltaAtClose = priceAtClose - referencePrice;
+      const closeSide = deltaAtClose >= 0 ? 'YES' : 'NO';
+      const flipped = (deltaAtEntry >= 0 && deltaAtClose < 0) || (deltaAtEntry < 0 && deltaAtClose >= 0);
+      const atrRatioAtClose = atrAtClose && atrAtClose > 0 ? Math.abs(deltaAtClose) / atrAtClose : null;
+      parts.push(
+        `На закрытии: цена ${priceAtClose} (дельта ${deltaAtClose.toFixed(2)}, сторона ${closeSide}` +
+          (atrRatioAtClose != null ? `, ATR-рацио ${atrRatioAtClose.toFixed(2)}x` : '') +
+          `). ${flipped ? 'Цена РАЗВЕРНУЛАСЬ относительно момента входа — классический поздний разворот.' : 'Разворота по нашему фиду не зафиксировано (расхождение с резолвом Polymarket — вероятно микро-разница момента фиксации/источника).'}`,
+      );
+    } else {
+      parts.push('Цена на закрытии по фиду недоступна (WS отвалился ближе к концу окна).');
+    }
+
+    return parts.join(' ');
   }
 
   private sleep(ms: number): Promise<void> {

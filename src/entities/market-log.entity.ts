@@ -112,6 +112,39 @@ export class MarketLog {
   @Column({ type: 'text', nullable: true })
   logMessage: string | null;
 
+  // --- Диагностика по внешнему ценовому фиду (Binance, proxy-источник —
+  // НЕ тот же фид, что резолвит маркет через Chainlink). Нужно для 1) будущего
+  // ATR-гейта входа и 2) разбора постфактум, что творилось с ценой перед сливом. ---
+
+  // Цена базового актива по фиду в момент открытия 5-минутного окна (наш локальный
+  // ориентир "тригера" UP/DOWN — сам Polymarket точную секунду фиксации не отдаёт).
+  @Column({ type: 'double precision', nullable: true })
+  referencePrice: number | null;
+
+  // Цена по фиду в момент входа в позицию.
+  @Column({ type: 'double precision', nullable: true })
+  priceAtEntry: number | null;
+
+  // ATR (среднее high-low за последние FEED_ATR_CANDLES свечей фида) на момент входа.
+  @Column({ type: 'double precision', nullable: true })
+  atrAtEntry: number | null;
+
+  // |priceAtEntry - referencePrice| / atrAtEntry — насколько "убедительно" далеко
+  // была цена от точки старта окна относительно недавней волатильности.
+  @Column({ type: 'double precision', nullable: true })
+  atrRatioAtEntry: number | null;
+
+  // То же самое, но зафиксированное в момент закрытия окна (для сравнения "было/стало").
+  @Column({ type: 'double precision', nullable: true })
+  priceAtClose: number | null;
+
+  @Column({ type: 'double precision', nullable: true })
+  atrAtClose: number | null;
+
+  // Человекочитаемая причина, заполняется резолвером при status='loss'.
+  @Column({ type: 'text', nullable: true })
+  failReason: string | null;
+
   @CreateDateColumn()
   createdAt: Date;
 

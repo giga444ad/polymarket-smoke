@@ -1,7 +1,7 @@
 import { Controller, Get, Query } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { LessThan, Repository } from 'typeorm';
 import { Attempt } from '../entities/attempt.entity';
 import { MarketLog } from '../entities/market-log.entity';
 
@@ -68,6 +68,17 @@ export class AnalyticsController {
       null,
     );
 
+    // Маркеты, зависшие в pending_resolve дольше STALE_RESOLVE_WARN_MS — то же,
+    // что предупреждает в логах TradingService.warnStaleUnresolved(), но здесь
+    // видно на фронте без необходимости лезть в консоль.
+    const staleResolveWarnMs = parseInt(this.config.get<string>('STALE_RESOLVE_WARN_MS', '180000'), 10);
+    const staleBefore = new Date(Date.now() - staleResolveWarnMs);
+    const staleLogs = await this.marketLogRepo.find({
+      where: { status: 'pending_resolve', createdAt: LessThan(staleBefore) },
+      order: { createdAt: 'ASC' },
+      take: 20,
+    });
+
     return {
       startingBankroll,
       currentBankroll: {
@@ -112,6 +123,14 @@ export class AnalyticsController {
         createdAt: a.createdAt,
         finishedAt: a.finishedAt,
       })),
+      // Незарезолвленные дольше нормы — сигнал, что резолвер Gamma подвис
+      // (см. обсуждение "ставлю следующую ставку, пока прошлая не зарезолвилась").
+      staleUnresolved: staleLogs.map((log) => ({
+        assetPrefix: log.assetPrefix,
+        slug: log.slug,
+        createdAt: log.createdAt,
+        ageSec: Math.round((Date.now() - log.createdAt.getTime()) / 1000),
+      })),
     };
   }
 
@@ -122,5 +141,31 @@ export class AnalyticsController {
       order: { createdAt: 'DESC' },
       take: Math.min(parseInt(limit, 10) || 100, 500),
     });
+  }
+
+  // Отдельная урезанная выдача только по сливам — с причиной и диагностикой,
+  // чтобы на фронте/скриптом можно было быстро разобрать статистику по факторам.
+  @Get('losses')
+  async getLosses(@Query('limit') limit = '100') {
+    const logs = await this.marketLogRepo.find({
+      where: { status: 'loss' },
+      order: { resolvedAt: 'DESC' },
+      take: Math.min(parseInt(limit, 10) || 100, 500),
+    });
+    return logs.map((log) => ({
+      slug: log.slug,
+      assetPrefix: log.assetPrefix,
+      chosenOutcome: log.chosenOutcome,
+      entryPrice: log.entryPrice,
+      profit: log.profit,
+      resolvedAt: log.resolvedAt,
+      failReason: log.failReason,
+      referencePrice: log.referencePrice,
+      priceAtEntry: log.priceAtEntry,
+      atrAtEntry: log.atrAtEntry,
+      atrRatioAtEntry: log.atrRatioAtEntry,
+      priceAtClose: log.priceAtClose,
+      atrAtClose: log.atrAtClose,
+    }));
   }
 }

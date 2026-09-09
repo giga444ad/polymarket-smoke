@@ -4,14 +4,14 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Bot Analytics Dashboard</title>
-    
+
     <!-- Подключаем Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
-    
+
     <!-- Подключаем React и ReactDOM -->
     <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
     <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-    
+
     <!-- Подключаем Babel для компиляции JSX прямо в браузере -->
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 </head>
@@ -27,24 +27,34 @@
         function AnalyticsDashboard() {
             const [activeTab, setActiveTab] = useState(MARKETS[0]);
             const [data, setData] = useState(null);
+            const [losses, setLosses] = useState(null);
             const [loading, setLoading] = useState(true);
             const [error, setError] = useState(null);
 
-            // Перезапрашиваем данные при каждом изменении activeTab
+            // Перезапрашиваем данные при каждом изменении activeTab (у каждого рынка свой бэкенд/деплой)
             useEffect(() => {
                 setLoading(true);
                 setError(null);
+                setData(null);
+                setLosses(null);
 
                 // Динамически формируем URL на основе выбранного таба
                 const baseUrl = `https://polymarket-smoke-${activeTab.toLowerCase()}.up.railway.app`;
+                // const baseUrl = 'http://localhost:3000';
 
-                fetch(`${baseUrl}/analytics/summary`)
-                    .then((res) => {
-                        if (!res.ok) throw new Error(`Ошибка сети (${activeTab}). Проверьте CORS или доступность бекенда.`);
+                Promise.all([
+                    fetch(`${baseUrl}/analytics/summary`).then((res) => {
+                        if (!res.ok) throw new Error(`Ошибка сети (${activeTab}, summary). Проверьте CORS или доступность бекенда.`);
                         return res.json();
-                    })
-                    .then((json) => {
-                        setData(json);
+                    }),
+                    fetch(`${baseUrl}/analytics/losses?limit=50`).then((res) => {
+                        if (!res.ok) throw new Error(`Ошибка сети (${activeTab}, losses). Проверьте CORS или доступность бекенда.`);
+                        return res.json();
+                    }),
+                ])
+                    .then(([summaryJson, lossesJson]) => {
+                        setData(summaryJson);
+                        setLosses(lossesJson);
                         setLoading(false);
                     })
                     .catch((err) => {
@@ -57,12 +67,25 @@
                 if (loading) return <div className="py-12 text-center text-gray-500 font-sans">Загрузка аналитики {activeTab}...</div>;
                 if (error || !data) return <div className="py-12 text-center text-red-500 font-sans">Ошибка: {error}</div>;
 
-                const winRate = data.totals.wins + data.totals.losses > 0 
-                    ? ((data.totals.wins / (data.totals.wins + data.totals.losses)) * 100).toFixed(1) 
+                const winRate = data.totals.wins + data.totals.losses > 0
+                    ? ((data.totals.wins / (data.totals.wins + data.totals.losses)) * 100).toFixed(1)
                     : 0;
 
                 return (
                     <div className="animate-fade-in transition-opacity">
+                        {data.staleUnresolved && data.staleUnresolved.length > 0 && (
+                            <div className="bg-amber-50 border border-amber-300 text-amber-800 rounded-xl p-4 mb-8">
+                                <div className="font-semibold mb-2">⚠ Есть маркеты, зависшие в pending_resolve дольше нормы</div>
+                                <ul className="text-sm space-y-1">
+                                    {data.staleUnresolved.map((s) => (
+                                        <li key={s.slug}>
+                                            {s.assetPrefix} / {s.slug} — висит {s.ageSec}с (с {new Date(s.createdAt).toLocaleString()})
+                                        </li>
+                                    ))}
+                                </ul>
+                            </div>
+                        )}
+
                         {/* Топ метрики */}
                         <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
                             <MetricCard title="Bankroll (Smoke)" value={`$${data.currentBankroll.smoke}`} />
@@ -88,7 +111,7 @@
                         )}
 
                         {/* История попыток */}
-                        <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+                        <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden mb-8">
                             <div className="p-6 border-b border-gray-100">
                                 <h2 className="text-xl font-semibold text-gray-800">Attempts History</h2>
                             </div>
@@ -104,7 +127,7 @@
                                     </thead>
                                     <tbody className="divide-y divide-gray-100">
                                         {data.attempts?.map((attempt) => (
-                                            <tr key={attempt.attemptNumber} className="hover:bg-gray-50 transition-colors">
+                                            <tr key={`${attempt.isSmoke}-${attempt.attemptNumber}`} className="hover:bg-gray-50 transition-colors">
                                                 <td className="p-4 font-medium">#{attempt.attemptNumber}</td>
                                                 <td className="p-4">
                                                     <span className={`px-2 py-1 rounded-md text-xs font-semibold uppercase ${attempt.status === 'active' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
@@ -126,6 +149,51 @@
                                 </table>
                             </div>
                         </div>
+
+                        {/* Разбор сливов: причина + дата + диагностика по фиду/ATR */}
+                        <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+                            <div className="p-6 border-b border-gray-100">
+                                <h2 className="text-xl font-semibold text-gray-800">Recent Losses — Diagnostics</h2>
+                            </div>
+                            <div className="overflow-x-auto">
+                                <table className="w-full text-left border-collapse">
+                                    <thead>
+                                        <tr className="bg-gray-50 text-gray-600 text-sm">
+                                            <th className="p-4 font-medium">Date</th>
+                                            <th className="p-4 font-medium">Market</th>
+                                            <th className="p-4 font-medium">Side</th>
+                                            <th className="p-4 font-medium">Profit</th>
+                                            <th className="p-4 font-medium">ATR ratio (entry)</th>
+                                            <th className="p-4 font-medium">Reason</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-gray-100">
+                                        {(losses || []).length === 0 && (
+                                            <tr><td className="p-4 text-sm text-gray-400" colSpan="6">Сливов пока нет.</td></tr>
+                                        )}
+                                        {(losses || []).map((log) => (
+                                            <tr key={log.slug} className="hover:bg-gray-50 transition-colors align-top">
+                                                <td className="p-4 text-sm text-gray-500 whitespace-nowrap">
+                                                    {log.resolvedAt ? new Date(log.resolvedAt).toLocaleString() : '—'}
+                                                </td>
+                                                <td className="p-4 text-sm">
+                                                    <div className="font-medium">{log.assetPrefix}</div>
+                                                    <div className="text-gray-400">{log.slug}</div>
+                                                </td>
+                                                <td className="p-4 text-sm">{log.chosenOutcome ?? '—'}</td>
+                                                <td className="p-4 text-sm text-red-600 font-medium">
+                                                    {log.profit != null ? `$${log.profit.toFixed(2)}` : '—'}
+                                                </td>
+                                                <td className="p-4 text-sm">
+                                                    {log.atrRatioAtEntry != null ? `${log.atrRatioAtEntry.toFixed(2)}x` : '—'}
+                                                </td>
+                                                <td className="p-4 text-sm text-gray-600 max-w-md">{log.failReason ?? '—'}</td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
                     </div>
                 );
             };
@@ -134,16 +202,16 @@
                 <div className="max-w-6xl mx-auto p-6 font-sans text-gray-800">
                     <div className="flex flex-col md:flex-row md:items-center justify-between mb-6 gap-4">
                         <h1 className="text-3xl font-bold text-gray-900">Bot Analytics Dashboard</h1>
-                        
+
                         {/* Навигация табов генерируется динамически из массива MARKETS */}
                         <div className="flex flex-wrap gap-1 bg-gray-200/50 p-1 rounded-lg">
                             {MARKETS.map((market) => (
-                                <button 
+                                <button
                                     key={market}
                                     onClick={() => setActiveTab(market)}
                                     className={`px-6 py-2 rounded-md font-medium text-sm transition-all duration-200 ${
-                                        activeTab === market 
-                                            ? 'bg-white text-blue-600 shadow-sm' 
+                                        activeTab === market
+                                            ? 'bg-white text-blue-600 shadow-sm'
                                             : 'text-gray-500 hover:text-gray-700'
                                     }`}
                                 >
@@ -174,8 +242,8 @@
             const percentage = Math.min((reached / target) * 100, 100);
             return (
                 <div className="w-full bg-gray-100 rounded-full h-2.5 overflow-hidden">
-                    <div 
-                        className="bg-blue-600 h-2.5 rounded-full transition-all duration-500 ease-in-out" 
+                    <div
+                        className="bg-blue-600 h-2.5 rounded-full transition-all duration-500 ease-in-out"
                         style={{ width: `${percentage}%` }}
                     />
                 </div>
