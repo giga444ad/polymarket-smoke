@@ -41,6 +41,11 @@ export class MarketLog {
   @Column({ type: 'int' })
   stepNumber: number;
 
+  // Префикс актива (btc-updown-5m, eth-updown-5m, ...) — для мультиассетного режима.
+  @Index()
+  @Column({ type: 'varchar', length: 64, default: 'btc-updown-5m' })
+  assetPrefix: string;
+
   @Index()
   @Column({ type: 'varchar', length: 128 })
   slug: string;
@@ -57,8 +62,25 @@ export class MarketLog {
   @Column({ type: 'double precision', nullable: true })
   entryPrice: number | null;
 
+  // Настроенная цель ставки (BET_AMOUNT на момент входа).
   @Column({ type: 'double precision', default: 1 })
   betAmount: number;
+
+  // Сколько реально удалось "потратить" при проходе по стакану (может быть
+  // меньше betAmount, если глубины не хватило) — это то, что реально стоит
+  // на кону для расчёта профита/лосса, а не заявленная цель.
+  @Column({ type: 'double precision', nullable: true })
+  filledAmount: number | null;
+
+  // Доля betAmount, которую реально удалось исполнить (0..1). Для честности
+  // смоука: 1.0 если стакана хватило целиком, меньше — если пришлось резать заявку.
+  @Column({ type: 'double precision', nullable: true })
+  fillRatio: number | null;
+
+  // Профит в долларах, посчитанный резолвером после исхода: на выигрыше —
+  // filledAmount/entryPrice*(1-entryPrice), на проигрыше — минус filledAmount.
+  @Column({ type: 'double precision', nullable: true })
+  profit: number | null;
 
   // true = ордер (реальный или симулированный) реально исполнился (хотя бы частично)
   @Column({ type: 'boolean', default: false })

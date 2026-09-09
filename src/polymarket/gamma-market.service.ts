@@ -1,5 +1,4 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
 import axios, { AxiosInstance } from 'axios';
 
 export interface CurrentMarketInfo {
@@ -21,25 +20,21 @@ export interface MarketOutcome {
 
 /**
  * Читает публичный Gamma API Polymarket (gamma-api.polymarket.com).
- * Только чтение, авторизация не требуется — используется и для поиска
- * текущего 5-минутного маркета, и для резолва исхода после закрытия.
+ * Только чтение, авторизация не требуется. Не завязан на конкретный
+ * актив — префикс слага (btc-updown-5m, eth-updown-5m, ...) передаётся
+ * параметром, чтобы можно было параллельно вести несколько монет.
  */
 @Injectable()
 export class GammaMarketService {
   private readonly logger = new Logger(GammaMarketService.name);
   private readonly http: AxiosInstance;
-  private readonly slugPrefix: string;
   private readonly intervalSec = 300;
 
-  constructor(private readonly config: ConfigService) {
+  constructor() {
     this.http = axios.create({
       baseURL: 'https://gamma-api.polymarket.com',
       timeout: 5000,
     });
-    this.slugPrefix = this.config.get<string>(
-      'MARKET_SLUG_PREFIX',
-      'btc-updown-5m',
-    );
   }
 
   /**
@@ -48,8 +43,8 @@ export class GammaMarketService {
    * https://polymarket.com/event/btc-updown-5m-1788782100 — это интервал,
    * который НАЧАЛСЯ в 1788782100 и закрывается в 1788782100+300.
    */
-  buildSlugForStart(startTimestampSec: number): string {
-    return `${this.slugPrefix}-${startTimestampSec}`;
+  buildSlugForStart(assetPrefix: string, startTimestampSec: number): string {
+    return `${assetPrefix}-${startTimestampSec}`;
   }
 
   currentIntervalStartTimestampSec(nowMs = Date.now()): number {
@@ -59,13 +54,6 @@ export class GammaMarketService {
 
   currentIntervalCloseTimestampSec(nowMs = Date.now()): number {
     return this.currentIntervalStartTimestampSec(nowMs) + this.intervalSec;
-  }
-
-  async fetchCurrentMarket(): Promise<CurrentMarketInfo | null> {
-    const startTs = this.currentIntervalStartTimestampSec();
-    const closeTs = startTs + this.intervalSec;
-    const slug = this.buildSlugForStart(startTs);
-    return this.fetchMarketBySlug(slug, closeTs);
   }
 
   async fetchMarketBySlug(

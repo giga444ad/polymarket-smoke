@@ -60,13 +60,15 @@ async function main() {
 
   await sleep(500);
 
-  // Симулируем ценовое движение к порогу через price_change (best_bid/best_ask).
+  // Симулируем ценовое движение к порогу через price_change: сначала снимаем
+  // старый уровень 0.5 (size=0 => уровень убирается), затем добавляем новый по 0.99.
   client.send(
     JSON.stringify({
       event_type: 'price_change',
       market: '0xabc',
       price_changes: [
-        { asset_id: YES, price: '0.99', size: '20', side: 'SELL', best_bid: '0.98', best_ask: '0.99' },
+        { asset_id: YES, price: '0.5', size: '0', side: 'SELL' },
+        { asset_id: YES, price: '0.99', size: '20', side: 'SELL' },
       ],
       timestamp: `${Date.now()}`,
     }),
