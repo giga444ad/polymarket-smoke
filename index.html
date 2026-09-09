@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bot Analytics Dashboard</title>
+    
+    <!-- Подключаем Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Подключаем React и ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    
+    <!-- Подключаем Babel для компиляции JSX прямо в браузере -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="bg-gray-50">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useEffect, useState } = React;
+
+        function AnalyticsDashboard() {
+            const [data, setData] = useState(null);
+            const [loading, setLoading] = useState(true);
+            const [error, setError] = useState(null);
+
+            useEffect(() => {
+                fetch('http://localhost:3000/analytics/summary')
+                    .then((res) => {
+                        if (!res.ok) throw new Error('Ошибка сети. Проверьте CORS на бэкенде.');
+                        return res.json();
+                    })
+                    .then((json) => {
+                        setData(json);
+                        setLoading(false);
+                    })
+                    .catch((err) => {
+                        setError(err.message);
+                        setLoading(false);
+                    });
+            }, []);
+
+            if (loading) return <div className="p-8 text-center text-gray-500 font-sans">Загрузка аналитики...</div>;
+            if (error || !data) return <div className="p-8 text-center text-red-500 font-sans">Ошибка: {error}</div>;
+
+            const winRate = data.totals.wins + data.totals.losses > 0 
+                ? ((data.totals.wins / (data.totals.wins + data.totals.losses)) * 100).toFixed(1) 
+                : 0;
+
+            return (
+                <div className="max-w-6xl mx-auto p-6 font-sans text-gray-800">
+                    <h1 className="text-3xl font-bold mb-8 text-gray-900">Bot Analytics Summary</h1>
+
+                    {/* Топ метрики */}
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+                        <MetricCard title="Bankroll (Smoke)" value={`$${data.currentBankroll.smoke}`} />
+                        <MetricCard title="Win Rate" value={`${winRate}%`} subtext={`${data.totals.wins}W / ${data.totals.losses}L`} />
+                        <MetricCard title="Markets Scanned" value={data.totals.marketsScanned} />
+                        <MetricCard title="Bets Placed" value={data.totals.betsPlaced} />
+                    </div>
+
+                    {/* Лучшая попытка */}
+                    <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100 mb-8">
+                        <h2 className="text-xl font-semibold mb-4 text-gray-800">Best Attempt: #{data.bestAttempt.attemptNumber}</h2>
+                        <div className="flex items-center justify-between mb-2">
+                            <span className="text-sm font-medium text-gray-600">
+                                Step {data.bestAttempt.reachedStep} of {data.bestAttempt.targetSteps}
+                            </span>
+                            <span className={`px-3 py-1 rounded-full text-xs font-semibold uppercase ${data.bestAttempt.status === 'active' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                                {data.bestAttempt.status}
+                            </span>
+                        </div>
+                        <ProgressBar reached={data.bestAttempt.reachedStep} target={data.bestAttempt.targetSteps} />
+                    </div>
+
+                    {/* История попыток */}
+                    <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+                        <div className="p-6 border-b border-gray-100">
+                            <h2 className="text-xl font-semibold text-gray-800">Attempts History</h2>
+                        </div>
+                        <div className="overflow-x-auto">
+                            <table className="w-full text-left border-collapse">
+                                <thead>
+                                    <tr className="bg-gray-50 text-gray-600 text-sm">
+                                        <th className="p-4 font-medium">Attempt</th>
+                                        <th className="p-4 font-medium">Status</th>
+                                        <th className="p-4 font-medium">Progress</th>
+                                        <th className="p-4 font-medium">Started</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-gray-100">
+                                    {data.attempts.map((attempt) => (
+                                        <tr key={attempt.attemptNumber} className="hover:bg-gray-50 transition-colors">
+                                            <td className="p-4 font-medium">#{attempt.attemptNumber}</td>
+                                            <td className="p-4">
+                                                <span className={`px-2 py-1 rounded-md text-xs font-semibold uppercase ${attempt.status === 'active' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                                                    {attempt.status}
+                                                </span>
+                                            </td>
+                                            <td className="p-4 w-1/3">
+                                                <div className="flex items-center gap-3">
+                                                    <span className="text-xs text-gray-500 w-12">{attempt.reachedStep}/{attempt.targetSteps}</span>
+                                                    <ProgressBar reached={attempt.reachedStep} target={attempt.targetSteps} />
+                                                </div>
+                                            </td>
+                                            <td className="p-4 text-sm text-gray-500">
+                                                {new Date(attempt.createdAt).toLocaleString()}
+                                            </td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        // Вспомогательные компоненты
+        function MetricCard({ title, value, subtext }) {
+            return (
+                <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-100 flex flex-col justify-center">
+                    <span className="text-sm text-gray-500 font-medium mb-1">{title}</span>
+                    <span className="text-2xl font-bold text-gray-900">{value}</span>
+                    {subtext && <span className="text-xs text-gray-400 mt-1">{subtext}</span>}
+                </div>
+            );
+        }
+
+        function ProgressBar({ reached, target }) {
+            const percentage = Math.min((reached / target) * 100, 100);
+            return (
+                <div className="w-full bg-gray-100 rounded-full h-2.5 overflow-hidden">
+                    <div 
+                        className="bg-blue-600 h-2.5 rounded-full transition-all duration-500 ease-in-out" 
+                        style={{ width: `${percentage}%` }}
+                    />
+                </div>
+            );
+        }
+
+        // Рендерим приложение в элемент div#root
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<AnalyticsDashboard />);
+    </script>
+</body>
+</html>
