@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import axios, { AxiosInstance } from 'axios';
+import { StreamDefinition } from '../trading/stream-config';
 
 export interface CurrentMarketInfo {
   slug: string;
@@ -20,15 +21,31 @@ export interface MarketOutcome {
 
 /**
  * Читает публичный Gamma API Polymarket (gamma-api.polymarket.com).
- * Только чтение, авторизация не требуется. Не завязан на конкретный
- * актив — префикс слага (btc-updown-5m, eth-updown-5m, ...) передаётся
- * параметром, чтобы можно было параллельно вести несколько монет.
+ * Только чтение, авторизация не требуется.
+ *
+ * Раньше был жёстко завязан на единственный таймфрейм (intervalSec=300,
+ * слаг = `${assetPrefix}-${unix_start}`) — предполагалось, что на инстанс
+ * приходится ровно один поток. Теперь параметризован по StreamDefinition
+ * (см. src/trading/stream-config.ts), чтобы вести несколько независимых
+ * потоков (актив × таймфрейм) с разным форматом слага одновременно.
+ *
+ * Формат слага ПРОВЕРЕН ВРУЧНУЮ на живых данных перед реализацией (см. п.4
+ * бэклога — "перед кодированием проверить реальные слаги"):
+ *  - 5m:  btc-updown-5m-1788998100   (слаг = таймстамп НАЧАЛА интервала)
+ *  - 15m: btc-updown-15m-1788997500  (та же схема, интервал 900с)
+ *  - 1h:  bitcoin-up-or-down-september-9-2026-7pm-et — календарная ET-строка,
+ *         НЕ unix-таймстамп; месяц словом, день/час без ведущего нуля,
+ *         am/pm строчными, суффикс "-et". Числовая арифметика границ часа
+ *         (начало/конец) при этом общая с interval-потоками: смещение ET
+ *         относительно UTC — целое число часов, поэтому floor(unixSec/3600)
+ *         даёт ровно те же моменты, что и границы часа по ET.
+ * 4ч/1д не реализованы (сознательно, см. BACKLOG п.5) — если понадобятся,
+ * сюда добавляется третий "kind" по тому же принципу.
  */
 @Injectable()
 export class GammaMarketService {
   private readonly logger = new Logger(GammaMarketService.name);
   private readonly http: AxiosInstance;
-  private readonly intervalSec = 300;
 
   constructor() {
     this.http = axios.create({
@@ -37,23 +54,48 @@ export class GammaMarketService {
     });
   }
 
-  /**
-   * Слаг 5-минутного интервала — по факту (проверено на живых данных)
-   * совпадает с таймстампом НАЧАЛА интервала, не закрытия:
-   * https://polymarket.com/event/btc-updown-5m-1788782100 — это интервал,
-   * который НАЧАЛСЯ в 1788782100 и закрывается в 1788782100+300.
-   */
-  buildSlugForStart(assetPrefix: string, startTimestampSec: number): string {
-    return `${assetPrefix}-${startTimestampSec}`;
-  }
-
-  currentIntervalStartTimestampSec(nowMs = Date.now()): number {
+  currentIntervalStartTimestampSec(intervalSec: number, nowMs = Date.now()): number {
     const nowSec = Math.floor(nowMs / 1000);
-    return Math.floor(nowSec / this.intervalSec) * this.intervalSec;
+    return Math.floor(nowSec / intervalSec) * intervalSec;
   }
 
-  currentIntervalCloseTimestampSec(nowMs = Date.now()): number {
-    return this.currentIntervalStartTimestampSec(nowMs) + this.intervalSec;
+  currentIntervalCloseTimestampSec(intervalSec: number, nowMs = Date.now()): number {
+    return this.currentIntervalStartTimestampSec(intervalSec, nowMs) + intervalSec;
+  }
+
+  /** Слаг маркета, который НАЧИНАЕТСЯ в startTimestampSec, для данного потока. */
+  buildSlugForStart(stream: StreamDefinition, startTimestampSec: number): string {
+    if (stream.kind === 'hourly-et') {
+      return this.buildHourlyEtSlug(stream.etSlugBase!, startTimestampSec * 1000);
+    }
+    return `${stream.slugPrefix}-${startTimestampSec}`;
+  }
+
+  /**
+   * `bitcoin-up-or-down-september-9-2026-7pm-et` — месяц словом (en-US,
+   * строчными), день/год числом без ведущих нулей, час 1-12 без ведущего
+   * нуля + am/pm строчными, суффикс -et. Считается по факту календарной
+   * даты/часа в America/New_York на момент startMs (не локальной зоне
+   * процесса).
+   */
+  private buildHourlyEtSlug(etSlugBase: string, startMs: number): string {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'America/New_York',
+      month: 'long',
+      day: 'numeric',
+      year: 'numeric',
+      hour: 'numeric',
+      hour12: true,
+    }).formatToParts(new Date(startMs));
+
+    const get = (type: string) => parts.find((p) => p.type === type)?.value ?? '';
+    const month = get('month').toLowerCase();
+    const day = get('day');
+    const year = get('year');
+    const hour = get('hour');
+    const dayPeriod = get('dayPeriod').toLowerCase(); // "am" | "pm"
+
+    return `${etSlugBase}-${month}-${day}-${year}-${hour}${dayPeriod}-et`;
   }
 
   async fetchMarketBySlug(

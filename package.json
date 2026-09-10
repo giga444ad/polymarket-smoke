@@ -14,7 +14,8 @@
     "start": "nest start",
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",
-    "start:prod": "node dist/main.js"
+    "start:prod": "node dist/main.js",
+    "measure:depth": "tsx scripts/measure-book-depth.ts"
   },
   "dependencies": {
     "@nestjs/common": "^11.2.3",
@@ -25,9 +26,11 @@
     "@polymarket/clob-client": "5.8.1",
     "axios": "^1.20.0",
     "ethers": "^5.8.0",
+    "https-proxy-agent": "^5.0.1",
     "pg": "^8.23.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1",
+    "socks-proxy-agent": "^7.0.0",
     "typeorm": "^0.3.31",
     "ws": "^8.21.3"
   },

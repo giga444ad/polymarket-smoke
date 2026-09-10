@@ -68,6 +68,16 @@ export class AnalyticsController {
       null,
     );
 
+    // Лучшая попытка ОТДЕЛЬНО по каждому потоку (streamKey) — раньше был
+    // единственный общий счётчик на все активы, теперь у каждого потока своя
+    // независимая прогрессия (см. BACKLOG п.3), так что имеет смысл сравнивать
+    // прогресс потоков между собой, а не только глобальный максимум.
+    const bestByStream = new Map<string, Attempt>();
+    for (const a of attempts) {
+      const current = bestByStream.get(a.streamKey);
+      if (!current || a.currentStep > current.currentStep) bestByStream.set(a.streamKey, a);
+    }
+
     // Маркеты, зависшие в pending_resolve дольше STALE_RESOLVE_WARN_MS — то же,
     // что предупреждает в логах TradingService.warnStaleUnresolved(), но здесь
     // видно на фронте без необходимости лезть в консоль.
@@ -108,18 +118,31 @@ export class AnalyticsController {
       bestAttempt: bestAttempt
         ? {
             attemptNumber: bestAttempt.attemptNumber,
+            streamKey: bestAttempt.streamKey,
             isSmoke: bestAttempt.isSmoke,
             reachedStep: bestAttempt.currentStep,
             targetSteps: bestAttempt.targetSteps,
             status: bestAttempt.status,
           }
         : null,
+      bestByStream: [...bestByStream.values()].map((a) => ({
+        streamKey: a.streamKey,
+        attemptNumber: a.attemptNumber,
+        isSmoke: a.isSmoke,
+        reachedStep: a.currentStep,
+        targetSteps: a.targetSteps,
+        status: a.status,
+        currentStake: a.currentStake,
+      })),
       attempts: attempts.map((a) => ({
         attemptNumber: a.attemptNumber,
+        streamKey: a.streamKey,
         isSmoke: a.isSmoke,
         status: a.status,
         reachedStep: a.currentStep,
         targetSteps: a.targetSteps,
+        currentStake: a.currentStake,
+        baseStake: a.baseStake,
         createdAt: a.createdAt,
         finishedAt: a.finishedAt,
       })),

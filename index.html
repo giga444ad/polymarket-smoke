@@ -94,19 +94,26 @@
                             <MetricCard title="Bets Placed" value={data.totals.betsPlaced} />
                         </div>
 
-                        {/* Лучшая попытка */}
-                        {data.bestAttempt && (
-                            <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-100 mb-8">
-                                <h2 className="text-xl font-semibold mb-4 text-gray-800">Best Attempt: #{data.bestAttempt.attemptNumber}</h2>
-                                <div className="flex items-center justify-between mb-2">
-                                    <span className="text-sm font-medium text-gray-600">
-                                        Step {data.bestAttempt.reachedStep} of {data.bestAttempt.targetSteps}
-                                    </span>
-                                    <span className={`px-3 py-1 rounded-full text-xs font-semibold uppercase ${data.bestAttempt.status === 'active' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
-                                        {data.bestAttempt.status}
-                                    </span>
-                                </div>
-                                <ProgressBar reached={data.bestAttempt.reachedStep} target={data.bestAttempt.targetSteps} />
+                        {/* Лучшая попытка по каждому независимому потоку (актив × таймфрейм) —
+                            раньше был один общий счётчик шагов на все активы сразу, теперь у
+                            каждого потока своя прогрессия/прогресс, см. BACKLOG п.3. */}
+                        {data.bestByStream && data.bestByStream.length > 0 && (
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+                                {data.bestByStream.map((a) => (
+                                    <div key={a.streamKey} className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+                                        <h2 className="text-sm font-semibold mb-1 text-gray-500 uppercase tracking-wide">{a.streamKey}</h2>
+                                        <div className="flex items-center justify-between mb-2">
+                                            <span className="text-sm font-medium text-gray-600">
+                                                Step {a.reachedStep} of {a.targetSteps}
+                                            </span>
+                                            <span className={`px-3 py-1 rounded-full text-xs font-semibold uppercase ${a.status === 'active' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                                                {a.status}
+                                            </span>
+                                        </div>
+                                        <ProgressBar reached={a.reachedStep} target={a.targetSteps} />
+                                        <p className="text-xs text-gray-500 mt-2">Attempt #{a.attemptNumber} — current stake ${Number(a.currentStake).toFixed(2)}</p>
+                                    </div>
+                                ))}
                             </div>
                         )}
 
@@ -119,15 +126,18 @@
                                 <table className="w-full text-left border-collapse">
                                     <thead>
                                         <tr className="bg-gray-50 text-gray-600 text-sm">
+                                            <th className="p-4 font-medium">Stream</th>
                                             <th className="p-4 font-medium">Attempt</th>
                                             <th className="p-4 font-medium">Status</th>
                                             <th className="p-4 font-medium">Progress</th>
+                                            <th className="p-4 font-medium">Stake</th>
                                             <th className="p-4 font-medium">Started</th>
                                         </tr>
                                     </thead>
                                     <tbody className="divide-y divide-gray-100">
                                         {data.attempts?.map((attempt) => (
-                                            <tr key={`${attempt.isSmoke}-${attempt.attemptNumber}`} className="hover:bg-gray-50 transition-colors">
+                                            <tr key={`${attempt.isSmoke}-${attempt.streamKey}-${attempt.attemptNumber}`} className="hover:bg-gray-50 transition-colors">
+                                                <td className="p-4 text-xs text-gray-500">{attempt.streamKey}</td>
                                                 <td className="p-4 font-medium">#{attempt.attemptNumber}</td>
                                                 <td className="p-4">
                                                     <span className={`px-2 py-1 rounded-md text-xs font-semibold uppercase ${attempt.status === 'active' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
@@ -140,6 +150,7 @@
                                                         <ProgressBar reached={attempt.reachedStep} target={attempt.targetSteps} />
                                                     </div>
                                                 </td>
+                                                <td className="p-4 text-sm text-gray-500">${Number(attempt.currentStake).toFixed(2)}</td>
                                                 <td className="p-4 text-sm text-gray-500">
                                                     {new Date(attempt.createdAt).toLocaleString()}
                                                 </td>

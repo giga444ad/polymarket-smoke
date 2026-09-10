@@ -10,6 +10,7 @@ import { PolymarketTraderService } from '../polymarket/polymarket-trader.service
 import { LiveBook, MarketWsStream, Outcome } from '../polymarket/market-ws-stream';
 import { cumulativeUsdAtOrBelow, walkAsksForFill } from '../polymarket/book-fill.util';
 import { PriceFeedService } from '../polymarket/price-feed.service';
+import { parseStreamsConfig, StreamDefinition } from './stream-config';
 
 type LimitTier = 'T1' | 'T2' | 'T3';
 
@@ -29,6 +30,9 @@ interface EntryDiagnostics {
 }
 
 interface MarketState {
+  // = stream.streamKey; хранится в колонке assetPrefix (переиспользуем
+  // существующую схему — она и раньше кодировала "актив+таймфрейм", просто
+  // Attempt раньше её игнорировал, см. п.3 бэклога).
   assetPrefix: string;
   slug: string;
   closesAt: Date;
@@ -53,6 +57,18 @@ interface MarketState {
   // id уже записанного MarketLog — нужен, чтобы дописать close-диагностику
   // (priceAtClose/atrAtClose) в finalizeMarket, не создавая второй лог.
   marketLogId: string | null;
+  // Стейк реинвест-прогрессии ЭТОГО потока, зафиксированный в момент открытия
+  // окна (снимок Attempt.currentStake на момент старта шага) — п.1 бэклога.
+  // Снимаем один раз при открытии, а не читаем на каждый тик, чтобы ставка
+  // внутри уже открытого окна не "поехала", если резолвер параллельно
+  // подвинет currentStake по другому, ещё не закрытому шагу того же потока
+  // (при последовательных окнах такого не бывает, но так честнее и проще
+  // рассуждать про инвариант "ставка шага фиксируется на его открытии").
+  betAmount: number;
+  // Уже залогировали переход в "окно входа" (последние LAST_ENTRY_WINDOW_SEC
+  // секунд) для этого маркета? Чтобы не спамить лог на каждый WS-тик до
+  // наступления этого момента — см. onBookUpdate.
+  lastMinuteAnnounced: boolean;
 }
 
 const EMPTY_BOOK = (outcome: Outcome, tickSize: string): LiveBook => ({
@@ -69,19 +85,30 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(TradingService.name);
 
   private isSmoke: boolean;
-  private betAmount: number;
   private minMarketPrice: number;
   private maxMarketPrice: number;
   private favoriteBidThreshold: number;
   private tierPrices: Record<LimitTier, number>;
   private tier2Seconds: number;
   private tier3Seconds: number;
+  // Не пытаемся входить (ни маркетом, ни лимиткой) раньше, чем останется
+  // это количество секунд до закрытия окна. Чем раньше пытаться войти, тем
+  // менее уверенно рынок ещё определился с направлением — по факту оба
+  // недавних слива случились именно на ранних, "неуверенных" входах, когда
+  // маркетмейкер уже давал ¢99, а цена потом успевала развернуться. Лучше
+  // пропустить шаг, чем рисковать капиталом на неопределившемся рынке.
+  private lastEntryWindowSec: number;
   private maxOverspendMultiplier: number;
   private minFillRatio: number;
   private targetSteps: number;
   private discoveryPollMs: number;
   private resolvePollMs: number;
-  private assetPrefixes: string[];
+
+  // Независимые потоки (актив × таймфрейм) — см. п.3/п.4 бэклога и
+  // src/trading/stream-config.ts. Раньше был единственный this.betAmount и
+  // единственный assetPrefixes[] с общим счётчиком шагов на все активы сразу.
+  private readonly streams: StreamDefinition[];
+  private readonly streamByKey: Map<string, StreamDefinition>;
 
   // --- ATR-гейт входа (см. README/обсуждение) ---
   // По умолчанию выключен (SHADOW-режим): диагностика считается и пишется в
@@ -93,7 +120,9 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
   // прежде чем мы начнём предупреждать в логах/на фронте (не блокирует торговлю).
   private staleResolveWarnMs: number;
 
-  private currentAttempt: Attempt;
+  // По одному активному Attempt на каждый streamKey — независимая
+  // прогрессия/прогресс для каждого потока (п.3 бэклога).
+  private currentAttempts = new Map<string, Attempt>();
   private activeMarkets = new Map<string, MarketState>();
   private stopped = false;
 
@@ -107,7 +136,6 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     @InjectRepository(MarketLog) private readonly marketLogRepo: Repository<MarketLog>,
   ) {
     this.isSmoke = this.config.get<string>('SMOKE_START', 'true') === 'true';
-    this.betAmount = parseFloat(this.config.get<string>('BET_AMOUNT', '5'));
     this.minMarketPrice = parseFloat(this.config.get<string>('MIN_MARKET_PRICE', '0.99'));
     this.maxMarketPrice = parseFloat(this.config.get<string>('MAX_MARKET_PRICE', '0.999'));
     this.favoriteBidThreshold = parseFloat(
@@ -120,6 +148,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     };
     this.tier2Seconds = parseInt(this.config.get<string>('LIMIT_TIER2_SECONDS', '150'), 10);
     this.tier3Seconds = parseInt(this.config.get<string>('LIMIT_TIER3_SECONDS', '60'), 10);
+    this.lastEntryWindowSec = parseInt(this.config.get<string>('LAST_ENTRY_WINDOW_SEC', '60'), 10);
     this.maxOverspendMultiplier = parseFloat(
       this.config.get<string>('MAX_OVERSPEND_MULTIPLIER', '1.5'),
     );
@@ -127,13 +156,11 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     this.targetSteps = parseInt(this.config.get<string>('TARGET_STEPS', '500'), 10);
     this.discoveryPollMs = parseInt(this.config.get<string>('MARKET_DISCOVERY_POLL_MS', '1500'), 10);
     this.resolvePollMs = parseInt(this.config.get<string>('RESOLVE_POLL_INTERVAL_MS', '10000'), 10);
-    this.assetPrefixes = this.config
-      .get<string>('MARKET_ASSETS', 'btc-updown-5m')
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean);
 
-    this.entryFilterEnabled = this.config.get<string>('ENTRY_FILTER_ENABLED', 'false') === 'true';
+    this.streams = parseStreamsConfig(this.config.get<string>('STREAMS_CONFIG'));
+    this.streamByKey = new Map(this.streams.map((s) => [s.streamKey, s]));
+
+    this.entryFilterEnabled = this.config.get<string>('ENTRY_FILTER_ENABLED', 'true') === 'true';
     this.minDistanceAtrRatio = parseFloat(this.config.get<string>('MIN_DISTANCE_ATR_RATIO', '1.5'));
     this.staleResolveWarnMs = parseInt(this.config.get<string>('STALE_RESOLVE_WARN_MS', '180000'), 10);
   }
@@ -151,14 +178,24 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
-    this.currentAttempt = await this.getOrCreateActiveAttempt();
+    for (const stream of this.streams) {
+      const attempt = await this.getOrCreateActiveAttempt(stream);
+      this.currentAttempts.set(stream.streamKey, attempt);
+    }
+
     this.logger.log(
       `Старт. Режим: ${this.isSmoke ? 'SMOKE (без реальных ордеров)' : 'LIVE (реальные деньги)'}. ` +
-        `Активы: ${this.assetPrefixes.join(', ')}. ` +
-        `Попытка #${this.currentAttempt.attemptNumber}, шаг ${this.currentAttempt.currentStep}/${this.currentAttempt.targetSteps}. ` +
-        `Маркет-тейк [¢${this.minMarketPrice * 100}-¢${this.maxMarketPrice * 100}] (минимум заполнения ${this.minFillRatio * 100}%), ` +
+        `Потоки (${this.streams.length}): ` +
+        this.streams
+          .map((s) => {
+            const a = this.currentAttempts.get(s.streamKey)!;
+            return `${s.streamKey}[попытка #${a.attemptNumber}, шаг ${a.currentStep}/${a.targetSteps}, стейк $${a.currentStake.toFixed(2)}]`;
+          })
+          .join('; ') +
+        `. Маркет-тейк [¢${this.minMarketPrice * 100}-¢${this.maxMarketPrice * 100}] (минимум заполнения ${this.minFillRatio * 100}%), ` +
         `лимитки-фолбэк от ¢${this.favoriteBidThreshold * 100} (тиры ${this.tierPrices.T1 * 100}/${this.tierPrices.T2 * 100}/${this.tierPrices.T3 * 100}). ` +
-        `ATR-гейт входа: ${this.entryFilterEnabled ? `ВКЛЮЧЁН (мин. ${this.minDistanceAtrRatio}x ATR)` : 'выключен (только диагностика в логах)'}.`,
+        `Окно входа: последние ${this.lastEntryWindowSec}с до закрытия (раньше — не пытаемся войти вообще). ` +
+        `ATR-гейт входа: ${this.entryFilterEnabled ? `ВКЛЮЧЁН (мин. ${this.minDistanceAtrRatio}x ATR, при недоступной диагностике — пропуск шага, не вход вслепую)` : 'выключен (только диагностика в логах)'}.`,
     );
 
     this.startDiscoveryLoop();
@@ -173,21 +210,24 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private async getOrCreateActiveAttempt(): Promise<Attempt> {
+  private async getOrCreateActiveAttempt(stream: StreamDefinition): Promise<Attempt> {
     const active = await this.attemptRepo.findOne({
-      where: { status: 'active', isSmoke: this.isSmoke },
+      where: { status: 'active', isSmoke: this.isSmoke, streamKey: stream.streamKey },
       order: { createdAt: 'DESC' },
     });
     if (active) return active;
 
     const last = await this.attemptRepo.findOne({
-      where: { isSmoke: this.isSmoke },
+      where: { isSmoke: this.isSmoke, streamKey: stream.streamKey },
       order: { attemptNumber: 'DESC' },
     });
     const attempt = this.attemptRepo.create({
       attemptNumber: (last?.attemptNumber ?? 0) + 1,
+      streamKey: stream.streamKey,
       currentStep: 0,
       targetSteps: this.targetSteps,
+      baseStake: stream.baseStake,
+      currentStake: stream.baseStake,
       status: 'active',
       isSmoke: this.isSmoke,
       finishedAt: null,
@@ -196,7 +236,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
   }
 
   // ---------------------------------------------------------------------
-  // Обнаружение маркетов по каждому настроенному активу отдельно.
+  // Обнаружение маркетов — независимо по каждому настроенному потоку.
   // ---------------------------------------------------------------------
   private async startDiscoveryLoop() {
     while (!this.stopped) {
@@ -210,28 +250,30 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async discoveryTick(): Promise<void> {
-    const startTs = this.gamma.currentIntervalStartTimestampSec();
-    const closeTs = this.gamma.currentIntervalCloseTimestampSec();
+    for (const stream of this.streams) {
+      const startTs = this.gamma.currentIntervalStartTimestampSec(stream.intervalSec);
+      const closeTs = this.gamma.currentIntervalCloseTimestampSec(stream.intervalSec);
+      const slug = this.gamma.buildSlugForStart(stream, startTs);
 
-    for (const assetPrefix of this.assetPrefixes) {
-      const slug = this.gamma.buildSlugForStart(assetPrefix, startTs);
-      if (this.activeMarkets.get(assetPrefix)?.slug === slug) continue; // уже отслеживаем
+      if (this.activeMarkets.get(stream.streamKey)?.slug === slug) continue; // уже отслеживаем
 
       const market = await this.gamma.fetchMarketBySlug(slug, closeTs);
       if (!market) continue; // ещё не создан на Gamma — попробуем на следующем тике
 
-      await this.openMarket(assetPrefix, market.slug, market.closesAt, market.yesTokenId, market.noTokenId, market.negRisk);
+      await this.openMarket(stream, market.slug, market.closesAt, market.yesTokenId, market.noTokenId, market.negRisk);
     }
   }
 
   private async openMarket(
-    assetPrefix: string,
+    stream: StreamDefinition,
     slug: string,
     closesAt: Date,
     yesTokenId: string,
     noTokenId: string,
     negRisk: boolean,
   ): Promise<void> {
+    const streamKey = stream.streamKey;
+
     // Разовый REST-бутстрап: тик-сайз + официальный минимальный размер ордера биржи.
     const [yesBoot, noBoot] = await Promise.all([
       this.clobPublic.getBestQuote(yesTokenId),
@@ -240,20 +282,30 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     const initialTickSize = yesBoot?.tickSize ?? noBoot?.tickSize ?? '0.01';
     const minOrderSize = yesBoot?.minOrderSize ?? noBoot?.minOrderSize ?? 5;
 
+    // Снимок стейка реинвест-прогрессии ЭТОГО потока на момент открытия окна
+    // (п.1 бэклога) — фиксируем один раз здесь, дальше в течение всего окна
+    // используем именно это число, а не текущее значение Attempt.
+    const attempt = this.currentAttempts.get(streamKey);
+    if (!attempt) {
+      this.logger.error(`[${streamKey}] ${slug}: нет активного Attempt для потока — пропуск окна (не должно происходить).`);
+      return;
+    }
+    const betAmount = attempt.currentStake;
+
     // Фиксируем ориентир по внешнему фиду в момент открытия окна — от него будем
     // считать дельту/ATR-рацио на входе и на закрытии. Если фид ещё не успел
     // прогреться (нет ни одного тика), просто останется null — вся диагностика
     // и гейт в этом случае молча отключаются для конкретного окна (fail-open).
-    const referenceSnapshot = this.priceFeed.getSnapshot(assetPrefix);
+    const referenceSnapshot = this.priceFeed.getSnapshot(streamKey);
     if (referenceSnapshot.price == null) {
       this.logger.warn(
-        `[${assetPrefix}] ${slug}: внешний ценовой фид ещё не отдал ни одного тика — ` +
+        `[${streamKey}] ${slug}: внешний ценовой фид ещё не отдал ни одного тика — ` +
           `диагностика/ATR-гейт для этого окна будут недоступны.`,
       );
     }
 
     const marketState: MarketState = {
-      assetPrefix,
+      assetPrefix: streamKey,
       slug,
       closesAt,
       yesTokenId,
@@ -274,24 +326,27 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       closeTimer: null as any,
       referencePrice: referenceSnapshot.price,
       marketLogId: null,
+      betAmount,
+      lastMinuteAnnounced: false,
     };
 
-    const stream = new MarketWsStream(
+    const wsStream = new MarketWsStream(
       yesTokenId,
       noTokenId,
       initialTickSize,
       (outcome, book) => this.onBookUpdate(marketState, outcome, book),
     );
-    marketState.stream = stream;
+    marketState.stream = wsStream;
 
     const msUntilClose = Math.max(0, closesAt.getTime() - Date.now());
     marketState.closeTimer = setTimeout(() => this.finalizeMarket(marketState), msUntilClose);
 
-    this.activeMarkets.set(assetPrefix, marketState);
-    stream.connect();
+    this.activeMarkets.set(streamKey, marketState);
+    wsStream.connect();
 
     this.logger.log(
-      `[${assetPrefix}] ${slug}: открыт WS-поток (закрытие через ${(msUntilClose / 1000).toFixed(0)}с, min_order_size=${minOrderSize}, tick=${initialTickSize}, ` +
+      `[${streamKey}] ${slug}: открыт WS-поток (закрытие через ${(msUntilClose / 1000).toFixed(0)}с, стейк шага $${betAmount.toFixed(2)} ` +
+        `[попытка #${attempt.attemptNumber}, шаг ${attempt.currentStep + 1}/${attempt.targetSteps}], min_order_size=${minOrderSize}, tick=${initialTickSize}, ` +
         `referencePrice=${referenceSnapshot.price ?? 'н/д'})`,
     );
   }
@@ -325,7 +380,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
           chosenTokenId: outcome === 'YES' ? marketState.yesTokenId : marketState.noTokenId,
           entryPrice: resting.price,
           filledAmount: targetUsd,
-          fillRatio: targetUsd / this.betAmount,
+          fillRatio: targetUsd / marketState.betAmount,
           executed: true,
           orderType: 'SIMULATED_LIMIT',
           limitTier: resting.tier,
@@ -340,7 +395,21 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
-    // 1) Правило A — агрессивный маркет-тейк: реально проходим по уровням стакана
+    // 1) Ждём последней минуты (LAST_ENTRY_WINDOW_SEC) перед тем, как вообще
+    //    пытаться войти — ни маркетом, ни лимиткой. Чем раньше вход, тем
+    //    менее рынок ещё "определился": именно так случились оба недавних
+    //    слива (ask по ¢99 появлялся за 2-3 минуты до закрытия, а потом цена
+    //    успевала развернуться). Лучше пропустить шаг целиком, чем рисковать
+    //    капиталом на неопределившемся рынке.
+    if (timeLeftSec > this.lastEntryWindowSec) return;
+    if (!marketState.lastMinuteAnnounced) {
+      marketState.lastMinuteAnnounced = true;
+      this.logger.log(
+        `[${marketState.assetPrefix}] ${marketState.slug}: вошли в окно входа (последние ${this.lastEntryWindowSec}с) — начинаем искать вход.`,
+      );
+    }
+
+    // 2) Правило A — агрессивный маркет-тейк: реально проходим по уровням стакана
     //    (не делаем вид, что весь объём взяли по единственной лучшей цене).
     for (const oc of ['YES', 'NO'] as const) {
       const b = marketState.books[oc];
@@ -353,7 +422,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    // 2) Правило B — лимитка-фолбэк, если у фаворита реально нет предложений на продажу.
+    // 3) Правило B — лимитка-фолбэк, если у фаворита реально нет предложений на продажу.
     const favorite = this.pickFavorite(marketState.books);
     if (!favorite) return;
     const fb = marketState.books[favorite];
@@ -394,11 +463,11 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** Сколько $ нужно набрать нашей резюм-лимиткой, чтобы удовлетворить минимум биржи
-   *  (не капая эту сумму обратно до betAmount — иначе проверка допустимого перерасхода
+   *  (не капая эту сумму обратно до стейка шага — иначе проверка допустимого перерасхода
    *  в вызывающем коде никогда не сработает). */
   private limitOrderTargetUsd(marketState: MarketState, price: number): number {
     const minUsd = marketState.minOrderSize * price;
-    return Math.max(this.betAmount, minUsd);
+    return Math.max(marketState.betAmount, minUsd);
   }
 
   // ---------------------------------------------------------------------
@@ -427,8 +496,17 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       return { allow: true, diagnostics, reason: null };
     }
     if (diagnostics.atrRatioAtEntry == null) {
-      // Нет данных для оценки (фид/референс/ATR ещё не готовы) — не блокируем.
-      return { allow: true, diagnostics, reason: null };
+      // Гейт включён, но диагностика недоступна (фид не отдал ни одного тика
+      // до этого момента, либо ATR ещё не прогрелся) — раньше это было
+      // fail-open (пропускали не глядя). Теперь фейл-клоуз: лучше упустить
+      // шаг, чем войти вслепую без понимания, насколько уверенно движение.
+      return {
+        allow: false,
+        diagnostics,
+        reason:
+          'ATR-гейт включён, но диагностика недоступна (нет цены/ATR по внешнему фиду на момент входа) — ' +
+          'пропускаем шаг: упустить сделку лучше, чем рисковать капиталом вслепую.',
+      };
     }
     if (diagnostics.atrRatioAtEntry < this.minDistanceAtrRatio) {
       return {
@@ -450,7 +528,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
   // ---------------------------------------------------------------------
   private async tryMarketBuy(marketState: MarketState, outcome: Outcome, book: LiveBook): Promise<void> {
     const tokenId = outcome === 'YES' ? marketState.yesTokenId : marketState.noTokenId;
-    const fill = walkAsksForFill(book.asks, this.betAmount, this.maxMarketPrice);
+    const fill = walkAsksForFill(book.asks, marketState.betAmount, this.maxMarketPrice);
 
     if (fill.filledShares <= 0) {
       this.logger.debug(`[${marketState.assetPrefix}][Market] ${marketState.slug}: нет реальной ликвидности по ${outcome} в диапазоне — пропуск`);
@@ -492,7 +570,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
           status: 'pending_resolve',
           logMessage:
             fill.filledRatio < 0.999
-              ? `SMOKE: частичное исполнение — забрали $${fill.filledUsd.toFixed(2)} из $${this.betAmount} (${(fill.filledRatio * 100).toFixed(0)}%) по VWAP ¢${(fill.vwapPrice! * 100).toFixed(2)}.`
+              ? `SMOKE: частичное исполнение — забрали $${fill.filledUsd.toFixed(2)} из $${marketState.betAmount.toFixed(2)} (${(fill.filledRatio * 100).toFixed(0)}%) по VWAP ¢${(fill.vwapPrice! * 100).toFixed(2)}.`
               : `SMOKE: маркет-ордер не отправлялся, только эмуляция прохода по стакану (VWAP ¢${(fill.vwapPrice! * 100).toFixed(2)}).`,
           ...gate.diagnostics,
         });
@@ -506,7 +584,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
 
       const result = await this.trader.placeMarketBuy({
         tokenId,
-        amountUsd: this.betAmount,
+        amountUsd: marketState.betAmount,
         worstPrice: this.maxMarketPrice,
         tickSize: book.tickSize,
         negRisk: marketState.negRisk,
@@ -529,7 +607,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
         chosenTokenId: tokenId,
         entryPrice: fill.vwapPrice,
         filledAmount: actualUsd,
-        fillRatio: actualUsd / this.betAmount,
+        fillRatio: actualUsd / marketState.betAmount,
         executed: true,
         orderType: 'FAK',
         orderId: result.orderId,
@@ -559,7 +637,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       const tokenId = outcome === 'YES' ? marketState.yesTokenId : marketState.noTokenId;
       const targetUsd = this.limitOrderTargetUsd(marketState, price);
 
-      if (targetUsd > this.betAmount * this.maxOverspendMultiplier) {
+      if (targetUsd > marketState.betAmount * this.maxOverspendMultiplier) {
         marketState.skippedLimitTier = tier;
         this.logger.debug(
           `[${marketState.assetPrefix}][Limit] ${marketState.slug}: пропуск тира ${tier} — нужно ~$${targetUsd.toFixed(2)} для минимума биржи, больше допустимого.`,
@@ -667,7 +745,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
             chosenTokenId: tokenId,
             entryPrice: resting.price,
             filledAmount,
-            fillRatio: filledAmount / this.betAmount,
+            fillRatio: filledAmount / marketState.betAmount,
             executed: true,
             orderType: 'GTD',
             limitTier: resting.tier,
@@ -734,14 +812,20 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     if (marketState.logWritten) return null;
     marketState.logWritten = true;
 
+    const attempt = this.currentAttempts.get(marketState.assetPrefix);
+    if (!attempt) {
+      this.logger.error(`[${marketState.assetPrefix}] ${marketState.slug}: нет активного Attempt на момент записи лога — не должно происходить.`);
+      return null;
+    }
+
     const saved = await this.marketLogRepo.save(
       this.marketLogRepo.create({
-        attemptId: this.currentAttempt.id,
-        stepNumber: this.currentAttempt.currentStep + 1,
+        attemptId: attempt.id,
+        stepNumber: attempt.currentStep + 1,
         assetPrefix: marketState.assetPrefix,
         slug: marketState.slug,
         closesAt: marketState.closesAt,
-        betAmount: this.betAmount,
+        betAmount: marketState.betAmount,
         isSmoke: this.isSmoke,
         chosenOutcome: fields.chosenOutcome,
         chosenTokenId: fields.chosenTokenId ?? null,
@@ -766,7 +850,9 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
 
   // ---------------------------------------------------------------------
   // Резолвер: REST-опрос Gamma API по закрытым маркетам, продвигает шаги
-  // и считает профит по факту исхода.
+  // и считает профит по факту исхода. Общий для всех потоков (сами логи уже
+  // несут attemptId/assetPrefix=streamKey, поэтому один цикл резолва работает
+  // одинаково независимо от того, сколько потоков сконфигурировано).
   // ---------------------------------------------------------------------
   private async startResolverLoop() {
     while (!this.stopped) {
@@ -832,34 +918,49 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       const attempt = await this.attemptRepo.findOneOrFail({ where: { id: log.attemptId } });
       if (attempt.status !== 'active') continue; // попытка уже закрыта ранее
 
+      const streamKey = log.assetPrefix;
+      const stream = this.streamByKey.get(streamKey);
+      const baseStake = stream?.baseStake ?? attempt.baseStake;
+
       if (won) {
         attempt.currentStep += 1;
+        // Реинвест-прогрессия (п.1 бэклога): следующий стейк = реально
+        // полученные деньги за этот шаг = spentUsd/entryPrice (то, что даёт
+        // выплата $1/акцию победителя) — считаем по ФАКТИЧЕСКОЙ цене
+        // исполнения (VWAP шага), а не по константе ¢99, потому что VWAP
+        // гуляет по тирам лимитки/маркет-тейка.
+        attempt.currentStake = spentUsd / entryPrice;
         if (attempt.currentStep >= attempt.targetSteps) {
           attempt.status = 'completed_target';
           attempt.finishedAt = new Date();
           this.logger.log(
-            `[GOAL] Попытка #${attempt.attemptNumber} (${attempt.isSmoke ? 'smoke' : 'live'}) дошла до ${attempt.targetSteps} шага!`,
+            `[GOAL] [${streamKey}] Попытка #${attempt.attemptNumber} (${attempt.isSmoke ? 'smoke' : 'live'}) дошла до ${attempt.targetSteps} шага!`,
           );
         }
         await this.attemptRepo.save(attempt);
+        this.currentAttempts.set(streamKey, attempt);
       } else {
         attempt.status = 'failed';
         attempt.finishedAt = new Date();
         await this.attemptRepo.save(attempt);
         this.logger.warn(
-          `[LOSS] Попытка #${attempt.attemptNumber} (${attempt.isSmoke ? 'smoke' : 'live'}) слита на шаге ${attempt.currentStep} ` +
-            `(${log.assetPrefix}, профит шага $${log.profit.toFixed(2)}, ${log.resolvedAt.toISOString()}). ${log.failReason ?? ''} Открываю новую попытку.`,
+          `[LOSS] [${streamKey}] Попытка #${attempt.attemptNumber} (${attempt.isSmoke ? 'smoke' : 'live'}) слита на шаге ${attempt.currentStep} ` +
+            `(профит шага $${log.profit.toFixed(2)}, ${log.resolvedAt.toISOString()}). ${log.failReason ?? ''} Открываю новую попытку (стейк сброшен на базовый $${baseStake.toFixed(2)}).`,
         );
 
         const next = this.attemptRepo.create({
           attemptNumber: attempt.attemptNumber + 1,
+          streamKey,
           currentStep: 0,
           targetSteps: this.targetSteps,
+          baseStake,
+          currentStake: baseStake, // сброс прогрессии на базовый стейк потока
           status: 'active',
           isSmoke: attempt.isSmoke,
           finishedAt: null,
         });
-        this.currentAttempt = await this.attemptRepo.save(next);
+        const saved = await this.attemptRepo.save(next);
+        this.currentAttempts.set(streamKey, saved);
       }
     }
   }

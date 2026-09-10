@@ -8,7 +8,6 @@ const attemptSaves: any[] = [];
 const fakeConfig = {
   overrides: {
     SMOKE_START: 'true',
-    BET_AMOUNT: '5',
     MIN_MARKET_PRICE: '0.99',
     MAX_MARKET_PRICE: '0.999',
     FAVORITE_BID_THRESHOLD: '0.90',
@@ -19,7 +18,17 @@ const fakeConfig = {
     LIMIT_TIER3_SECONDS: '60',
     MAX_OVERSPEND_MULTIPLIER: '1.5',
     MIN_FILL_RATIO: '0.5',
-    MARKET_ASSETS: 'btc-updown-5m,eth-updown-5m',
+    // Тесты 1-6 проверяют механику стакана/резолва, не новые гейты — держим
+    // их отключёнными/широкими здесь и тестируем гейты отдельно ниже
+    // (Тесты 9-10), т.к. по умолчанию в проде теперь ENTRY_FILTER_ENABLED=true
+    // и LAST_ENTRY_WINDOW_SEC=60 (см. .env.example).
+    LAST_ENTRY_WINDOW_SEC: '600',
+    ENTRY_FILTER_ENABLED: 'false',
+    STREAMS_CONFIG: JSON.stringify([
+      { streamKey: 'btc-updown-5m', kind: 'interval', intervalSec: 300, slugPrefix: 'btc-updown-5m', baseStake: 5 },
+      { streamKey: 'btc-updown-15m', kind: 'interval', intervalSec: 900, slugPrefix: 'btc-updown-15m', baseStake: 5 },
+      { streamKey: 'bitcoin-up-or-down', kind: 'hourly-et', intervalSec: 3600, etSlugBase: 'bitcoin-up-or-down', baseStake: 5 },
+    ]),
   } as Record<string, string>,
   get(key: string, def?: string) {
     return this.overrides[key] ?? def;
@@ -29,7 +38,8 @@ const fakeConfig = {
 const fakeGamma: any = {
   currentIntervalStartTimestampSec: () => 700,
   currentIntervalCloseTimestampSec: () => 1000,
-  buildSlugForStart: (assetPrefix: string, ts: number) => `${assetPrefix}-${ts}`,
+  buildSlugForStart: (stream: any, ts: number) =>
+    stream.kind === 'hourly-et' ? `${stream.etSlugBase}-fake-hourly-slug-${ts}` : `${stream.slugPrefix}-${ts}`,
   fetchMarketBySlug: async () => null,
   fetchOutcome: async () => null as any,
 };
@@ -62,7 +72,16 @@ const fakeAttemptRepo = {
     attemptSaves.push(saved);
     return saved;
   },
-  findOneOrFail: async () => ({ id: 'attempt-1', status: 'active', currentStep: 0, targetSteps: 500, isSmoke: true }),
+  findOneOrFail: async () => ({
+    id: 'attempt-1',
+    streamKey: 'btc-updown-5m',
+    status: 'active',
+    currentStep: 0,
+    targetSteps: 500,
+    baseStake: 5,
+    currentStake: 5,
+    isSmoke: true,
+  }),
 };
 
 const fakeMarketLogRepo: any = {
@@ -97,6 +116,10 @@ function makeMarketState(overrides: any = {}) {
     closeTimer: setTimeout(() => {}, 999_999),
     referencePrice: null,
     marketLogId: null,
+    // Стейк шага теперь снимается с Attempt.currentStake в момент открытия
+    // окна (реинвест-прогрессия, см. BACKLOG п.1) — в тестах фиксируем $5,
+    // как раньше был константный BET_AMOUNT.
+    betAmount: 5,
     ...overrides,
   };
 }
@@ -122,9 +145,22 @@ async function main() {
     fakeAttemptRepo as any,
     fakeMarketLogRepo as any,
   );
-  svc.currentAttempt = { id: 'attempt-1', currentStep: 0, targetSteps: 500 };
+  // currentAttempt раньше был единственным полем — теперь Map<streamKey, Attempt>
+  // (независимая прогрессия на поток, см. BACKLOG п.3).
+  svc.currentAttempts.set('btc-updown-5m', {
+    id: 'attempt-1',
+    streamKey: 'btc-updown-5m',
+    currentStep: 0,
+    targetSteps: 500,
+    baseStake: 5,
+    currentStake: 5,
+  });
 
-  console.log('assetPrefixes =', svc.assetPrefixes, '(ожидаем [btc-updown-5m, eth-updown-5m])');
+  console.log(
+    'streams =',
+    svc.streams.map((s: any) => s.streamKey),
+    '(ожидаем [btc-updown-5m, btc-updown-15m, bitcoin-up-or-down])',
+  );
 
   // --- Тест 1: тонкая заявка (дребезг) — глубина покрывает только 10% ставки -> НЕ покупаем ---
   {
@@ -230,6 +266,148 @@ async function main() {
     await svc.resolvePendingMarkets();
     console.log('[Тест 6] Профит на проигрыше = -filledAmount:', log2.profit === -3);
   }
+
+  // --- Тест 7: реинвест-прогрессия — выигрыш поднимает currentStake на следующий шаг,
+  //     а не оставляет его константным (BACKLOG п.1). nextStake = filledAmount/entryPrice.
+  {
+    const log: any = {
+      id: 'log-3',
+      slug: 'btc-updown-5m-2000',
+      chosenOutcome: 'YES',
+      entryPrice: 0.99,
+      betAmount: 5,
+      filledAmount: 5,
+      assetPrefix: 'btc-updown-5m',
+      attemptId: 'attempt-1',
+    };
+    fakeMarketLogRepo.find = async () => [log];
+    fakeGamma.fetchOutcome = async () => ({ slug: log.slug, closed: true, yesWon: true, noWon: false });
+    await svc.resolvePendingMarkets();
+    const updatedAttempt = svc.currentAttempts.get('btc-updown-5m');
+    const expectedNextStake = 5 / 0.99;
+    console.log(
+      '\n[Тест 7] currentStake после выигрыша = filledAmount/entryPrice (ожидаем ~5.0505):',
+      updatedAttempt?.currentStake,
+      Math.abs((updatedAttempt?.currentStake ?? 0) - expectedNextStake) < 1e-9,
+    );
+  }
+
+  // --- Тест 8: проигрыш сбрасывает currentStake новой попытки на baseStake потока ---
+  {
+    const log: any = {
+      id: 'log-4',
+      slug: 'btc-updown-5m-3000',
+      chosenOutcome: 'YES',
+      entryPrice: 0.99,
+      betAmount: 5.0505,
+      filledAmount: 5.0505,
+      assetPrefix: 'btc-updown-5m',
+      attemptId: 'attempt-1',
+    };
+    fakeAttemptRepo.findOneOrFail = async () => ({
+      id: 'attempt-1',
+      attemptNumber: 1,
+      streamKey: 'btc-updown-5m',
+      status: 'active',
+      currentStep: 1,
+      targetSteps: 500,
+      baseStake: 5,
+      currentStake: 5.0505,
+      isSmoke: true,
+    });
+    fakeMarketLogRepo.find = async () => [log];
+    fakeGamma.fetchOutcome = async () => ({ slug: log.slug, closed: true, yesWon: false, noWon: true });
+    await svc.resolvePendingMarkets();
+    const newAttempt = svc.currentAttempts.get('btc-updown-5m');
+    console.log(
+      '[Тест 8] После проигрыша новая попытка стартует с currentStake=baseStake (5):',
+      newAttempt?.currentStake === 5,
+    );
+  }
+
+  writes.length = 0;
+  // --- Тест 9: окно входа — не пытаемся войти раньше LAST_ENTRY_WINDOW_SEC,
+  //     даже если стакан даёт отличную цену (см. реальный инцидент — оба
+  //     слива случились на ранних, "неопределившихся" входах). ---
+  {
+    const gatedConfig = {
+      overrides: { ...fakeConfig.overrides, LAST_ENTRY_WINDOW_SEC: '60', ENTRY_FILTER_ENABLED: 'false' },
+      get(key: string, def?: string) {
+        return this.overrides[key] ?? def;
+      },
+    };
+    const gatedSvc: any = new TradingService(
+      gatedConfig as any,
+      fakeGamma as any,
+      fakeClobPublic as any,
+      fakeTrader as any,
+      fakePriceFeed as any,
+      fakeAttemptRepo as any,
+      fakeMarketLogRepo as any,
+    );
+    gatedSvc.currentAttempts.set('btc-updown-5m', {
+      id: 'attempt-1',
+      streamKey: 'btc-updown-5m',
+      currentStep: 0,
+      targetSteps: 500,
+      baseStake: 5,
+      currentStake: 5,
+    });
+
+    const early = makeMarketState({ closesAt: new Date(Date.now() + 200_000) }); // 200с до закрытия > окна в 60с
+    const b = book([{ price: 0.99, size: 10 }], 0.97); // отличная цена и глубина — но рано
+    gatedSvc.onBookUpdate(early, 'YES', b);
+    await sleep(30);
+    console.log(
+      '\n[Тест 9] Слишком рано (200с до закрытия, окно=60с) — вход НЕ предпринят:',
+      writes.length === 0 && !early.positioned && !early.restingOrder,
+    );
+
+    writes.length = 0;
+    const late = makeMarketState({ closesAt: new Date(Date.now() + 50_000) }); // 50с < окна в 60с — уже можно
+    gatedSvc.onBookUpdate(late, 'YES', b);
+    await sleep(30);
+    console.log('[Тест 9] Внутри окна входа (50с < 60с) — вход предпринят:', writes.length === 1 && late.positioned);
+  }
+  writes.length = 0;
+
+  // --- Тест 10: ATR-гейт теперь fail-closed на отсутствии диагностики, а не
+  //     fail-open — упустить шаг лучше, чем рисковать капиталом вслепую. ---
+  {
+    const gatedConfig = {
+      overrides: { ...fakeConfig.overrides, LAST_ENTRY_WINDOW_SEC: '600', ENTRY_FILTER_ENABLED: 'true' },
+      get(key: string, def?: string) {
+        return this.overrides[key] ?? def;
+      },
+    };
+    const gatedSvc: any = new TradingService(
+      gatedConfig as any,
+      fakeGamma as any,
+      fakeClobPublic as any,
+      fakeTrader as any,
+      fakePriceFeed as any, // всегда возвращает price:null — "фид не отдал ни одного тика"
+      fakeAttemptRepo as any,
+      fakeMarketLogRepo as any,
+    );
+    gatedSvc.currentAttempts.set('btc-updown-5m', {
+      id: 'attempt-1',
+      streamKey: 'btc-updown-5m',
+      currentStep: 0,
+      targetSteps: 500,
+      baseStake: 5,
+      currentStake: 5,
+    });
+
+    const ms = makeMarketState();
+    const b = book([{ price: 0.99, size: 10 }], 0.97);
+    gatedSvc.onBookUpdate(ms, 'YES', b);
+    await sleep(30);
+    console.log(
+      '\n[Тест 10] ATR-гейт включён, диагностики нет -> вход заблокирован (fail-closed):',
+      writes.length === 0 && !ms.positioned,
+    );
+  }
+  writes.length = 0;
 
   console.log('\nВСЕ ПРОВЕРКИ ВЫПОЛНЕНЫ.');
   process.exit(0);

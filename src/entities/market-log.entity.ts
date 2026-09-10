@@ -62,7 +62,8 @@ export class MarketLog {
   @Column({ type: 'double precision', nullable: true })
   entryPrice: number | null;
 
-  // Настроенная цель ставки (BET_AMOUNT на момент входа).
+  // Целевой стейк этого шага — снимок Attempt.currentStake потока на момент
+  // открытия окна (реинвест-прогрессия, см. README/BACKLOG п.1), не константа.
   @Column({ type: 'double precision', default: 1 })
   betAmount: number;
 

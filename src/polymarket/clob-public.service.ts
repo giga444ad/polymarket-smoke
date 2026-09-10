@@ -39,6 +39,33 @@ export class ClobPublicService {
     });
   }
 
+  /**
+   * Полный стакан (все уровни asks/bids), а не только лучшая цена — нужен
+   * для замера реальной глубины по ¢99+ (см. BACKLOG п.2, scripts/measure-book-depth.ts).
+   * Уровни отсортированы: asks по возрастанию цены, bids по убыванию — так
+   * их ожидают book-fill.util.ts (walkAsksForFill/cumulativeUsdAtOrBelow).
+   */
+  async getBook(tokenId: string): Promise<{ asks: BookLevel[]; bids: BookLevel[]; tickSize: string | null; minOrderSize: number | null } | null> {
+    try {
+      const { data } = await this.http.get('/book', {
+        params: { token_id: tokenId },
+      });
+      const asks = this.normalizeLevels(data?.asks).sort((a, b) => a.price - b.price);
+      const bids = this.normalizeLevels(data?.bids).sort((a, b) => b.price - a.price);
+      return {
+        asks,
+        bids,
+        tickSize: data?.tick_size ?? null,
+        minOrderSize: Number.isFinite(parseFloat(data?.min_order_size))
+          ? parseFloat(data.min_order_size)
+          : null,
+      };
+    } catch (err) {
+      this.logger.debug(`Стакан ${tokenId} недоступен: ${err instanceof Error ? err.message : err}`);
+      return null;
+    }
+  }
+
   async getBestQuote(tokenId: string): Promise<BestQuote | null> {
     try {
       const { data } = await this.http.get('/book', {
