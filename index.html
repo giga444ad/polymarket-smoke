@@ -26,17 +26,21 @@
 
         function AnalyticsDashboard() {
             const [activeTab, setActiveTab] = useState(MARKETS[0]);
+            const [activeStream, setActiveStream] = useState('all');
             const [data, setData] = useState(null);
             const [losses, setLosses] = useState(null);
             const [loading, setLoading] = useState(true);
             const [error, setError] = useState(null);
 
-            // Перезапрашиваем данные при каждом изменении activeTab (у каждого рынка свой бэкенд/деплой)
+            // Перезапрашиваем данные при каждом изменении activeTab (у каждого рынка свой бэкенд/деплой).
+            // Таб по потоку (5m/15m/1h) сбрасываем на "Все" — у разных бэкендов разный набор
+            // streamKey (напр. у SOL-бэкенда будут sol-updown-5m и т.п., не btc-*).
             useEffect(() => {
                 setLoading(true);
                 setError(null);
                 setData(null);
                 setLosses(null);
+                setActiveStream('all');
 
                 // Динамически формируем URL на основе выбранного таба
                 const baseUrl = `https://polymarket-smoke-${activeTab.toLowerCase()}.up.railway.app`;
@@ -71,13 +75,32 @@
                     ? ((data.totals.wins / (data.totals.wins + data.totals.losses)) * 100).toFixed(1)
                     : 0;
 
+                // Табы по потокам (5m/15m/1h) — набор streamKey берём из самих данных, а не
+                // хардкодим, потому что у разных бэкендов (разных активов) он разный.
+                const streamKeys = [...new Set((data.byAsset || []).map((a) => a.assetPrefix))].sort();
+                const inStream = (key) => activeStream === 'all' || key === activeStream;
+
+                const filteredByAsset = (data.byAsset || []).filter((a) => inStream(a.assetPrefix));
+                const filteredBestByStream = (data.bestByStream || []).filter((a) => inStream(a.streamKey));
+                const filteredAttempts = (data.attempts || []).filter((a) => inStream(a.streamKey));
+                const filteredLosses = (losses || []).filter((l) => inStream(l.assetPrefix));
+                const filteredStale = (data.staleUnresolved || []).filter((s) => inStream(s.assetPrefix));
+
+                // Сводка "сколько именно принёс/заработал/проиграл" конкретный поток —
+                // суммируем по всем строкам byAsset этого потока (может быть отдельно
+                // smoke/live) в одну цифру для карточки.
+                const streamSummary = filteredByAsset.reduce(
+                    (acc, r) => ({ wins: acc.wins + r.wins, losses: acc.losses + r.losses, profit: acc.profit + r.profit }),
+                    { wins: 0, losses: 0, profit: 0 },
+                );
+
                 return (
                     <div className="animate-fade-in transition-opacity">
-                        {data.staleUnresolved && data.staleUnresolved.length > 0 && (
+                        {filteredStale.length > 0 && (
                             <div className="bg-amber-50 border border-amber-300 text-amber-800 rounded-xl p-4 mb-8">
                                 <div className="font-semibold mb-2">⚠ Есть маркеты, зависшие в pending_resolve дольше нормы</div>
                                 <ul className="text-sm space-y-1">
-                                    {data.staleUnresolved.map((s) => (
+                                    {filteredStale.map((s) => (
                                         <li key={s.slug}>
                                             {s.assetPrefix} / {s.slug} — висит {s.ageSec}с (с {new Date(s.createdAt).toLocaleString()})
                                         </li>
@@ -86,7 +109,33 @@
                             </div>
                         )}
 
-                        {/* Топ метрики */}
+                        {/* Табы по потокам внутри текущего бэкенда */}
+                        {streamKeys.length > 0 && (
+                            <div className="flex flex-wrap gap-1 bg-gray-200/50 p-1 rounded-lg mb-6 w-fit">
+                                <button
+                                    onClick={() => setActiveStream('all')}
+                                    className={`px-4 py-1.5 rounded-md font-medium text-sm transition-all duration-200 ${
+                                        activeStream === 'all' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'
+                                    }`}
+                                >
+                                    Все
+                                </button>
+                                {streamKeys.map((key) => (
+                                    <button
+                                        key={key}
+                                        onClick={() => setActiveStream(key)}
+                                        className={`px-4 py-1.5 rounded-md font-medium text-sm transition-all duration-200 ${
+                                            activeStream === key ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'
+                                        }`}
+                                    >
+                                        {key}
+                                    </button>
+                                ))}
+                            </div>
+                        )}
+
+                        {/* Топ метрики — бэнкролл общий на все потоки сразу (так и задумано,
+                            это один кошелёк), поэтому НЕ фильтруется по табу потока. */}
                         <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
                             <MetricCard title="Bankroll (Smoke)" value={`$${data.currentBankroll.smoke}`} />
                             <MetricCard title="Win Rate" value={`${winRate}%`} subtext={`${data.totals.wins}W / ${data.totals.losses}L`} />
@@ -94,12 +143,25 @@
                             <MetricCard title="Bets Placed" value={data.totals.betsPlaced} />
                         </div>
 
+                        {/* Сколько именно принёс/заработал/проиграл ВЫБРАННЫЙ поток —
+                            видно только когда выбран конкретный таб потока, не "Все". */}
+                        {activeStream !== 'all' && (
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+                                <MetricCard title={`${activeStream} — Wins`} value={streamSummary.wins} />
+                                <MetricCard title={`${activeStream} — Losses`} value={streamSummary.losses} />
+                                <MetricCard
+                                    title={`${activeStream} — Profit`}
+                                    value={`${streamSummary.profit >= 0 ? '+' : ''}$${streamSummary.profit.toFixed(2)}`}
+                                />
+                            </div>
+                        )}
+
                         {/* Лучшая попытка по каждому независимому потоку (актив × таймфрейм) —
                             раньше был один общий счётчик шагов на все активы сразу, теперь у
                             каждого потока своя прогрессия/прогресс, см. BACKLOG п.3. */}
-                        {data.bestByStream && data.bestByStream.length > 0 && (
+                        {filteredBestByStream.length > 0 && (
                             <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
-                                {data.bestByStream.map((a) => (
+                                {filteredBestByStream.map((a) => (
                                     <div key={a.streamKey} className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
                                         <h2 className="text-sm font-semibold mb-1 text-gray-500 uppercase tracking-wide">{a.streamKey}</h2>
                                         <div className="flex items-center justify-between mb-2">
@@ -120,7 +182,7 @@
                         {/* История попыток */}
                         <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden mb-8">
                             <div className="p-6 border-b border-gray-100">
-                                <h2 className="text-xl font-semibold text-gray-800">Attempts History</h2>
+                                <h2 className="text-xl font-semibold text-gray-800">Attempts History{activeStream !== 'all' ? ` — ${activeStream}` : ''}</h2>
                             </div>
                             <div className="overflow-x-auto">
                                 <table className="w-full text-left border-collapse">
@@ -135,7 +197,7 @@
                                         </tr>
                                     </thead>
                                     <tbody className="divide-y divide-gray-100">
-                                        {data.attempts?.map((attempt) => (
+                                        {filteredAttempts.map((attempt) => (
                                             <tr key={`${attempt.isSmoke}-${attempt.streamKey}-${attempt.attemptNumber}`} className="hover:bg-gray-50 transition-colors">
                                                 <td className="p-4 text-xs text-gray-500">{attempt.streamKey}</td>
                                                 <td className="p-4 font-medium">#{attempt.attemptNumber}</td>
@@ -164,7 +226,7 @@
                         {/* Разбор сливов: причина + дата + диагностика по фиду/ATR */}
                         <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
                             <div className="p-6 border-b border-gray-100">
-                                <h2 className="text-xl font-semibold text-gray-800">Recent Losses — Diagnostics</h2>
+                                <h2 className="text-xl font-semibold text-gray-800">Recent Losses — Diagnostics{activeStream !== 'all' ? ` (${activeStream})` : ''}</h2>
                             </div>
                             <div className="overflow-x-auto">
                                 <table className="w-full text-left border-collapse">
@@ -179,10 +241,10 @@
                                         </tr>
                                     </thead>
                                     <tbody className="divide-y divide-gray-100">
-                                        {(losses || []).length === 0 && (
+                                        {filteredLosses.length === 0 && (
                                             <tr><td className="p-4 text-sm text-gray-400" colSpan="6">Сливов пока нет.</td></tr>
                                         )}
-                                        {(losses || []).map((log) => (
+                                        {filteredLosses.map((log) => (
                                             <tr key={log.slug} className="hover:bg-gray-50 transition-colors align-top">
                                                 <td className="p-4 text-sm text-gray-500 whitespace-nowrap">
                                                     {log.resolvedAt ? new Date(log.resolvedAt).toLocaleString() : '—'}
