@@ -1,6 +1,9 @@
 import { Module } from '@nestjs/common';
-import { ConfigModule } from '@nestjs/config';
+import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { ServeStaticModule } from '@nestjs/serve-static';
+import { join } from 'path';
+
 import { Attempt } from './entities/attempt.entity';
 import { MarketLog } from './entities/market-log.entity';
 import { TradingModule } from './trading/trading.module';
@@ -17,11 +20,28 @@ import { AnalyticsModule } from './analytics/analytics.module';
       password: process.env.POSTGRES_PASSWORD || 'postgres',
       database: process.env.POSTGRES_DB || 'polymarket_bot',
       entities: [Attempt, MarketLog],
-      // Только для смоук/дев-контура: сам создаёт таблицы по сущностям.
-      // Для боевого использования лучше завести нормальные миграции.
       synchronize: process.env.TYPEORM_SYNC !== 'false',
       logging: process.env.TYPEORM_LOGGING === 'true',
     }),
+    
+    ServeStaticModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (configService: ConfigService) => {
+        const isStatic = configService.get<string>('IS_STATIC') === 'true';
+
+        if (!isStatic) {
+          return [];
+        }
+
+        return [
+          {
+            rootPath: join(__dirname, '..', 'public'),
+          },
+        ];
+      },
+    }),
+
     TradingModule,
     AnalyticsModule,
   ],

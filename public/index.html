@@ -19,32 +19,38 @@
     <div id="root"></div>
 
     <script type="text/babel">
-        const { useEffect, useState } = React;
+        const { useEffect, useState, useRef, useCallback } = React;
 
-        // Массив всех доступных рынков. Добавляй сюда новые, если появятся.
+        // Массив всех доступных рынков.
         const MARKETS = ['BTC', 'SOL', 'ETH'];
+        const REFRESH_INTERVAL_SEC = 60;
 
         function AnalyticsDashboard() {
-            const [activeTab, setActiveTab] = useState(MARKETS[0]);
+            // Вариант 3: Инициализация вкладки из sessionStorage
+            const [activeTab, setActiveTab] = useState(() => {
+                const savedTab = sessionStorage.getItem('activeTab');
+                return MARKETS.includes(savedTab) ? savedTab : MARKETS[0];
+            });
+
             const [activeStream, setActiveStream] = useState('all');
             const [data, setData] = useState(null);
             const [losses, setLosses] = useState(null);
             const [loading, setLoading] = useState(true);
             const [error, setError] = useState(null);
 
-            // Перезапрашиваем данные при каждом изменении activeTab (у каждого рынка свой бэкенд/деплой).
-            // Таб по потоку (5m/15m/1h) сбрасываем на "Все" — у разных бэкендов разный набор
-            // streamKey (напр. у SOL-бэкенда будут sol-updown-5m и т.п., не btc-*).
-            useEffect(() => {
-                setLoading(true);
-                setError(null);
-                setData(null);
-                setLosses(null);
-                setActiveStream('all');
+            // Состояние таймера автообновления
+            const [lastUpdated, setLastUpdated] = useState(null);
+            const [secondsLeft, setSecondsLeft] = useState(REFRESH_INTERVAL_SEC);
+            const [isAutoRefreshEnabled, setIsAutoRefreshEnabled] = useState(true);
 
-                // Динамически формируем URL на основе выбранного таба
+            // Функция загрузки данных
+            const fetchData = useCallback((isInitial = false) => {
+                if (isInitial) {
+                    setLoading(true);
+                }
+                setError(null);
+
                 const baseUrl = `https://polymarket-smoke-${activeTab.toLowerCase()}.up.railway.app`;
-                // const baseUrl = 'http://localhost:3000';
 
                 Promise.all([
                     fetch(`${baseUrl}/analytics/summary`).then((res) => {
@@ -60,12 +66,53 @@
                         setData(summaryJson);
                         setLosses(lossesJson);
                         setLoading(false);
+                        setLastUpdated(new Date());
+                        setSecondsLeft(REFRESH_INTERVAL_SEC);
                     })
                     .catch((err) => {
                         setError(err.message);
                         setLoading(false);
                     });
             }, [activeTab]);
+
+            // Сохранение переключенной вкладки в sessionStorage и первичный запрос
+            const handleTabChange = (market) => {
+                setActiveTab(market);
+                sessionStorage.setItem('activeTab', market);
+                setActiveStream('all');
+            };
+
+            // Запрос при смене активного таба
+            useEffect(() => {
+                fetchData(true);
+            }, [fetchData]);
+
+            // Эффект для обратного отсчета и таймера автообновления каждые 60 секунд
+            useEffect(() => {
+                if (!isAutoRefreshEnabled) return;
+
+                const timer = setInterval(() => {
+                    setSecondsLeft((prev) => {
+                        if (prev <= 1) {
+                            fetchData(false);
+                            return REFRESH_INTERVAL_SEC;
+                        }
+                        return prev - 1;
+                    });
+                }, 1000);
+
+                return () => clearInterval(timer);
+            }, [isAutoRefreshEnabled, fetchData]);
+
+            // Переключение активности автообновления по клику на футер
+            const toggleAutoRefresh = () => {
+                if (!isAutoRefreshEnabled) {
+                    setIsAutoRefreshEnabled(true);
+                    fetchData(false); // сразу подтягиваем свежие данные при повторном включении
+                } else {
+                    setIsAutoRefreshEnabled(false);
+                }
+            };
 
             const renderContent = () => {
                 if (loading) return <div className="py-12 text-center text-gray-500 font-sans">Загрузка аналитики {activeTab}...</div>;
@@ -75,8 +122,6 @@
                     ? ((data.totals.wins / (data.totals.wins + data.totals.losses)) * 100).toFixed(1)
                     : 0;
 
-                // Табы по потокам (5m/15m/1h) — набор streamKey берём из самих данных, а не
-                // хардкодим, потому что у разных бэкендов (разных активов) он разный.
                 const streamKeys = [...new Set((data.byAsset || []).map((a) => a.assetPrefix))].sort();
                 const inStream = (key) => activeStream === 'all' || key === activeStream;
 
@@ -86,9 +131,6 @@
                 const filteredLosses = (losses || []).filter((l) => inStream(l.assetPrefix));
                 const filteredStale = (data.staleUnresolved || []).filter((s) => inStream(s.assetPrefix));
 
-                // Сводка "сколько именно принёс/заработал/проиграл" конкретный поток —
-                // суммируем по всем строкам byAsset этого потока (может быть отдельно
-                // smoke/live) в одну цифру для карточки.
                 const streamSummary = filteredByAsset.reduce(
                     (acc, r) => ({ wins: acc.wins + r.wins, losses: acc.losses + r.losses, profit: acc.profit + r.profit }),
                     { wins: 0, losses: 0, profit: 0 },
@@ -134,8 +176,7 @@
                             </div>
                         )}
 
-                        {/* Топ метрики — бэнкролл общий на все потоки сразу (так и задумано,
-                            это один кошелёк), поэтому НЕ фильтруется по табу потока. */}
+                        {/* Топ метрики */}
                         <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
                             <MetricCard title="Bankroll (Smoke)" value={`$${data.currentBankroll.smoke}`} />
                             <MetricCard title="Win Rate" value={`${winRate}%`} subtext={`${data.totals.wins}W / ${data.totals.losses}L`} />
@@ -143,8 +184,7 @@
                             <MetricCard title="Bets Placed" value={data.totals.betsPlaced} />
                         </div>
 
-                        {/* Сколько именно принёс/заработал/проиграл ВЫБРАННЫЙ поток —
-                            видно только когда выбран конкретный таб потока, не "Все". */}
+                        {/* Сколько именно принёс/заработал/проиграл ВЫБРАННЫЙ поток */}
                         {activeStream !== 'all' && (
                             <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
                                 <MetricCard title={`${activeStream} — Wins`} value={streamSummary.wins} />
@@ -156,9 +196,7 @@
                             </div>
                         )}
 
-                        {/* Лучшая попытка по каждому независимому потоку (актив × таймфрейм) —
-                            раньше был один общий счётчик шагов на все активы сразу, теперь у
-                            каждого потока своя прогрессия/прогресс, см. BACKLOG п.3. */}
+                        {/* Лучшая попытка по каждому независимому потоку */}
                         {filteredBestByStream.length > 0 && (
                             <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
                                 {filteredBestByStream.map((a) => (
@@ -223,7 +261,7 @@
                             </div>
                         </div>
 
-                        {/* Разбор сливов: причина + дата + диагностика по фиду/ATR */}
+                        {/* Разбор сливов */}
                         <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
                             <div className="p-6 border-b border-gray-100">
                                 <h2 className="text-xl font-semibold text-gray-800">Recent Losses — Diagnostics{activeStream !== 'all' ? ` (${activeStream})` : ''}</h2>
@@ -271,31 +309,58 @@
                 );
             };
 
-            return (
-                <div className="max-w-6xl mx-auto p-6 font-sans text-gray-800">
-                    <div className="flex flex-col md:flex-row md:items-center justify-between mb-6 gap-4">
-                        <h1 className="text-3xl font-bold text-gray-900">Bot Analytics Dashboard</h1>
+            // Сколько секунд прошло с момента последнего обновления
+            const timeSinceUpdate = lastUpdated
+                ? Math.floor((new Date() - lastUpdated) / 1000)
+                : 0;
 
-                        {/* Навигация табов генерируется динамически из массива MARKETS */}
-                        <div className="flex flex-wrap gap-1 bg-gray-200/50 p-1 rounded-lg">
-                            {MARKETS.map((market) => (
-                                <button
-                                    key={market}
-                                    onClick={() => setActiveTab(market)}
-                                    className={`px-6 py-2 rounded-md font-medium text-sm transition-all duration-200 ${
-                                        activeTab === market
-                                            ? 'bg-white text-blue-600 shadow-sm'
-                                            : 'text-gray-500 hover:text-gray-700'
-                                    }`}
-                                >
-                                    {market}
-                                </button>
-                            ))}
+            return (
+                <div className="min-h-screen flex flex-col justify-between max-w-6xl mx-auto p-6 font-sans text-gray-800">
+                    <div>
+                        <div className="flex flex-col md:flex-row md:items-center justify-between mb-6 gap-4">
+                            <h1 className="text-3xl font-bold text-gray-900">Bot Analytics Dashboard</h1>
+
+                            {/* Навигация табов */}
+                            <div className="flex flex-wrap gap-1 bg-gray-200/50 p-1 rounded-lg">
+                                {MARKETS.map((market) => (
+                                    <button
+                                        key={market}
+                                        onClick={() => handleTabChange(market)}
+                                        className={`px-6 py-2 rounded-md font-medium text-sm transition-all duration-200 ${
+                                            activeTab === market
+                                                ? 'bg-white text-blue-600 shadow-sm'
+                                                : 'text-gray-500 hover:text-gray-700'
+                                        }`}
+                                    >
+                                        {market}
+                                    </button>
+                                ))}
+                            </div>
                         </div>
+
+                        {/* Отрисовка контента */}
+                        {renderContent()}
                     </div>
 
-                    {/* Отрисовка контента */}
-                    {renderContent()}
+                    {/* Интерактивный футер с информацией об автообновлении */}
+                    <footer className="mt-12 pt-6 border-t border-gray-200 text-center text-xs text-gray-500">
+                        <div
+                            onClick={toggleAutoRefresh}
+                            className="inline-flex items-center gap-2 cursor-pointer select-none bg-gray-100 hover:bg-gray-200 text-gray-600 px-4 py-2 rounded-full transition-colors"
+                            title="Нажмите, чтобы включить/отключить автообновление"
+                        >
+                            <span className={`w-2 h-2 rounded-full ${isAutoRefreshEnabled ? 'bg-green-500 animate-pulse' : 'bg-red-400'}`}></span>
+                            {isAutoRefreshEnabled ? (
+                                <span>
+                                    Обновлено {timeSinceUpdate} сек. назад • Следующее через {secondsLeft} сек. <span className="text-gray-400">(нажмите для паузы)</span>
+                                </span>
+                            ) : (
+                                <span className="font-medium text-amber-700">
+                                    Автообновление: отключено <span className="text-gray-400">(нажмите, чтобы включить)</span>
+                                </span>
+                            )}
+                        </div>
+                    </footer>
                 </div>
             );
         }
