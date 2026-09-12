@@ -417,8 +417,8 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
       const next = (this.providerIndex + 1) % this.providers.length;
       this.logger.warn(
         `PriceFeedService: ${provider.name} не отвечает уже ${this.consecutiveFailuresOnProvider} подключений подряд ` +
-          `(похоже на гео-блокировку по IP хостинга или сбой сервиса, не на временный сбой сети) — ` +
-          `переключаюсь на ${this.providers[next].name}.`,
+        `(похоже на гео-блокировку по IP хостинга или сбой сервиса, не на временный сбой сети) — ` +
+        `переключаюсь на ${this.providers[next].name}.`,
       );
       this.providerIndex = next;
       this.consecutiveFailuresOnProvider = 0;

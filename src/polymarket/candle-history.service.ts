@@ -11,9 +11,9 @@ export interface HistCandle {
   close: number;
 }
 
-// Binance поддерживает эти интервалы ровно (без остатка) — совпадает один в
-// один с длительностью наших потоков (5m/15m/1h), поэтому конвертация
-// intervalMs -> строка Binance тривиальна, без дробления/агрегации.
+/**
+ * Наши intervalMs -> Binance interval.
+ */
 const BINANCE_INTERVAL_BY_MS: Record<number, string> = {
   [60_000]: '1m',
   [300_000]: '5m',
@@ -24,83 +24,222 @@ const BINANCE_INTERVAL_BY_MS: Record<number, string> = {
 };
 
 /**
- * Бэкафилл и персистентность истории свечей ценового фида — см. класс-
- * комментарий PriceCandle и CONTEXT.md (Сессия 6, п.6). Архитектура:
- * PostgreSQL как единственное хранилище (транзакционно, уже есть в стеке —
- * не заводим Redis только ради этого), Binance REST klines как источник
- * бэкафилла ИСТОРИИ (публичный, без ключа, интервалы совпадают с нашими
- * потоками), WS-фид (PriceFeedService) — источник новых свечей вперёд по
- * времени, каждая из которых дописывается сюда же через saveClosedCandle.
+ * Наши intervalMs -> Bybit interval.
  *
- * Из Chainlink/Bybit бэкафилл истории намеренно не делаем: Binance REST
- * klines достаточно как приближение для ПРОШЛОЙ волатильности (ATR — это
- * статистика размаха, а не точный резолвящий источник) — точность источника
- * важна для live-диагностики на входе (там уже стоит Chainlink, см.
- * PriceFeedService), не для прогрева ATR за прошлые часы.
+ * Bybit V5 /v5/market/kline:
+ * 1, 3, 5, 15, 30, 60, 120, 240, 480, D, W
+ */
+const BYBIT_INTERVAL_BY_MS: Record<number, string> = {
+  [60_000]: '1',
+  [180_000]: '3',
+  [300_000]: '5',
+  [900_000]: '15',
+  [1_800_000]: '30',
+  [3_600_000]: '60',
+  [7_200_000]: '120',
+  [14_400_000]: '240',
+  [28_800_000]: '480',
+  [86_400_000]: 'D',
+  [604_800_000]: 'W',
+};
+
+/**
+ * Бэкаффил и персистентность истории свечей ценового фида.
+ *
+ * Архитектура:
+ *
+ * PostgreSQL — основное хранилище истории.
+ *
+ * Источник бэкаффила:
+ * 1. Binance REST — основной источник исторических klines.
+ * 2. Bybit REST — fallback, если Binance недоступен или не вернул
+ *    достаточно свечей.
+ *
+ * Источник новых свечей вперёд по времени:
+ * WS-фид (PriceFeedService).
+ *
+ * Исторические данные используются для прогрева ATR, поэтому Binance/Bybit
+ * допустимы как приближённый источник прошлой волатильности.
  */
 @Injectable()
 export class CandleHistoryService {
   private readonly logger = new Logger(CandleHistoryService.name);
 
   constructor(
-    @InjectRepository(PriceCandle) private readonly repo: Repository<PriceCandle>,
+    @InjectRepository(PriceCandle)
+    private readonly repo: Repository<PriceCandle>,
   ) {}
 
   /**
    * Возвращает до `need` последних ЗАКРЫТЫХ свечей для (ticker, intervalMs),
-   * самая новая — в конце. Сначала читает из БД; если не хватает — догружает
-   * через Binance REST и апсертит недостающее.
+   * самая новая — в конце.
+   *
+   * Порядок источников:
+   *   DB -> Binance REST -> Bybit REST
+   *
+   * Если внешний источник недоступен, продолжаем с тем, что уже есть в БД.
    */
-  async bootstrap(ticker: string, intervalMs: number, need: number): Promise<HistCandle[]> {
+  async bootstrap(
+    ticker: string,
+    intervalMs: number,
+    need: number,
+  ): Promise<HistCandle[]> {
     let fromDb = await this.readFromDb(ticker, intervalMs, need);
 
-    if (fromDb.length < need) {
-      const binanceInterval = BINANCE_INTERVAL_BY_MS[intervalMs];
-      if (!binanceInterval) {
-        this.logger.warn(
-          `CandleHistoryService: нет соответствия Binance-интервала для ${ticker}@${intervalMs}мс — ` +
-            `бэкафилл истории пропущен, прогрев ATR пойдёт с нуля через живой фид.`,
-        );
-        return fromDb;
-      }
+    // Истории уже достаточно.
+    if (fromDb.length >= need) {
+      return fromDb;
+    }
+
+    // ------------------------------------------------------------
+    // 1. Binance
+    // ------------------------------------------------------------
+
+    const binanceInterval = BINANCE_INTERVAL_BY_MS[intervalMs];
+
+    if (binanceInterval) {
       try {
-        const fetched = await this.fetchFromBinance(ticker, binanceInterval, need);
+        const fetched = await this.fetchFromBinance(
+          ticker,
+          binanceInterval,
+          need - fromDb.length,
+        );
+
         if (fetched.length > 0) {
-          await this.upsertMany(ticker, intervalMs, fetched, 'binance-rest');
+          await this.upsertMany(
+            ticker,
+            intervalMs,
+            fetched,
+            'binance-rest',
+          );
+
           fromDb = await this.readFromDb(ticker, intervalMs, need);
+
           this.logger.log(
-            `CandleHistoryService: ${ticker}@${intervalMs / 1000}с — бэкафилл из Binance REST дал ${fetched.length} свечей ` +
+            `CandleHistoryService: ${ticker}@${intervalMs / 1000}с — ` +
+              `бэкаффил из Binance дал ${fetched.length} свечей ` +
               `(в БД теперь ${fromDb.length}/${need}).`,
           );
         }
       } catch (err) {
         this.logger.warn(
-          `CandleHistoryService: бэкафилл из Binance REST для ${ticker}@${intervalMs / 1000}с не удался (${this.errMsg(err)}) — ` +
-            `продолжаем с тем, что есть в БД (${fromDb.length}/${need}).`,
+          `CandleHistoryService: Binance REST для ` +
+            `${ticker}@${intervalMs / 1000}с не удался ` +
+            `(${this.errMsg(err)}), пробуем Bybit.`,
         );
       }
+    } else {
+      this.logger.warn(
+        `CandleHistoryService: нет соответствия Binance-интервала ` +
+          `для ${ticker}@${intervalMs}мс — Binance бэкаффил пропущен.`,
+      );
+    }
+
+    // Binance хватило.
+    if (fromDb.length >= need) {
+      return fromDb;
+    }
+
+    // ------------------------------------------------------------
+    // 2. Bybit fallback
+    // ------------------------------------------------------------
+
+    const bybitInterval = BYBIT_INTERVAL_BY_MS[intervalMs];
+
+    if (!bybitInterval) {
+      this.logger.warn(
+        `CandleHistoryService: нет соответствия Bybit-интервала ` +
+          `для ${ticker}@${intervalMs}мс — ` +
+          `бэкаффил через Bybit пропущен.`,
+      );
+
+      return fromDb;
+    }
+
+    try {
+      const fetched = await this.fetchFromBybit(
+        ticker,
+        bybitInterval,
+        need - fromDb.length,
+      );
+
+      if (fetched.length > 0) {
+        await this.upsertMany(
+          ticker,
+          intervalMs,
+          fetched,
+          'bybit-rest',
+        );
+
+        fromDb = await this.readFromDb(ticker, intervalMs, need);
+
+        this.logger.log(
+          `CandleHistoryService: ${ticker}@${intervalMs / 1000}с — ` +
+            `бэкаффил из Bybit дал ${fetched.length} свечей ` +
+            `(в БД теперь ${fromDb.length}/${need}).`,
+        );
+      }
+    } catch (err) {
+      this.logger.warn(
+        `CandleHistoryService: бэкаффил из Bybit REST для ` +
+          `${ticker}@${intervalMs / 1000}с не удался ` +
+          `(${this.errMsg(err)}) — продолжаем с тем, что есть ` +
+          `в БД (${fromDb.length}/${need}).`,
+      );
     }
 
     return fromDb;
   }
 
-  /** Апсерт одной живой закрытой свечи из WS-фида (вызывается PriceFeedService при закрытии окна). */
-  async saveClosedCandle(ticker: string, intervalMs: number, candle: HistCandle, source: string): Promise<void> {
+  /**
+   * Апсерт одной живой закрытой свечи из WS-фида.
+   *
+   * Вызывается PriceFeedService при закрытии окна.
+   */
+  async saveClosedCandle(
+    ticker: string,
+    intervalMs: number,
+    candle: HistCandle,
+    source: string,
+  ): Promise<void> {
     try {
-      await this.upsertMany(ticker, intervalMs, [candle], source);
+      await this.upsertMany(
+        ticker,
+        intervalMs,
+        [candle],
+        source,
+      );
     } catch (err) {
-      // Персистентность истории — best-effort кеш, не должна ронять горячий
-      // путь фида, если БД временно недоступна.
-      this.logger.debug(`CandleHistoryService: не удалось сохранить свечу ${ticker}@${intervalMs}: ${this.errMsg(err)}`);
+      // Персистентность истории — best-effort кеш.
+      // Не должна ронять горячий путь фида.
+      this.logger.debug(
+        `CandleHistoryService: не удалось сохранить свечу ` +
+          `${ticker}@${intervalMs}: ${this.errMsg(err)}`,
+      );
     }
   }
 
-  private async readFromDb(ticker: string, intervalMs: number, need: number): Promise<HistCandle[]> {
+  /**
+   * Читает последние `need` свечей из БД.
+   *
+   * Наружу всегда возвращаем oldest -> newest.
+   */
+  private async readFromDb(
+    ticker: string,
+    intervalMs: number,
+    need: number,
+  ): Promise<HistCandle[]> {
     const rows = await this.repo.find({
-      where: { ticker, intervalMs: intervalMs as any },
-      order: { startMs: 'DESC' },
+      where: {
+        ticker,
+        intervalMs: intervalMs as any,
+      },
+      order: {
+        startMs: 'DESC',
+      },
       take: need,
     });
+
     return rows
       .map((r) => ({
         start: Number(r.startMs),
@@ -112,8 +251,19 @@ export class CandleHistoryService {
       .sort((a, b) => a.start - b.start);
   }
 
-  private async upsertMany(ticker: string, intervalMs: number, candles: HistCandle[], source: string): Promise<void> {
-    if (candles.length === 0) return;
+  /**
+   * Массовый upsert свечей.
+   */
+  private async upsertMany(
+    ticker: string,
+    intervalMs: number,
+    candles: HistCandle[],
+    source: string,
+  ): Promise<void> {
+    if (candles.length === 0) {
+      return;
+    }
+
     await this.repo.upsert(
       candles.map((c) => ({
         ticker,
@@ -125,32 +275,212 @@ export class CandleHistoryService {
         close: c.close,
         source,
       })),
-      { conflictPaths: ['ticker', 'intervalMs', 'startMs'], skipUpdateIfNoValuesChanged: true },
+      {
+        conflictPaths: [
+          'ticker',
+          'intervalMs',
+          'startMs',
+        ],
+        skipUpdateIfNoValuesChanged: true,
+      },
     );
   }
 
-  private async fetchFromBinance(ticker: string, interval: string, limit: number): Promise<HistCandle[]> {
-    const symbol = `${ticker.toUpperCase()}USDT`;
-    // +5 с запасом: последняя свеча Binance может быть ещё не закрыта на момент запроса.
-    const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${Math.min(limit + 5, 1000)}`;
-    const res = await fetch(url);
-    if (!res.ok) {
-      throw new Error(`Binance klines HTTP ${res.status}`);
+  /**
+   * Binance interval -> миллисекунды.
+   */
+  private getIntervalMsFromBinance(interval: string): number {
+    switch (interval) {
+      case '1m':
+        return 60_000;
+
+      case '5m':
+        return 5 * 60_000;
+
+      case '15m':
+        return 15 * 60_000;
+
+      case '1h':
+        return 60 * 60_000;
+
+      case '4h':
+        return 4 * 60 * 60_000;
+
+      case '1d':
+        return 24 * 60 * 60_000;
+
+      default:
+        throw new Error(
+          `Unknown Binance interval: ${interval}`,
+        );
     }
+  }
+
+  /**
+   * Bybit interval -> миллисекунды.
+   */
+  private getIntervalMsFromBybit(interval: string): number {
+    switch (interval) {
+      case '1':
+        return 60_000;
+
+      case '3':
+        return 3 * 60_000;
+
+      case '5':
+        return 5 * 60_000;
+
+      case '15':
+        return 15 * 60_000;
+
+      case '30':
+        return 30 * 60_000;
+
+      case '60':
+        return 60 * 60_000;
+
+      case '120':
+        return 2 * 60 * 60_000;
+
+      case '240':
+        return 4 * 60 * 60_000;
+
+      case '480':
+        return 8 * 60 * 60_000;
+
+      case 'D':
+        return 24 * 60 * 60_000;
+
+      case 'W':
+        return 7 * 24 * 60 * 60_000;
+
+      default:
+        throw new Error(
+          `Unknown Bybit interval: ${interval}`,
+        );
+    }
+  }
+
+  /**
+   * Загружает последние закрытые свечи из Binance REST.
+   */
+  private async fetchFromBinance(
+    ticker: string,
+    interval: string,
+    limit: number,
+  ): Promise<HistCandle[]> {
+    const symbol = `${ticker.toUpperCase()}USDT`;
+
+    // Берём запас, потому что последняя свеча может быть текущей
+    // и ещё не закрытой.
+    const url =
+      `https://api.binance.com/api/v3/klines` +
+      `?symbol=${symbol}` +
+      `&interval=${interval}` +
+      `&limit=${Math.min(limit + 5, 1000)}`;
+
+    const res = await fetch(url);
+
+    if (!res.ok) {
+      throw new Error(
+        `Binance klines HTTP ${res.status}`,
+      );
+    }
+
     const raw = (await res.json()) as any[];
-    // Формат Binance kline: [openTime, open, high, low, close, volume, closeTime, ...]
-    // Отбрасываем последний элемент — как правило это ещё текущая, не закрытая свеча.
-    const closed = raw.slice(0, Math.max(0, raw.length - 1));
-    return closed.map((k) => ({
-      start: Number(k[0]),
-      open: parseFloat(k[1]),
-      high: parseFloat(k[2]),
-      low: parseFloat(k[3]),
-      close: parseFloat(k[4]),
-    }));
+
+    const intervalMs =
+      this.getIntervalMsFromBinance(interval);
+
+    const now = Date.now();
+
+    return raw
+      .map((k) => ({
+        start: Number(k[0]),
+        open: Number(k[1]),
+        high: Number(k[2]),
+        low: Number(k[3]),
+        close: Number(k[4]),
+      }))
+      .filter(
+        (candle) =>
+          candle.start + intervalMs <= now,
+      )
+      .sort(
+        (a, b) => a.start - b.start,
+      )
+      .slice(-limit);
+  }
+
+  /**
+   * Загружает последние закрытые свечи из Bybit REST.
+   *
+   * category=linear означает USDT perpetual/futures market.
+   */
+  private async fetchFromBybit(
+    ticker: string,
+    interval: string,
+    limit: number,
+  ): Promise<HistCandle[]> {
+    const symbol = `${ticker.toUpperCase()}USDT`;
+
+    const url =
+      `https://api.bybit.com/v5/market/kline` +
+      `?category=linear` +
+      `&symbol=${symbol}` +
+      `&interval=${interval}` +
+      `&limit=${Math.min(limit + 5, 1000)}`;
+
+    const res = await fetch(url);
+
+    if (!res.ok) {
+      throw new Error(
+        `Bybit klines HTTP ${res.status}`,
+      );
+    }
+
+    const json = (await res.json()) as {
+      retCode: number;
+      retMsg: string;
+      result?: {
+        list?: string[][];
+      };
+    };
+
+    if (json.retCode !== 0) {
+      throw new Error(
+        `Bybit klines error ${json.retCode}: ${json.retMsg}`,
+      );
+    }
+
+    const raw = json.result?.list ?? [];
+
+    const intervalMs =
+      this.getIntervalMsFromBybit(interval);
+
+    const now = Date.now();
+
+    return raw
+      .map((k) => ({
+        start: Number(k[0]),
+        open: Number(k[1]),
+        high: Number(k[2]),
+        low: Number(k[3]),
+        close: Number(k[4]),
+      }))
+      .filter(
+        (candle) =>
+          candle.start + intervalMs <= now,
+      )
+      .sort(
+        (a, b) => a.start - b.start,
+      )
+      .slice(-limit);
   }
 
   private errMsg(err: unknown): string {
-    return err instanceof Error ? err.message : String(err);
+    return err instanceof Error
+      ? err.message
+      : String(err);
   }
 }
