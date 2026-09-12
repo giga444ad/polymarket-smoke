@@ -282,6 +282,17 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
             this.logger.log(
               `PriceFeedService: [${state.streamKey}] частичный прогрев из кеша (${history.length}/${state.atrCandles}) — остаток догонит живой фид.`,
             );
+          } else {
+            // Раньше этот случай не логировался ВООБЩЕ — именно поэтому баг
+            // с геоблокировкой Binance с US-хостинга (см. CONTEXT.md, Сессия 8)
+            // был не виден в логах: ATR-гейт просто "изредка" fail-closed
+            // (see evaluateEntryGate) без единой строки объяснения почему.
+            this.logger.warn(
+              `PriceFeedService: [${state.streamKey}] бэкафилл истории вернул 0 свечей (ни БД, ни REST-источники ` +
+                `не дали ни одной) — ATR-гейт будет fail-closed (пропускать шаги) до тех пор, пока живой фид сам ` +
+                `не накопит ${state.atrCandles} закрытых свечей (${((state.atrCandles * state.candleMs) / 60000).toFixed(0)} мин). ` +
+                `Частая причина — REST-источник бэкафилла недоступен из региона хостинга (см. CandleHistoryService).`,
+            );
           }
         } catch (err) {
           this.logger.warn(`PriceFeedService: бэкафилл истории для [${state.streamKey}] не удался: ${this.errMsg(err)}`);
@@ -417,8 +428,8 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
       const next = (this.providerIndex + 1) % this.providers.length;
       this.logger.warn(
         `PriceFeedService: ${provider.name} не отвечает уже ${this.consecutiveFailuresOnProvider} подключений подряд ` +
-        `(похоже на гео-блокировку по IP хостинга или сбой сервиса, не на временный сбой сети) — ` +
-        `переключаюсь на ${this.providers[next].name}.`,
+          `(похоже на гео-блокировку по IP хостинга или сбой сервиса, не на временный сбой сети) — ` +
+          `переключаюсь на ${this.providers[next].name}.`,
       );
       this.providerIndex = next;
       this.consecutiveFailuresOnProvider = 0;

@@ -93,6 +93,7 @@ const fakeMarketLogRepo: any = {
     return saved;
   },
   find: async () => [] as any[],
+  findOne: async () => null as any,
 };
 
 function makeMarketState(overrides: any = {}) {
@@ -294,7 +295,46 @@ async function main() {
     );
   }
 
-  // --- Тест 8: проигрыш сбрасывает currentStake новой попытки на baseStake потока ---
+  // --- Тест 7b (Сессия 8, баг №1): при ЧАСТИЧНОМ филле неисполненный остаток
+  //     заявки не должен теряться — он прибавляется к следующему стейку.
+  //     Пример из прода: заявка $6.36, филл $4.95 по ¢99 -> ожидаем
+  //     currentStake = 4.95/0.99 + (6.36-4.95) = 5.00 + 1.41 = 6.41,
+  //     а НЕ 5.00 (как было бы без фикса — прогрессия "проваливалась" к базе).
+  {
+    const log: any = {
+      id: 'log-3b',
+      slug: 'btc-updown-5m-2050',
+      chosenOutcome: 'YES',
+      entryPrice: 0.99,
+      betAmount: 6.36,
+      filledAmount: 4.95,
+      assetPrefix: 'btc-updown-5m',
+      attemptId: 'attempt-1',
+    };
+    fakeAttemptRepo.findOneOrFail = async () => ({
+      id: 'attempt-1',
+      attemptNumber: 1,
+      streamKey: 'btc-updown-5m',
+      status: 'active',
+      currentStep: 7,
+      targetSteps: 500,
+      baseStake: 5,
+      currentStake: 6.36,
+      isSmoke: true,
+    });
+    fakeMarketLogRepo.find = async () => [log];
+    fakeGamma.fetchOutcome = async () => ({ slug: log.slug, closed: true, yesWon: true, noWon: false });
+    await svc.resolvePendingMarkets();
+    const updatedAttempt = svc.currentAttempts.get('btc-updown-5m');
+    const expected = 4.95 / 0.99 + (6.36 - 4.95);
+    console.log(
+      '[Тест 7b] Частичный филл: неисполненный остаток прибавлен к следующему стейку (ожидаем ~6.41):',
+      updatedAttempt?.currentStake,
+      Math.abs((updatedAttempt?.currentStake ?? 0) - expected) < 1e-9,
+    );
+  }
+
+
   {
     const log: any = {
       id: 'log-4',
@@ -435,7 +475,7 @@ async function main() {
       fakeAttemptRepo as any,
       fakeMarketLogRepo as any,
     );
-    svcBlocked.blockOrdersIfPending = true;
+    svcBlocked.pendingGateMode = 'block';
     svcBlocked.pendingByStream.set('btc-updown-5m', new Set(['log-1']));
     await svcBlocked.discoveryTick();
     console.log(
@@ -464,6 +504,67 @@ async function main() {
       `[Тест 12] Лог записан со снимком attemptId='attempt-42'/stepNumber=7: ${lastWrite.attemptId === 'attempt-42' && lastWrite.stepNumber === 7}`,
     );
     console.log(`[Тест 12] pendingByStream пополнен id только что записанного лога: ${pendingSet?.has(lastWrite.id) ?? false}`);
+  }
+
+  // --- Тест 13 (Сессия 7): pre_resolve — предсказание исхода по Chainlink ---
+  {
+    const pendingLog = {
+      id: 'log-pending-1',
+      slug: 'btc-updown-5m-900',
+      assetPrefix: 'btc-updown-5m',
+      status: 'pending_resolve',
+      chosenOutcome: 'YES',
+      referencePrice: 0.5, // страйк (условно — "цена BTC" в шкале теста)
+      entryPrice: 0.99,
+      filledAmount: 9.9,
+      betAmount: 10,
+      createdAt: new Date(),
+    };
+    const repoWithPending: any = { ...fakeMarketLogRepo, findOne: async () => pendingLog };
+
+    // 13a: цена ушла далеко вверх (в сторону YES) на 3x ATR — уверенно предсказываем ВЫИГРЫШ.
+    const confidentUpFeed: any = { getSnapshot: () => ({ price: 0.53, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }) };
+    const svcPreWin: any = new TradingService(
+      fakeConfig as any, fakeGamma as any, fakeClobPublic as any, fakeTrader as any,
+      confidentUpFeed, fakeAttemptRepo as any, repoWithPending,
+    );
+    svcPreWin.preResolveMinAtrRatio = 2;
+    svcPreWin.preResolveMaxChain = 1;
+    const winPrediction = await svcPreWin.tryPreResolve('btc-updown-5m');
+    // Сессия 8: формула синхронизирована с фиксом бага №1 — неисполненный
+    // остаток заявки (betAmount-filledAmount = 10-9.9 = 0.1) тоже переносится.
+    const expectedWinStake = 9.9 / 0.99 + (10 - 9.9);
+    console.log(
+      `[Тест 13a] pre_resolve предсказывает ВЫИГРЫШ и стейк = filledAmount/entryPrice + неисполненный остаток (${expectedWinStake.toFixed(2)}): ` +
+        `${winPrediction != null && Math.abs(winPrediction.betAmount - expectedWinStake) < 1e-9}`,
+    );
+
+    // 13b: цена ушла в сторону NO (противоположную chosenOutcome) — предсказываем ПРОИГРЫШ, стейк = baseStake.
+    const confidentDownFeed: any = { getSnapshot: () => ({ price: 0.47, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }) };
+    const svcPreLoss: any = new TradingService(
+      fakeConfig as any, fakeGamma as any, fakeClobPublic as any, fakeTrader as any,
+      confidentDownFeed, fakeAttemptRepo as any, repoWithPending,
+    );
+    svcPreLoss.preResolveMinAtrRatio = 2;
+    svcPreLoss.preResolveMaxChain = 1;
+    const lossPrediction = await svcPreLoss.tryPreResolve('btc-updown-5m');
+    console.log(`[Тест 13b] pre_resolve предсказывает ПРОИГРЫШ и сбрасывает стейк на baseStake (5): ${lossPrediction?.betAmount === 5}`);
+
+    // 13c: цена почти не сдвинулась (0.2x ATR) — недостаточно уверенно, null (безопасный фолбэк к block).
+    const unsureFeed: any = { getSnapshot: () => ({ price: 0.502, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }) };
+    const svcUnsure: any = new TradingService(
+      fakeConfig as any, fakeGamma as any, fakeClobPublic as any, fakeTrader as any,
+      unsureFeed, fakeAttemptRepo as any, repoWithPending,
+    );
+    svcUnsure.preResolveMinAtrRatio = 2;
+    svcUnsure.preResolveMaxChain = 1;
+    const unsurePrediction = await svcUnsure.tryPreResolve('btc-updown-5m');
+    console.log(`[Тест 13c] Слишком близко к страйку (<2x ATR) — предсказание отклонено (null): ${unsurePrediction === null}`);
+
+    // 13d: PRE_RESOLVE_MAX_CHAIN — после достижения потолка новые предсказания не выдаются, пока нет официального резолва.
+    svcPreWin.provisionalChainByStream.set('btc-updown-5m', 1); // уже 1 подряд при maxChain=1
+    const cappedPrediction = await svcPreWin.tryPreResolve('btc-updown-5m');
+    console.log(`[Тест 13d] PRE_RESOLVE_MAX_CHAIN=1 останавливает цепочку предсказаний без подтверждения: ${cappedPrediction === null}`);
   }
 
   console.log('\nВСЕ ПРОВЕРКИ ВЫПОЛНЕНЫ.');

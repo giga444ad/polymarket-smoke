@@ -179,4 +179,21 @@ export class MarketLog {
 
   @Column({ type: 'timestamptz', nullable: true })
   resolvedAt: Date | null;
+
+  // --- Пре-резолв (Сессия 7, см. CONTEXT.md) ---
+  // true, если betAmount этого шага был снят НЕ с подтверждённого
+  // Attempt.currentStake, а с ПРЕДСКАЗАНИЯ исхода предыдущего (ещё не
+  // зарезолвленного официально Gamma) шага по живой цене Chainlink —
+  // см. TradingService.tryPreResolve. Профит/статус САМОГО этого шага
+  // всегда считается официальным резолвером Gamma как обычно — этот флаг
+  // только про то, откуда взялась СУММА ставки на входе.
+  @Column({ type: 'boolean', default: false })
+  stakePredicted: boolean;
+
+  // id лога ПРЕДЫДУЩЕГО (на момент открытия этого окна ещё не
+  // зарезолвленного) шага, на предсказании исхода которого была основана
+  // сумма стейка — для ручного аудита, если предсказание разойдётся с
+  // официальным резолвом Gamma.
+  @Column({ type: 'uuid', nullable: true })
+  predictedFromLogId: string | null;
 }

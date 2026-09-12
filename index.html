@@ -594,6 +594,14 @@
                                             <span className={`px-2 py-0.5 rounded ${t.isSmoke ? 'bg-gray-100 text-gray-600' : 'bg-purple-100 text-purple-700'}`}>
                                                 {t.isSmoke ? 'SMOKE' : 'LIVE'}
                                             </span>
+                                            {t.stakePredicted && (
+                                                <span
+                                                    title="Сумма ставки взята из pre_resolve-предсказания исхода предыдущего шага по Chainlink, официальный резолв Gamma ещё не подтверждал её на момент открытия."
+                                                    className="ml-1 px-2 py-0.5 rounded bg-indigo-100 text-indigo-700 whitespace-nowrap"
+                                                >
+                                                    прогноз
+                                                </span>
+                                            )}
                                         </td>
                                         <td className="p-4">
                                             <span className={`px-2 py-1 rounded-md text-xs font-semibold uppercase ${statusBadgeClass(t.status)}`}>
@@ -680,6 +688,11 @@
                                     <td className="p-3">{s.stepNumber}</td>
                                     <td className="p-3">
                                         <span className={`px-2 py-0.5 rounded text-xs font-semibold uppercase ${statusBadgeClass(s.status)}`}>{s.status}</span>
+                                        {s.stakePredicted && (
+                                            <span title="Сумма взята из pre_resolve-предсказания, ещё не подтверждена официальным резолвом Gamma" className="ml-1 px-1.5 py-0.5 rounded text-[10px] bg-indigo-100 text-indigo-700">
+                                                прогноз
+                                            </span>
+                                        )}
                                     </td>
                                     <td className="p-3">{s.chosenOutcome ?? '—'}</td>
                                     <td className="p-3">{s.entryPrice != null ? `¢${(s.entryPrice * 100).toFixed(2)}` : '—'}</td>

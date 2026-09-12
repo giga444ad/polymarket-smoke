@@ -31,6 +31,8 @@ function toTradeDto(log: MarketLog, attemptNumber?: number) {
     chosenOutcome: log.chosenOutcome,
     entryPrice: log.entryPrice,
     betAmount: log.betAmount,
+    stakePredicted: log.stakePredicted,
+    predictedFromLogId: log.predictedFromLogId,
     filledAmount: log.filledAmount,
     fillRatio: log.fillRatio,
     profit: log.profit,

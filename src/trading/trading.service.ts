@@ -14,6 +14,8 @@ import { parseStreamsConfig, StreamDefinition } from './stream-config';
 
 type LimitTier = 'T1' | 'T2' | 'T3';
 
+type PendingGateMode = 'block' | 'pre_resolve' | 'open';
+
 interface RestingOrder {
   tier: LimitTier;
   outcome: Outcome;
@@ -82,6 +84,11 @@ interface MarketState {
   // шага ушёл бы не в ту попытку.
   attemptId: string;
   attemptStepNumber: number;
+  // Пре-резолв (Сессия 7) — заполняется в openMarket, когда стейк этого окна
+  // взят не из подтверждённого Attempt.currentStake, а из предсказания
+  // исхода предыдущего ещё не зарезолвленного шага (см. tryPreResolve).
+  stakePredicted: boolean;
+  predictedFromLogId: string | null;
   // Уже залогировали переход в "окно входа" (последние LAST_ENTRY_WINDOW_SEC
   // секунд) для этого маркета? Чтобы не спамить лог на каждый WS-тик до
   // наступления этого момента — см. onBookUpdate.
@@ -137,12 +144,31 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
   // прежде чем мы начнём предупреждать в логах/на фронте (не блокирует торговлю).
   private staleResolveWarnMs: number;
 
-  // Если true — не открываем новое окно потока, пока по нему же есть хоть
-  // одна незарезолвленная (pending_resolve) ставка. Реализация п.7 сессии 6
-  // (реальный race condition по сумме ставки) — см. CONTEXT.md. Раньше был
-  // задокументирован в .env.example как "уже сделано", но физически не
-  // применялся нигде в коде.
-  private blockOrdersIfPending: boolean;
+  // Три режима реакции на "предыдущий шаг потока ещё не зарезолвлен
+  // официально Gamma" (Сессия 6 п.7 + Сессия 7, см. CONTEXT.md):
+  //  - 'block'       — не открываем новое окно, пока не придёт официальный
+  //                    резолв. Самый безопасный, изредка пропускает шаг,
+  //                    если Gamma отвечает с задержкой. Дефолт.
+  //  - 'pre_resolve' — открываем новое окно, но СУММУ стейка берём не из
+  //                    Attempt.currentStake (он ещё не обновлён), а из
+  //                    предсказания исхода предыдущего шага по живой цене
+  //                    Chainlink (см. tryPreResolve) — эта же цена и есть
+  //                    источник, которым Gamma резолвит крипто-маркеты, так
+  //                    что при уверенном сигнале расхождение с официальным
+  //                    резолвом крайне маловероятно. Если предсказание
+  //                    недоступно/неуверенное на конкретном тике — на ЭТОМ
+  //                    тике ведёт себя как 'block' (безопасный фолбэк), не
+  //                    открывает окно вслепую.
+  //  - 'open'        — легаси-режим без какой-либо защиты (открывает окно
+  //                    с текущим Attempt.currentStake как есть, это и есть
+  //                    исходный баг из п.7 сессии 6). Оставлен только для
+  //                    явного осознанного выбора, использовать не рекомендуется.
+  private pendingGateMode: PendingGateMode;
+  private preResolveMinAtrRatio: number;
+  // Потолок на число ПОДРЯД идущих окон, открытых через предсказание без
+  // хотя бы одного официального подтверждения между ними — не даём риску
+  // накапливаться бесконтрольно, если Gamma зависла надолго (см. tryPreResolve).
+  private preResolveMaxChain: number;
 
   // По одному активному Attempt на каждый streamKey — независимая
   // прогрессия/прогресс для каждого потока (п.3 бэклога).
@@ -150,8 +176,20 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
   private activeMarkets = new Map<string, MarketState>();
   // streamKey -> id логов, ещё не зарезолвленных (status='pending_resolve').
   // Заполняется в writeLog, чистится в resolvePendingMarkets, восстанавливается
-  // из БД в onModuleInit (переживает рестарт процесса) — см. blockOrdersIfPending.
+  // из БД в onModuleInit (переживает рестарт процесса) — см. pendingGateMode.
   private pendingByStream = new Map<string, Set<string>>();
+  // streamKey -> сколько подряд окон открыто через pre_resolve без
+  // промежуточного официального подтверждения (см. preResolveMaxChain).
+  private provisionalChainByStream = new Map<string, number>();
+  // Троттлинг DEBUG-сообщений о пропуске окна в discoveryTick (Сессия 8,
+  // баг №2): тик обнаружения гоняется каждые discoveryPollMs (по умолчанию
+  // 1.5с) — без троттлинга обычная ситуация "ждём резолва Gamma" превращала
+  // логи в сплошной спам (десятки одинаковых строк в минуту на поток).
+  // Реальная задержка резолва и так видна по отдельному [STALE]-предупреждению
+  // (staleResolveWarnMs) — этот лог нужен только для локальной отладки, не
+  // для постоянного потока.
+  private lastGateSkipLogAt = new Map<string, number>();
+  private static readonly GATE_SKIP_LOG_THROTTLE_MS = 30_000;
   private stopped = false;
 
   constructor(
@@ -191,7 +229,26 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     this.entryFilterEnabled = this.config.get<string>('ENTRY_FILTER_ENABLED', 'true') === 'true';
     this.minDistanceAtrRatio = parseFloat(this.config.get<string>('MIN_DISTANCE_ATR_RATIO', '1.5'));
     this.staleResolveWarnMs = parseInt(this.config.get<string>('STALE_RESOLVE_WARN_MS', '180000'), 10);
-    this.blockOrdersIfPending = this.config.get<string>('BLOCK_ORDERS_IF_PENDING', 'true') === 'true';
+
+    const rawMode = (this.config.get<string>('PENDING_GATE_MODE', '') ?? '').trim().toLowerCase();
+    if (rawMode === 'block' || rawMode === 'pre_resolve' || rawMode === 'open') {
+      this.pendingGateMode = rawMode;
+    } else {
+      // Обратная совместимость со старым булевым флагом (Сессия 6) — если
+      // новый PENDING_GATE_MODE не задан явно, но задан старый, мапим его.
+      const legacy = this.config.get<string>('BLOCK_ORDERS_IF_PENDING');
+      if (legacy != null && legacy !== '') {
+        this.pendingGateMode = legacy === 'true' ? 'block' : 'open';
+        this.logger.warn(
+          `BLOCK_ORDERS_IF_PENDING устарел (Сессия 7) — используйте PENDING_GATE_MODE=block|pre_resolve|open. ` +
+            `Сейчас смаплено в PENDING_GATE_MODE=${this.pendingGateMode}.`,
+        );
+      } else {
+        this.pendingGateMode = 'block'; // безопасный дефолт
+      }
+    }
+    this.preResolveMinAtrRatio = parseFloat(this.config.get<string>('PRE_RESOLVE_MIN_ATR_RATIO', '2'));
+    this.preResolveMaxChain = parseInt(this.config.get<string>('PRE_RESOLVE_MAX_CHAIN', '1'), 10);
   }
 
   async onModuleInit() {
@@ -344,6 +401,16 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /** Троттлинг спама из discoveryTick (Сессия 8, баг №2) — см. lastGateSkipLogAt. */
+  private logGateSkipThrottled(streamKey: string, message: string): void {
+    const key = `${streamKey}`;
+    const last = this.lastGateSkipLogAt.get(key) ?? 0;
+    const now = Date.now();
+    if (now - last < TradingService.GATE_SKIP_LOG_THROTTLE_MS) return;
+    this.lastGateSkipLogAt.set(key, now);
+    this.logger.debug(message);
+  }
+
   private async discoveryTick(): Promise<void> {
     for (const stream of this.streams) {
       const startTs = this.gamma.currentIntervalStartTimestampSec(stream.intervalSec);
@@ -352,24 +419,123 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
 
       if (this.activeMarkets.get(stream.streamKey)?.slug === slug) continue; // уже отслеживаем
 
-      if (this.blockOrdersIfPending) {
-        const pending = this.pendingByStream.get(stream.streamKey);
-        if (pending && pending.size > 0) {
+      let forcedBetAmount: number | null = null;
+      let predictedFromLogId: string | null = null;
+
+      const pending = this.pendingByStream.get(stream.streamKey);
+      if (pending && pending.size > 0) {
+        if (this.pendingGateMode === 'block') {
           // Не долбим лог на каждый тик обнаружения (1.5с) — это ожидаемое,
           // а не аварийное состояние (Gamma просто ещё не ответила closed:true).
-          this.logger.debug(
+          // Троттлинг (Сессия 8, баг №2): максимум раз в GATE_SKIP_LOG_THROTTLE_MS.
+          this.logGateSkipThrottled(
+            stream.streamKey,
             `[${stream.streamKey}] пропуск нового окна: ${pending.size} шаг(ов) ещё не зарезолвлены ` +
-              `(BLOCK_ORDERS_IF_PENDING=true) — ждём резолва, прежде чем снимать новый снимок стейка.`,
+              `(PENDING_GATE_MODE=block) — ждём резолва, прежде чем снимать новый снимок стейка.`,
           );
           continue;
         }
+        if (this.pendingGateMode === 'pre_resolve') {
+          const prediction = await this.tryPreResolve(stream.streamKey);
+          if (!prediction) {
+            // Предсказание недоступно/неуверенное — на ЭТОМ тике ведём себя
+            // как 'block', не открываем окно вслепую (см. tryPreResolve).
+            this.logGateSkipThrottled(
+              stream.streamKey,
+              `[${stream.streamKey}] pre_resolve: предсказание недоступно/неуверенное — пропуск нового окна на этот тик.`,
+            );
+            continue;
+          }
+          forcedBetAmount = prediction.betAmount;
+          predictedFromLogId = prediction.logId;
+        }
+        // 'open' — намеренно легаси-поведение без гейта, ничего не делаем.
       }
 
       const market = await this.gamma.fetchMarketBySlug(slug, closeTs);
       if (!market) continue; // ещё не создан на Gamma — попробуем на следующем тике
 
-      await this.openMarket(stream, market.slug, market.closesAt, market.yesTokenId, market.noTokenId, market.negRisk);
+      await this.openMarket(
+        stream,
+        market.slug,
+        market.closesAt,
+        market.yesTokenId,
+        market.noTokenId,
+        market.negRisk,
+        forcedBetAmount,
+        predictedFromLogId,
+      );
     }
+  }
+
+  /**
+   * Пре-резолв (Сессия 7, см. CONTEXT.md) — предсказывает исход ПОСЛЕДНЕГО
+   * ещё не зарезолвленного официально шага потока по живой цене Chainlink,
+   * чтобы можно было корректно (не вслепую и не "как было раньше") снять
+   * сумму стейка для СЛЕДУЮЩЕГО окна ДО того, как Gamma подтвердит closed:true.
+   *
+   * Идея (предложена пользователем): открытие следующего окна фиксирует цену,
+   * которая по факту и есть цена ЗАКРЫТИЯ предыдущего окна (это одна и та же
+   * непрерывная лента Chainlink) — то есть если сравнить эту цену со
+   * страйком (referencePrice) предыдущего шага, можно почти достоверно
+   * узнать его исход ДО официального резолва Gamma, который использует
+   * именно Chainlink как источник истины.
+   *
+   * Возвращает null (== "не уверены, лучше подождать") если:
+   *  - самого pending-лога нет, либо в нём нет chosenOutcome/referencePrice
+   *    (например фид был недоступен на момент ЕГО открытия);
+   *  - живой фид сейчас недоступен;
+   *  - дистанция от страйка меньше preResolveMinAtrRatio * ATR — слишком
+   *    близко к границе, чтобы доверять предсказанию (могло дёрнуться к
+   *    моменту официального резолва);
+   *  - уже preResolveMaxChain окон подряд открыты через предсказание без
+   *    хотя бы одного официального подтверждения между ними — не даём
+   *    риску накапливаться бесконтрольно, если Gamma зависла надолго.
+   */
+  private async tryPreResolve(streamKey: string): Promise<{ betAmount: number; logId: string } | null> {
+    const chain = this.provisionalChainByStream.get(streamKey) ?? 0;
+    if (chain >= this.preResolveMaxChain) {
+      this.logger.warn(
+        `[${streamKey}] pre_resolve: достигнут потолок ${this.preResolveMaxChain} окон подряд без официального ` +
+          `подтверждения — временно откатываемся к ожиданию резолва (защита от накопления риска).`,
+      );
+      return null;
+    }
+
+    const lastPending = await this.marketLogRepo.findOne({
+      where: { assetPrefix: streamKey, status: 'pending_resolve' },
+      order: { createdAt: 'DESC' },
+    });
+    if (!lastPending || !lastPending.chosenOutcome || lastPending.referencePrice == null) return null;
+
+    const snap = this.priceFeed.getSnapshot(streamKey);
+    if (snap.price == null) return null;
+
+    const dist = Math.abs(snap.price - lastPending.referencePrice);
+    const ratio = snap.atr && snap.atr > 0 ? dist / snap.atr : null;
+    if (ratio == null || ratio < this.preResolveMinAtrRatio) return null;
+
+    const predictedSide: Outcome = snap.price >= lastPending.referencePrice ? 'YES' : 'NO';
+    const predictedWin = predictedSide === lastPending.chosenOutcome;
+
+    const stream = this.streamByKey.get(streamKey);
+    const baseStake = stream?.baseStake ?? lastPending.betAmount;
+    const spentUsd = lastPending.filledAmount ?? lastPending.betAmount;
+    const entryPrice = lastPending.entryPrice ?? this.maxMarketPrice;
+    // Тот же фикс, что и в resolvePendingMarkets (Сессия 8, баг №1) — не
+    // теряем неисполненный остаток заявки при частичном филле предыдущего шага.
+    const unfilledUsd = Math.max(0, lastPending.betAmount - spentUsd);
+    const betAmount = predictedWin ? spentUsd / entryPrice + unfilledUsd : baseStake;
+
+    this.logger.log(
+      `[${streamKey}] pre_resolve: предсказан ${predictedWin ? 'ВЫИГРЫШ' : 'ПРОИГРЫШ'} шага ${lastPending.slug} ` +
+        `(дистанция ${ratio.toFixed(2)}x ATR от страйка ¢${(lastPending.referencePrice * 100).toFixed(2)}, ` +
+        `текущая цена ${snap.price}) — открываю следующее окно со стейком $${betAmount.toFixed(2)} ДО официального ` +
+        `резолва Gamma. Официальный резолв всё равно наступит и остаётся источником истины для профита/прогрессии.`,
+    );
+
+    this.provisionalChainByStream.set(streamKey, chain + 1);
+    return { betAmount, logId: lastPending.id };
   }
 
   private async openMarket(
@@ -379,6 +545,8 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     yesTokenId: string,
     noTokenId: string,
     negRisk: boolean,
+    forcedBetAmount: number | null = null,
+    predictedFromLogId: string | null = null,
   ): Promise<void> {
     const streamKey = stream.streamKey;
 
@@ -392,13 +560,16 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
 
     // Снимок стейка реинвест-прогрессии ЭТОГО потока на момент открытия окна
     // (п.1 бэклога) — фиксируем один раз здесь, дальше в течение всего окна
-    // используем именно это число, а не текущее значение Attempt.
+    // используем именно это число, а не текущее значение Attempt. Если гейт
+    // (см. discoveryTick/tryPreResolve) уже посчитал предсказанную сумму —
+    // используем её вместо Attempt.currentStake (который на данный момент
+    // ещё НЕ обновлён официальным резолвером и был бы попросту устаревшим).
     const attempt = this.currentAttempts.get(streamKey);
     if (!attempt) {
       this.logger.error(`[${streamKey}] ${slug}: нет активного Attempt для потока — пропуск окна (не должно происходить).`);
       return;
     }
-    const betAmount = attempt.currentStake;
+    const betAmount = forcedBetAmount ?? attempt.currentStake;
     const attemptId = attempt.id;
     const attemptStepNumber = attempt.currentStep + 1;
 
@@ -439,6 +610,8 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       betAmount,
       attemptId,
       attemptStepNumber,
+      stakePredicted: forcedBetAmount != null,
+      predictedFromLogId,
       lastMinuteAnnounced: false,
     };
 
@@ -955,6 +1128,8 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
         slug: marketState.slug,
         closesAt: marketState.closesAt,
         betAmount: marketState.betAmount,
+        stakePredicted: marketState.stakePredicted,
+        predictedFromLogId: marketState.predictedFromLogId,
         isSmoke: this.isSmoke,
         chosenOutcome: fields.chosenOutcome,
         chosenTokenId: fields.chosenTokenId ?? null,
@@ -1021,7 +1196,16 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     if (stale.length === 0) return;
 
     for (const log of stale) {
-      const ageSec = Math.round((Date.now() - log.createdAt.getTime()) / 1000);
+      // Троттлинг (Сессия 8, баг №2): без него это тоже спамило WARN каждые
+      // resolvePollMs (10с) на весь срок зависания шага. Раз в staleResolveWarnMs
+      // достаточно, чтобы держать в курсе, что проблема ещё не решена.
+      const key = `stale:${log.id}`;
+      const last = this.lastGateSkipLogAt.get(key) ?? 0;
+      const now = Date.now();
+      if (now - last < this.staleResolveWarnMs) continue;
+      this.lastGateSkipLogAt.set(key, now);
+
+      const ageSec = Math.round((now - log.createdAt.getTime()) / 1000);
       this.logger.warn(
         `[STALE] ${log.assetPrefix} ${log.slug}: висит в pending_resolve уже ${ageSec}с — ` +
           `резолв Gamma задерживается сильнее обычного (текущее окно закрытия ~30с). Проверь вручную.`,
@@ -1060,6 +1244,13 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       // до проверки attempt.status ниже, чтобы досрочно закрытая попытка
       // (closeAttemptEarly) тоже корректно снимала блокировку по потоку.
       this.pendingByStream.get(log.assetPrefix)?.delete(log.id);
+      // Сбрасываем троттлинг лога пропуска (Сессия 8, баг №2) — если поток
+      // снова застрянет в pending, следующий пропуск должен залогироваться
+      // сразу, а не молчать оставшиеся секунды от предыдущего эпизода.
+      this.lastGateSkipLogAt.delete(log.assetPrefix);
+      // Официальное подтверждение от Gamma пришло — цепочка непроверенных
+      // pre_resolve-окон обнуляется (см. preResolveMaxChain/tryPreResolve).
+      this.provisionalChainByStream.set(log.assetPrefix, 0);
 
       const attempt = await this.attemptRepo.findOneOrFail({ where: { id: log.attemptId } });
       if (attempt.status !== 'active') continue; // попытка уже закрыта ранее (в т.ч. закрыта досрочно)
@@ -1075,7 +1266,27 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
         // выплата $1/акцию победителя) — считаем по ФАКТИЧЕСКОЙ цене
         // исполнения (VWAP шага), а не по константе ¢99, потому что VWAP
         // гуляет по тирам лимитки/маркет-тейка.
-        attempt.currentStake = spentUsd / entryPrice;
+        //
+        // ФИКС (Сессия 8, баг №1): при ЧАСТИЧНОМ филле (spentUsd < betAmount —
+        // например тир маркет-тейка исполнился лишь на 78% от заявки из-за
+        // нехватки глубины стакана) неисполненный остаток (betAmount-spentUsd)
+        // никуда не делся — эти деньги просто не были поставлены и остались
+        // "в кармане". Раньше он терялся из формулы: currentStake считался
+        // ТОЛЬКО от spentUsd, из-за чего прогрессия почти обнулялась до
+        // базового стейка при каждом частичном филле, даже подряд идущих
+        // выигрышах (наблюдалось в проде: заявка $6.36, филл $4.95 -> новый
+        // стейк $5.00 вместо ожидаемого роста). Теперь неисполненный остаток
+        // прибавляется обратно к следующему стейку — деньги "возвращаются
+        // в оборот" вместо того, чтобы молча выпадать из прогрессии.
+        const unfilledUsd = Math.max(0, log.betAmount - spentUsd);
+        attempt.currentStake = spentUsd / entryPrice + unfilledUsd;
+        if (unfilledUsd > 0.01) {
+          this.logger.log(
+            `[${streamKey}] Шаг ${log.slug} исполнен частично ($${spentUsd.toFixed(2)} из $${log.betAmount.toFixed(2)}) — ` +
+              `неисполненный остаток $${unfilledUsd.toFixed(2)} добавлен к следующему стейку ($${attempt.currentStake.toFixed(2)}), ` +
+              `чтобы частичный филл не "съедал" прогрессию.`,
+          );
+        }
         if (attempt.currentStep >= attempt.targetSteps) {
           attempt.status = 'completed_target';
           attempt.finishedAt = new Date();
