@@ -493,12 +493,38 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     const referencePrice = marketState.referencePrice;
     const priceAtEntry = snap.price;
     const atrAtEntry = snap.atr;
+  
     let atrRatioAtEntry: number | null = null;
-    if (referencePrice != null && priceAtEntry != null && atrAtEntry != null && atrAtEntry > 0) {
-      atrRatioAtEntry = Math.abs(priceAtEntry - referencePrice) / atrAtEntry;
+  
+    if (
+      referencePrice != null &&
+      priceAtEntry != null &&
+      atrAtEntry != null &&
+      atrAtEntry > 0
+    ) {
+      atrRatioAtEntry =
+        Math.abs(priceAtEntry - referencePrice) / atrAtEntry;
     }
-    return { referencePrice, priceAtEntry, atrAtEntry, atrRatioAtEntry, priceSource: snap.source };
+  
+    this.logger.log(
+      `[ATR DEBUG] ${marketState.assetPrefix}: ` +
+      `reference=${referencePrice} ` +
+      `price=${priceAtEntry} ` +
+      `atr=${atrAtEntry} ` +
+      `candles=${snap.candleCount} ` +
+      `source=${snap.source} ` +
+      `ratio=${atrRatioAtEntry}`
+    );
+  
+    return {
+      referencePrice,
+      priceAtEntry,
+      atrAtEntry,
+      atrRatioAtEntry,
+      priceSource: snap.source,
+    };
   }
+  
 
   private evaluateEntryGate(marketState: MarketState): { allow: boolean; diagnostics: EntryDiagnostics; reason: string | null } {
     const diagnostics = this.captureDiagnostics(marketState);
