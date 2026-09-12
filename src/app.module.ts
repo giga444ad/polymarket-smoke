@@ -6,6 +6,7 @@ import { join } from 'path';
 
 import { Attempt } from './entities/attempt.entity';
 import { MarketLog } from './entities/market-log.entity';
+import { PriceCandle } from './entities/price-candle.entity';
 import { TradingModule } from './trading/trading.module';
 import { AnalyticsModule } from './analytics/analytics.module';
 
@@ -19,7 +20,7 @@ import { AnalyticsModule } from './analytics/analytics.module';
       username: process.env.POSTGRES_USER || 'postgres',
       password: process.env.POSTGRES_PASSWORD || 'postgres',
       database: process.env.POSTGRES_DB || 'polymarket_bot',
-      entities: [Attempt, MarketLog],
+      entities: [Attempt, MarketLog, PriceCandle],
       // Только для смоук/дев-контура: сам создаёт таблицы по сущностям.
       // Для боевого использования лучше завести нормальные миграции.
       synchronize: process.env.TYPEORM_SYNC !== 'false',

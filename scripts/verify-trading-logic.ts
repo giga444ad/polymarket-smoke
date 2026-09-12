@@ -84,11 +84,13 @@ const fakeAttemptRepo = {
   }),
 };
 
+let fakeLogIdSeq = 0;
 const fakeMarketLogRepo: any = {
   create: (x: any) => x,
   save: async (x: any) => {
-    writes.push(x);
-    return x;
+    const saved = { ...x, id: x.id ?? `log-${++fakeLogIdSeq}` };
+    writes.push(saved);
+    return saved;
   },
   find: async () => [] as any[],
 };
@@ -408,6 +410,61 @@ async function main() {
     );
   }
   writes.length = 0;
+
+  // --- Тест 11 (Сессия 6, п.7): BLOCK_ORDERS_IF_PENDING реально блокирует
+  // discoveryTick, пока по потоку есть незарезолвленный шаг — это и есть
+  // фикс реального race condition по сумме ставки (см. CONTEXT.md). ---
+  {
+    // Несколько потоков сконфигурировано разом (см. STREAMS_CONFIG в
+    // fakeConfig) — проверяем гейт ИМЕННО для btc-updown-5m, не задевая
+    // остальные потоки (у них своя, отдельная блокировка по своему streamKey).
+    const calledSlugs: string[] = [];
+    const gammaSpy: any = {
+      ...fakeGamma,
+      fetchMarketBySlug: async (slug: string) => {
+        calledSlugs.push(slug);
+        return null;
+      },
+    };
+    const svcBlocked: any = new TradingService(
+      fakeConfig as any,
+      gammaSpy,
+      fakeClobPublic as any,
+      fakeTrader as any,
+      fakePriceFeed as any,
+      fakeAttemptRepo as any,
+      fakeMarketLogRepo as any,
+    );
+    svcBlocked.blockOrdersIfPending = true;
+    svcBlocked.pendingByStream.set('btc-updown-5m', new Set(['log-1']));
+    await svcBlocked.discoveryTick();
+    console.log(
+      `[Тест 11] Окно btc-updown-5m НЕ открыто, пока есть pending-шаг (fetchMarketBySlug для него не вызван): ${!calledSlugs.some((s) => s.startsWith('btc-updown-5m-'))}`,
+    );
+
+    calledSlugs.length = 0;
+    svcBlocked.pendingByStream.set('btc-updown-5m', new Set());
+    await svcBlocked.discoveryTick();
+    console.log(
+      `[Тест 11] После резолва (pending-сет пуст) discoveryTick снова идёт за маркетом btc-updown-5m: ${calledSlugs.some((s) => s.startsWith('btc-updown-5m-'))}`,
+    );
+  }
+
+  // --- Тест 12 (Сессия 6, п.7): writeLog кладёт id лога в pendingByStream
+  // при status='pending_resolve', и марkет-стейт использует СНИМОК
+  // attemptId/attemptStepNumber, а не currentAttempts.get(...) "на сейчас". ---
+  {
+    const ms = makeMarketState({ attemptId: 'attempt-42', attemptStepNumber: 7 });
+    const b = book([{ price: 0.99, size: 10 }], 0.97);
+    svc.onBookUpdate(ms, 'YES', b);
+    await sleep(50);
+    const lastWrite = writes[writes.length - 1];
+    const pendingSet = svc.pendingByStream.get('btc-updown-5m');
+    console.log(
+      `[Тест 12] Лог записан со снимком attemptId='attempt-42'/stepNumber=7: ${lastWrite.attemptId === 'attempt-42' && lastWrite.stepNumber === 7}`,
+    );
+    console.log(`[Тест 12] pendingByStream пополнен id только что записанного лога: ${pendingSet?.has(lastWrite.id) ?? false}`);
+  }
 
   console.log('\nВСЕ ПРОВЕРКИ ВЫПОЛНЕНЫ.');
   process.exit(0);

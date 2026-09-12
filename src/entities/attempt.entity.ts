@@ -9,7 +9,10 @@ import {
 } from 'typeorm';
 import { MarketLog } from './market-log.entity';
 
-export type AttemptStatus = 'active' | 'failed' | 'completed_target';
+// 'closed_early' — попытка остановлена вручную через
+// POST /trading/attempts/:id/close-early (см. CONTEXT.md, п.5 сессии 6),
+// не дожидаясь ни проигрыша, ни достижения targetSteps.
+export type AttemptStatus = 'active' | 'failed' | 'completed_target' | 'closed_early';
 
 @Entity('attempts')
 export class Attempt {

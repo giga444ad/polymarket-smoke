@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit, OnModuleDestroy, NotFoundException, BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { LessThan, Repository } from 'typeorm';
@@ -73,6 +73,15 @@ interface MarketState {
   // (при последовательных окнах такого не бывает, но так честнее и проще
   // рассуждать про инвариант "ставка шага фиксируется на его открытии").
   betAmount: number;
+  // Снимок Attempt.id/currentStep НА МОМЕНТ ОТКРЫТИЯ ЭТОГО ОКНА (см. п.7
+  // сессии 6 в CONTEXT.md) — writeLog обязан использовать именно эти
+  // значения, а НЕ currentAttempts.get(streamKey) в момент записи лога:
+  // между открытием окна и фактическим исполнением проходят десятки секунд,
+  // и currentAttempts для потока может успеть смениться (например через
+  // досрочное закрытие попытки, см. closeAttemptEarly) — без снимка лог
+  // шага ушёл бы не в ту попытку.
+  attemptId: string;
+  attemptStepNumber: number;
   // Уже залогировали переход в "окно входа" (последние LAST_ENTRY_WINDOW_SEC
   // секунд) для этого маркета? Чтобы не спамить лог на каждый WS-тик до
   // наступления этого момента — см. onBookUpdate.
@@ -128,10 +137,21 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
   // прежде чем мы начнём предупреждать в логах/на фронте (не блокирует торговлю).
   private staleResolveWarnMs: number;
 
+  // Если true — не открываем новое окно потока, пока по нему же есть хоть
+  // одна незарезолвленная (pending_resolve) ставка. Реализация п.7 сессии 6
+  // (реальный race condition по сумме ставки) — см. CONTEXT.md. Раньше был
+  // задокументирован в .env.example как "уже сделано", но физически не
+  // применялся нигде в коде.
+  private blockOrdersIfPending: boolean;
+
   // По одному активному Attempt на каждый streamKey — независимая
   // прогрессия/прогресс для каждого потока (п.3 бэклога).
   private currentAttempts = new Map<string, Attempt>();
   private activeMarkets = new Map<string, MarketState>();
+  // streamKey -> id логов, ещё не зарезолвленных (status='pending_resolve').
+  // Заполняется в writeLog, чистится в resolvePendingMarkets, восстанавливается
+  // из БД в onModuleInit (переживает рестарт процесса) — см. blockOrdersIfPending.
+  private pendingByStream = new Map<string, Set<string>>();
   private stopped = false;
 
   constructor(
@@ -171,6 +191,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     this.entryFilterEnabled = this.config.get<string>('ENTRY_FILTER_ENABLED', 'true') === 'true';
     this.minDistanceAtrRatio = parseFloat(this.config.get<string>('MIN_DISTANCE_ATR_RATIO', '1.5'));
     this.staleResolveWarnMs = parseInt(this.config.get<string>('STALE_RESOLVE_WARN_MS', '180000'), 10);
+    this.blockOrdersIfPending = this.config.get<string>('BLOCK_ORDERS_IF_PENDING', 'true') === 'true';
   }
 
   async onModuleInit() {
@@ -189,6 +210,22 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     for (const stream of this.streams) {
       const attempt = await this.getOrCreateActiveAttempt(stream);
       this.currentAttempts.set(stream.streamKey, attempt);
+    }
+
+    // Восстанавливаем pendingByStream из БД — переживает рестарт процесса.
+    // Без этого после рестарта bloqueOrdersIfPending "забыл" бы про шаг,
+    // который уже был отправлен до рестарта и всё ещё не зарезолвлен.
+    const stillPending = await this.marketLogRepo.find({ where: { status: 'pending_resolve' } });
+    for (const log of stillPending) {
+      const set = this.pendingByStream.get(log.assetPrefix) ?? new Set<string>();
+      set.add(log.id);
+      this.pendingByStream.set(log.assetPrefix, set);
+    }
+    if (stillPending.length > 0) {
+      this.logger.log(
+        `Восстановлено ${stillPending.length} незарезолвленных шагов из БД после рестарта: ` +
+          [...this.pendingByStream.entries()].map(([k, v]) => `${k}=${v.size}`).join(', '),
+      );
     }
 
     this.logger.log(
@@ -243,6 +280,56 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     return this.attemptRepo.save(attempt);
   }
 
+  /**
+   * Досрочное закрытие попытки (п.5 сессии 6, см. CONTEXT.md) — вызывается
+   * из TradingController по POST /trading/attempts/:id/close-early. Не
+   * дожидаемся ни проигрыша, ни достижения targetSteps: фиксируем текущий
+   * прогресс/профит попытки как есть и сразу поднимаем для того же потока
+   * новую активную попытку со сбросом на baseStake (ровно как при
+   * проигрыше) — бот продолжает торговать потоком без ручного рестарта.
+   *
+   * Если на потоке в этот момент есть открытое (positioned/pending) окно —
+   * его резолвер довьёт обычным порядком (см. resolvePendingMarkets); он
+   * уже привязан к СТАРОМУ attemptId по снимку в MarketState (см. п.7 сессии
+   * 6), так что не "утечёт" в новую попытку и не исказит её прогрессию.
+   */
+  async closeAttemptEarly(attemptId: string): Promise<Attempt> {
+    const attempt = await this.attemptRepo.findOne({ where: { id: attemptId } });
+    if (!attempt) {
+      throw new NotFoundException(`Попытка ${attemptId} не найдена.`);
+    }
+    if (attempt.status !== 'active') {
+      throw new BadRequestException(`Попытка ${attemptId} уже не активна (status=${attempt.status}) — закрывать нечего.`);
+    }
+
+    attempt.status = 'closed_early';
+    attempt.finishedAt = new Date();
+    await this.attemptRepo.save(attempt);
+
+    const stream = this.streamByKey.get(attempt.streamKey);
+    const baseStake = stream?.baseStake ?? attempt.baseStake;
+    const next = this.attemptRepo.create({
+      attemptNumber: attempt.attemptNumber + 1,
+      streamKey: attempt.streamKey,
+      currentStep: 0,
+      targetSteps: attempt.targetSteps,
+      baseStake,
+      currentStake: baseStake,
+      status: 'active',
+      isSmoke: attempt.isSmoke,
+      finishedAt: null,
+    });
+    const saved = await this.attemptRepo.save(next);
+    this.currentAttempts.set(attempt.streamKey, saved);
+
+    this.logger.log(
+      `[${attempt.streamKey}] Попытка #${attempt.attemptNumber} закрыта досрочно вручную на шаге ${attempt.currentStep} ` +
+        `(стейк $${attempt.currentStake.toFixed(2)}). Открыта новая попытка #${saved.attemptNumber} со стейком $${baseStake.toFixed(2)}.`,
+    );
+
+    return saved;
+  }
+
   // ---------------------------------------------------------------------
   // Обнаружение маркетов — независимо по каждому настроенному потоку.
   // ---------------------------------------------------------------------
@@ -264,6 +351,19 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       const slug = this.gamma.buildSlugForStart(stream, startTs);
 
       if (this.activeMarkets.get(stream.streamKey)?.slug === slug) continue; // уже отслеживаем
+
+      if (this.blockOrdersIfPending) {
+        const pending = this.pendingByStream.get(stream.streamKey);
+        if (pending && pending.size > 0) {
+          // Не долбим лог на каждый тик обнаружения (1.5с) — это ожидаемое,
+          // а не аварийное состояние (Gamma просто ещё не ответила closed:true).
+          this.logger.debug(
+            `[${stream.streamKey}] пропуск нового окна: ${pending.size} шаг(ов) ещё не зарезолвлены ` +
+              `(BLOCK_ORDERS_IF_PENDING=true) — ждём резолва, прежде чем снимать новый снимок стейка.`,
+          );
+          continue;
+        }
+      }
 
       const market = await this.gamma.fetchMarketBySlug(slug, closeTs);
       if (!market) continue; // ещё не создан на Gamma — попробуем на следующем тике
@@ -299,6 +399,8 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       return;
     }
     const betAmount = attempt.currentStake;
+    const attemptId = attempt.id;
+    const attemptStepNumber = attempt.currentStep + 1;
 
     // Фиксируем ориентир по внешнему фиду в момент открытия окна — от него будем
     // считать дельту/ATR-рацио на входе и на закрытии. Если фид ещё не успел
@@ -335,6 +437,8 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       referencePrice: referenceSnapshot.price,
       marketLogId: null,
       betAmount,
+      attemptId,
+      attemptStepNumber,
       lastMinuteAnnounced: false,
     };
 
@@ -493,38 +597,12 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     const referencePrice = marketState.referencePrice;
     const priceAtEntry = snap.price;
     const atrAtEntry = snap.atr;
-  
     let atrRatioAtEntry: number | null = null;
-  
-    if (
-      referencePrice != null &&
-      priceAtEntry != null &&
-      atrAtEntry != null &&
-      atrAtEntry > 0
-    ) {
-      atrRatioAtEntry =
-        Math.abs(priceAtEntry - referencePrice) / atrAtEntry;
+    if (referencePrice != null && priceAtEntry != null && atrAtEntry != null && atrAtEntry > 0) {
+      atrRatioAtEntry = Math.abs(priceAtEntry - referencePrice) / atrAtEntry;
     }
-  
-    this.logger.log(
-      `[ATR DEBUG] ${marketState.assetPrefix}: ` +
-      `reference=${referencePrice} ` +
-      `price=${priceAtEntry} ` +
-      `atr=${atrAtEntry} ` +
-      `candles=${snap.candleCount} ` +
-      `source=${snap.source} ` +
-      `ratio=${atrRatioAtEntry}`
-    );
-  
-    return {
-      referencePrice,
-      priceAtEntry,
-      atrAtEntry,
-      atrRatioAtEntry,
-      priceSource: snap.source,
-    };
+    return { referencePrice, priceAtEntry, atrAtEntry, atrRatioAtEntry, priceSource: snap.source };
   }
-  
 
   private evaluateEntryGate(marketState: MarketState): { allow: boolean; diagnostics: EntryDiagnostics; reason: string | null } {
     const diagnostics = this.captureDiagnostics(marketState);
@@ -866,16 +944,13 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     if (marketState.logWritten) return null;
     marketState.logWritten = true;
 
-    const attempt = this.currentAttempts.get(marketState.assetPrefix);
-    if (!attempt) {
-      this.logger.error(`[${marketState.assetPrefix}] ${marketState.slug}: нет активного Attempt на момент записи лога — не должно происходить.`);
-      return null;
-    }
-
+    // ВАЖНО: используем снимок attemptId/attemptStepNumber, сделанный в
+    // openMarket в момент открытия ЭТОГО окна, а не currentAttempts.get(...)
+    // "сейчас" — см. комментарий у полей MarketState.attemptId (п.7 сессии 6).
     const saved = await this.marketLogRepo.save(
       this.marketLogRepo.create({
-        attemptId: attempt.id,
-        stepNumber: attempt.currentStep + 1,
+        attemptId: marketState.attemptId,
+        stepNumber: marketState.attemptStepNumber,
         assetPrefix: marketState.assetPrefix,
         slug: marketState.slug,
         closesAt: marketState.closesAt,
@@ -902,6 +977,13 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
         orderFilledAt: fields.orderFilledAt ?? null,
       }),
     );
+
+    if (fields.status === 'pending_resolve') {
+      const set = this.pendingByStream.get(marketState.assetPrefix) ?? new Set<string>();
+      set.add(saved.id);
+      this.pendingByStream.set(marketState.assetPrefix, set);
+    }
+
     return saved.id;
   }
 
@@ -972,8 +1054,15 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       }
       await this.marketLogRepo.save(log);
 
+      // Снимаем шаг с "занято" СРАЗУ после того, как узнали исход — именно
+      // это разблокирует discoveryTick на открытие следующего окна потока с
+      // ПРАВИЛЬНЫМ (уже обновлённым) стейком (см. п.7 сессии 6). Делаем это
+      // до проверки attempt.status ниже, чтобы досрочно закрытая попытка
+      // (closeAttemptEarly) тоже корректно снимала блокировку по потоку.
+      this.pendingByStream.get(log.assetPrefix)?.delete(log.id);
+
       const attempt = await this.attemptRepo.findOneOrFail({ where: { id: log.attemptId } });
-      if (attempt.status !== 'active') continue; // попытка уже закрыта ранее
+      if (attempt.status !== 'active') continue; // попытка уже закрыта ранее (в т.ч. закрыта досрочно)
 
       const streamKey = log.assetPrefix;
       const stream = this.streamByKey.get(streamKey);

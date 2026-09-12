@@ -1,9 +1,46 @@
-import { Controller, Get, Query } from '@nestjs/common';
+import { Controller, Get, NotFoundException, Param, Query } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { LessThan, Repository } from 'typeorm';
 import { Attempt } from '../entities/attempt.entity';
 import { MarketLog } from '../entities/market-log.entity';
+
+// Ссылка на страницу события на Polymarket (п.2 сессии 6, см. CONTEXT.md).
+// Слаг маркета Polymarket 1-в-1 совпадает со слагом события для этих
+// Up/Down маркетов (проверено вручную на живых данных), поэтому отдельного
+// маппинга market-slug -> event-slug не потребовалось.
+function eventUrlForSlug(slug: string): string {
+  return `https://polymarket.com/event/${slug}`;
+}
+
+// Общая, компактная проекция MarketLog для списковых ручек (/trades,
+// /streams/:key, /attempts/:id) — специально НЕ тащит всю диагностику
+// ATR/фида (она есть в /analytics/losses для разбора сливов), чтобы не
+// раздувать полезную нагрузку на фронте (п.1 сессии 6 — "не грузить фронт").
+function toTradeDto(log: MarketLog, attemptNumber?: number) {
+  return {
+    id: log.id,
+    attemptId: log.attemptId,
+    attemptNumber: attemptNumber ?? null,
+    stepNumber: log.stepNumber,
+    streamKey: log.assetPrefix,
+    slug: log.slug,
+    eventUrl: eventUrlForSlug(log.slug),
+    isSmoke: log.isSmoke,
+    status: log.status,
+    chosenOutcome: log.chosenOutcome,
+    entryPrice: log.entryPrice,
+    betAmount: log.betAmount,
+    filledAmount: log.filledAmount,
+    fillRatio: log.fillRatio,
+    profit: log.profit,
+    profitPct: log.filledAmount ? (log.profit != null ? (log.profit / log.filledAmount) * 100 : null) : null,
+    orderType: log.orderType,
+    closesAt: log.closesAt,
+    createdAt: log.createdAt,
+    resolvedAt: log.resolvedAt,
+  };
+}
 
 @Controller('analytics')
 export class AnalyticsController {
@@ -126,6 +163,7 @@ export class AnalyticsController {
           }
         : null,
       bestByStream: [...bestByStream.values()].map((a) => ({
+        id: a.id,
         streamKey: a.streamKey,
         attemptNumber: a.attemptNumber,
         isSmoke: a.isSmoke,
@@ -135,6 +173,7 @@ export class AnalyticsController {
         currentStake: a.currentStake,
       })),
       attempts: attempts.map((a) => ({
+        id: a.id,
         attemptNumber: a.attemptNumber,
         streamKey: a.streamKey,
         isSmoke: a.isSmoke,
@@ -190,5 +229,108 @@ export class AnalyticsController {
       priceAtClose: log.priceAtClose,
       atrAtClose: log.atrAtClose,
     }));
+  }
+
+  // ---------------------------------------------------------------------
+  // Сессия 6, п.1: единый список ставок (активные pending_resolve + история)
+  // по ВСЕМ потокам сразу, отдельно от /analytics/summary — не нагружает
+  // тяжёлую сводку и позволяет фронту дёргать это чаще/пагинированно.
+  // ---------------------------------------------------------------------
+  @Get('trades')
+  async getTrades(
+    @Query('limit') limit = '100',
+    @Query('streamKey') streamKey?: string,
+    @Query('status') status?: string,
+  ) {
+    const qb = this.marketLogRepo
+      .createQueryBuilder('log')
+      .leftJoin(Attempt, 'attempt', 'attempt.id = log.attemptId')
+      .addSelect('attempt.attemptNumber', 'attemptNumber')
+      .orderBy('log.createdAt', 'DESC')
+      .limit(Math.min(parseInt(limit, 10) || 100, 300));
+
+    if (streamKey) qb.andWhere('log.assetPrefix = :streamKey', { streamKey });
+    if (status) qb.andWhere('log.status = :status', { status });
+
+    const { entities, raw } = await qb.getRawAndEntities();
+    return entities.map((log, i) => toTradeDto(log, parseInt(raw[i]?.attemptNumber, 10) || undefined));
+  }
+
+  // Сессия 6, п.3: "событие" в терминах пользователя = поток (streamKey) —
+  // все ставки этого потока по ВСЕМ его попыткам (история + активные).
+  @Get('streams/:streamKey')
+  async getStreamDetail(@Param('streamKey') streamKey: string, @Query('limit') limit = '200') {
+    const attemptsOfStream = await this.attemptRepo.find({
+      where: { streamKey },
+      order: { attemptNumber: 'ASC' },
+    });
+    if (attemptsOfStream.length === 0) {
+      throw new NotFoundException(`Поток "${streamKey}" не найден (нет ни одной попытки).`);
+    }
+    const attemptNumberById = new Map(attemptsOfStream.map((a) => [a.id, a.attemptNumber]));
+
+    const logs = await this.marketLogRepo.find({
+      where: { assetPrefix: streamKey },
+      order: { createdAt: 'DESC' },
+      take: Math.min(parseInt(limit, 10) || 200, 500),
+    });
+
+    const totalProfit = attemptsOfStream.length
+      ? (await this.marketLogRepo
+          .createQueryBuilder('log')
+          .select('COALESCE(SUM(log.profit), 0)', 'total')
+          .where('log.assetPrefix = :streamKey', { streamKey })
+          .getRawOne<{ total: string }>())
+      : null;
+
+    return {
+      streamKey,
+      attemptsCount: attemptsOfStream.length,
+      totalProfit: Number((parseFloat(totalProfit?.total ?? '0') || 0).toFixed(2)),
+      attempts: attemptsOfStream.map((a) => ({
+        id: a.id,
+        attemptNumber: a.attemptNumber,
+        status: a.status,
+        isSmoke: a.isSmoke,
+        reachedStep: a.currentStep,
+        targetSteps: a.targetSteps,
+        currentStake: a.currentStake,
+        baseStake: a.baseStake,
+        createdAt: a.createdAt,
+        finishedAt: a.finishedAt,
+      })),
+      trades: logs.map((log) => toTradeDto(log, attemptNumberById.get(log.attemptId))),
+    };
+  }
+
+  // Сессия 6, п.4: конкретная попытка целиком — её шаги/история/активная
+  // ставка/цена входа и т.д., без остальных потоков и попыток.
+  @Get('attempts/:id')
+  async getAttemptDetail(@Param('id') id: string) {
+    const attempt = await this.attemptRepo.findOne({ where: { id } });
+    if (!attempt) {
+      throw new NotFoundException(`Попытка ${id} не найдена.`);
+    }
+    const logs = await this.marketLogRepo.find({
+      where: { attemptId: id },
+      order: { stepNumber: 'ASC' },
+    });
+
+    return {
+      attempt: {
+        id: attempt.id,
+        attemptNumber: attempt.attemptNumber,
+        streamKey: attempt.streamKey,
+        status: attempt.status,
+        isSmoke: attempt.isSmoke,
+        reachedStep: attempt.currentStep,
+        targetSteps: attempt.targetSteps,
+        currentStake: attempt.currentStake,
+        baseStake: attempt.baseStake,
+        createdAt: attempt.createdAt,
+        finishedAt: attempt.finishedAt,
+      },
+      steps: logs.map((log) => toTradeDto(log, attempt.attemptNumber)),
+    };
   }
 }

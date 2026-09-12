@@ -4,6 +4,7 @@ import WebSocket from 'ws';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { parseStreamsConfig } from '../trading/stream-config';
+import { CandleHistoryService } from './candle-history.service';
 
 interface Candle {
   start: number; // ts начала бакета, мс
@@ -44,7 +45,7 @@ interface ProviderAdapter {
   buildUrl(tickers: string[]): string;
   /** Что отправить сразу после открытия соединения (напр. Bybit/RTDS требуют явный subscribe). */
   onOpenMessage?(tickers: string[]): string | null;
-  parseMessage(raw: any, logger: Logger): NormalizedTrade | null;
+  parseMessage(raw: any): NormalizedTrade | null;
   /** Прикладной heartbeat (RTDS требует текстовый "PING" каждые 5с, помимо протокольного ws ping/pong). */
   heartbeatIntervalMs?: number;
   heartbeatMessage?: string;
@@ -104,7 +105,7 @@ const CHAINLINK_RTDS_ADAPTER: ProviderAdapter = {
     return 'wss://ws-live-data.polymarket.com';
   },
   onOpenMessage(tickers) {
-    const rawString = JSON.stringify({
+    return JSON.stringify({
       action: 'subscribe',
       subscriptions: tickers.map((t) => ({
         topic: 'crypto_prices_chainlink',
@@ -112,11 +113,10 @@ const CHAINLINK_RTDS_ADAPTER: ProviderAdapter = {
         filters: JSON.stringify({ symbol: `${t}/usd` }),
       })),
     });
-    return rawString;
   },
   heartbeatIntervalMs: 5000,
   heartbeatMessage: 'PING',
-  parseMessage(raw, logger) {
+  parseMessage(raw) {
     if (raw?.topic !== 'crypto_prices_chainlink') return null;
     const payload = raw?.payload;
     if (!payload) return null;
@@ -125,14 +125,6 @@ const CHAINLINK_RTDS_ADAPTER: ProviderAdapter = {
     const price = parseFloat(payload.value);
     const ts = Number(payload.timestamp) || Date.now();
     if (!ticker || !Number.isFinite(price)) return null;
-    logger.log(
-      `[CHAINLINK PARSED] symbol=${wireSymbol} ticker=${ticker} ` +
-      `price=${price} ` +
-      `rawTimestamp=${payload.timestamp} ` +
-      `ts=${ts} ` +
-      `tsDigits=${String(ts).length} ` +
-      `date=${new Date(ts).toISOString()}`
-    );
     return { ticker, price, ts };
   },
 };
@@ -208,7 +200,10 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
   // streamKey -> собственное состояние свечей/ATR (см. комментарий класса выше)
   private readonly states = new Map<string, StreamFeedState>();
 
-  constructor(private readonly config: ConfigService) {
+  constructor(
+    private readonly config: ConfigService,
+    private readonly candleHistory: CandleHistoryService,
+  ) {
     this.atrCandles = parseInt(this.config.get<string>('FEED_ATR_CANDLES', '20'), 10);
     this.staleMs = parseInt(this.config.get<string>('FEED_STALE_MS', '5000'), 10);
     this.failThreshold = parseInt(this.config.get<string>('FEED_PROVIDER_FAIL_THRESHOLD', '3'), 10);
@@ -268,7 +263,31 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  onModuleInit(): void {
+  async onModuleInit(): Promise<void> {
+    // Бэкафилл истории свечей ПЕРЕД подключением по WS (см. CandleHistoryService
+    // и CONTEXT.md, Сессия 6 п.6) — без этого прогрев ATR-гейта после каждого
+    // рестарта процесса начинался бы с нуля (до 20 часов для часового потока).
+    // Тикеры общие для нескольких потоков (напр. все BTC-потоки), но у каждого
+    // потока свой candleMs/atrCandles — бэкафилл делаем на уровне ПОТОКА, не тикера.
+    await Promise.all(
+      [...this.states.values()].map(async (state) => {
+        try {
+          const history = await this.candleHistory.bootstrap(state.ticker, state.candleMs, state.atrCandles * 2);
+          state.closed = history;
+          if (history.length >= state.atrCandles) {
+            this.logger.log(
+              `PriceFeedService: [${state.streamKey}] ATR прогрет из кеша сразу при старте (${history.length}/${state.atrCandles} свечей).`,
+            );
+          } else if (history.length > 0) {
+            this.logger.log(
+              `PriceFeedService: [${state.streamKey}] частичный прогрев из кеша (${history.length}/${state.atrCandles}) — остаток догонит живой фид.`,
+            );
+          }
+        } catch (err) {
+          this.logger.warn(`PriceFeedService: бэкафилл истории для [${state.streamKey}] не удался: ${this.errMsg(err)}`);
+        }
+      }),
+    );
     this.connect();
   }
 
@@ -367,24 +386,18 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
 
     this.ws.on('message', (raw: WebSocket.RawData) => {
       try {
+        // Chainlink RTDS иногда присылает первым фреймом пустую строку
+        // (не JSON) — без этой проверки JSON.parse валился на КАЖДОМ
+        // подключении и всё уходило в debug-лог как "не удалось разобрать".
         const message = raw.toString();
+        if (!message.trim()) return;
 
-        if (!message.trim()) {
-          return;
-        }
-
-        const trade = provider.parseMessage(JSON.parse(message), this.logger);
-        console.log('ifTrade: ', trade)
-        if (trade) {
-          this.applyTrade(provider.name, trade);
-        }
+        const trade = provider.parseMessage(JSON.parse(message));
+        if (trade) this.applyTrade(provider.name, trade);
       } catch (err) {
-        this.logger.debug(
-          `PriceFeedService: не удалось разобрать сообщение (${provider.name}): ${this.errMsg(err)}`
-        );
+        this.logger.debug(`PriceFeedService: не удалось разобрать сообщение (${provider.name}): ${this.errMsg(err)}`);
       }
     });
-
 
     this.ws.on('close', () => this.handleDisconnect(provider));
     this.ws.on('error', (err) => {
@@ -404,8 +417,8 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
       const next = (this.providerIndex + 1) % this.providers.length;
       this.logger.warn(
         `PriceFeedService: ${provider.name} не отвечает уже ${this.consecutiveFailuresOnProvider} подключений подряд ` +
-        `(похоже на гео-блокировку по IP хостинга или сбой сервиса, не на временный сбой сети) — ` +
-        `переключаюсь на ${this.providers[next].name}.`,
+          `(похоже на гео-блокировку по IP хостинга или сбой сервиса, не на временный сбой сети) — ` +
+          `переключаюсь на ${this.providers[next].name}.`,
       );
       this.providerIndex = next;
       this.consecutiveFailuresOnProvider = 0;
@@ -417,14 +430,6 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
 
   private applyTrade(source: string, trade: NormalizedTrade): void {
     const streamKeys = this.tickerToStreams.get(trade.ticker);
-
-    this.logger.log(
-      `[ATR APPLY] source=${source} ticker=${trade.ticker} ` +
-      `price=${trade.price} ts=${trade.ts} ` +
-      `date=${new Date(trade.ts).toISOString()} ` +
-      `streams=${JSON.stringify(streamKeys)}`
-    );
-
     if (!streamKeys) return;
 
     for (const streamKey of streamKeys) {
@@ -436,22 +441,15 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
       state.lastPriceSource = source;
 
       const bucketStart = Math.floor(trade.ts / state.candleMs) * state.candleMs;
-
-      this.logger.log(
-        `[ATR BUCKET] ${streamKey} ` +
-        `candleMs=${state.candleMs} ` +
-        `bucket=${bucketStart} (${new Date(bucketStart).toISOString()}) ` +
-        `current=${state.current?.start ?? null} ` +
-        `currentDate=${state.current ? new Date(state.current.start).toISOString() : null} ` +
-        `closed=${state.closed.length}`
-      );
-
       if (!state.current || state.current.start !== bucketStart) {
         if (state.current) {
           state.closed.push(state.current);
           if (state.closed.length > state.atrCandles * 2) {
             state.closed.splice(0, state.closed.length - state.atrCandles * 2);
           }
+          // Персистим закрытую свечу в БД (кеш под ATR, см. CandleHistoryService) —
+          // best-effort, не блокирует горячий путь фида.
+          void this.candleHistory.saveClosedCandle(state.ticker, state.candleMs, state.current, source);
         }
         state.current = { start: bucketStart, open: trade.price, high: trade.price, low: trade.price, close: trade.price };
       } else {
