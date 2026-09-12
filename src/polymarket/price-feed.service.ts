@@ -16,7 +16,8 @@ interface Candle {
 interface StreamFeedState {
   streamKey: string;
   ticker: string; // "btc", "eth", ... — общий тикер для всех провайдеров
-  candleMs: number; // размер свечи ATR, ПОДОБРАН ПОД ТАЙМФРЕЙМ ЭТОГО ПОТОКА (см. ниже)
+  candleMs: number; // размер свечи ATR = ровно длительность окна ЭТОГО потока (см. ниже)
+  atrCandles: number; // сколько прошлых окон усредняем (может быть переопределено на поток)
   lastPrice: number | null;
   lastPriceAt: number | null;
   lastPriceSource: string | null;
@@ -147,17 +148,29 @@ const PROVIDERS: Record<string, ProviderAdapter> = {
  * доступны как фолбэк-провайдеры (`FEED_PROVIDERS`), но их значения всегда
  * помечаются `source` в FeedSnapshot — не выдаём приближение за истину молча.
  *
- * ОКНО ATR ТЕПЕРЬ МАСШТАБИРУЕТСЯ ПОД ТАЙМФРЕЙМ ПОТОКА. Раньше был единственный
- * глобальный размер свечи (по умолчанию 1 секунда) и 20 таких свечей на ATR —
- * то есть ATR буквально измерял волатильность последних 20 СЕКУНД, вне
- * зависимости от того, идёт ли речь о 5-минутном или часовом маркете. Для
- * часового/15-минутного окна это давало обманчиво ВЫСОКИЙ atrRatioAtEntry
- * (типичное движение за 20 секунд — это шум на порядки меньше типичного
- * дрейфа цены за 15-60 минут), из-за чего гейт выглядел бы "уверенным" даже
- * на почти равновероятных входах у самой границы. Теперь размер свечи
- * ATR для каждого потока считается как `intervalSec*1000 / FEED_ATR_CANDLES`
- * — то есть ATR отражает типичный размах цены за период, СОПОСТАВИМЫЙ с
- * длительностью самого окна, а не с несколькими секундами.
+ * ОКНО ATR ПРИВЯЗАНО К ДЛИТЕЛЬНОСТИ ОКНА ПОТОКА, А НЕ К ЕГО ДОЛЕ. Важная
+ * деталь, из-за которой первая версия этого фикса всё ещё была неверна:
+ * если считать ATR по свечам РАЗМЕРОМ intervalSec/N (т.е. дробить каждое
+ * окно на N кусков), то мы сравниваем "дрейф цены за ВСЁ прошедшее окно" с
+ * "типичным размахом ВНУТРИ 1/N этого окна" — а это не одна и та же
+ * величина по масштабу времени. При случайном блуждании размах растёт
+ * примерно как √(время), поэтому даже на чистом шуме без всякого
+ * направленного движения такое сравнение само по себе даёт коэффициент
+ * ≈ √N (для N=20 это ≈4.5), а не ≈1 — то есть гейт всё ещё систематически
+ * занижал бы риск, просто не так драматично, как при 20-секундных свечах.
+ *
+ * Правильное сравнение — не дробить окно, а мерить размах целых ПРОШЛЫХ
+ * завершённых окон того же потока и сравнивать с ним: одна свеча ATR = ровно
+ * одно окно (`intervalSec`), ATR = средний размах последних N таких окон.
+ * Это буквально "насколько обычно двигается цена этого актива за один такой
+ * же по длине маркет" — без пересчётных коэффициентов. Платим за это более
+ * долгим прогревом: N=20 окон для 5m — это 100 минут, для 1h — 20 часов
+ * (поэтому у часового потока в дефолтном `STREAMS_CONFIG` `atrCandles`
+ * уменьшен до 8 — см. stream-config.ts). Пока прогрев не набрался,
+ * `getSnapshot(...).atr` возвращает null — при включённом
+ * `ENTRY_FILTER_ENABLED` это уходит в fail-closed так же, как отсутствие
+ * тиков: лучше не торговать этим потоком, чем гадать на нерепрезентативной
+ * статистике.
  */
 @Injectable()
 export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
@@ -212,6 +225,9 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
 
     const streams = parseStreamsConfig(this.config.get<string>('STREAMS_CONFIG'));
     const overrides = this.parseOverrides(this.config.get<string>('FEED_SYMBOL_OVERRIDES', ''));
+    // Оставлен как защитный нижний предел (на случай экзотически маленького
+    // intervalSec) — при обычных 5m/15m/1h НЕ участвует в расчёте, поскольку
+    // candleMs теперь равен полной длительности окна, а не её доле.
     const minCandleMs = parseInt(this.config.get<string>('FEED_MIN_CANDLE_MS', '1000'), 10);
 
     for (const stream of streams) {
@@ -221,11 +237,19 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
       list.push(stream.streamKey);
       this.tickerToStreams.set(ticker, list);
 
-      const candleMs = Math.max(minCandleMs, Math.round((stream.intervalSec * 1000) / this.atrCandles));
+      // Одна свеча ATR = ровно одно окно потока (см. класс-комментарий выше —
+      // почему НЕ intervalSec/N). Побочный бонус: границы такой свечи
+      // (floor(ts/candleMs)*candleMs) совпадают с границами САМИХ маркетов
+      // Polymarket для этого потока (см. GammaMarketService.currentIntervalStartTimestampSec
+      // — та же формула), так что каждая закрытая свеча ATR — это буквально
+      // диапазон цены за одно из прошлых окон этого актива/таймфрейма.
+      const candleMs = Math.max(minCandleMs, stream.intervalSec * 1000);
+      const atrCandles = stream.atrCandles ?? this.atrCandles;
       this.states.set(stream.streamKey, {
         streamKey: stream.streamKey,
         ticker,
         candleMs,
+        atrCandles,
         lastPrice: null,
         lastPriceAt: null,
         lastPriceSource: null,
@@ -267,8 +291,8 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
   }
 
   private computeAtr(state: StreamFeedState): number | null {
-    if (state.closed.length < this.atrCandles) return null;
-    const sample = state.closed.slice(-this.atrCandles);
+    if (state.closed.length < state.atrCandles) return null;
+    const sample = state.closed.slice(-state.atrCandles);
     const sum = sample.reduce((acc, c) => acc + Math.abs(c.high - c.low), 0);
     return sum / sample.length;
   }
@@ -386,8 +410,8 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
       if (!state.current || state.current.start !== bucketStart) {
         if (state.current) {
           state.closed.push(state.current);
-          if (state.closed.length > this.atrCandles * 2) {
-            state.closed.splice(0, state.closed.length - this.atrCandles * 2);
+          if (state.closed.length > state.atrCandles * 2) {
+            state.closed.splice(0, state.closed.length - state.atrCandles * 2);
           }
         }
         state.current = { start: bucketStart, open: trade.price, high: trade.price, low: trade.price, close: trade.price };
