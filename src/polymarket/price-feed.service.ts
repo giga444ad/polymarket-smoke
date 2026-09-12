@@ -44,7 +44,7 @@ interface ProviderAdapter {
   buildUrl(tickers: string[]): string;
   /** Что отправить сразу после открытия соединения (напр. Bybit/RTDS требуют явный subscribe). */
   onOpenMessage?(tickers: string[]): string | null;
-  parseMessage(raw: any): NormalizedTrade | null;
+  parseMessage(raw: any, logger: Logger): NormalizedTrade | null;
   /** Прикладной heartbeat (RTDS требует текстовый "PING" каждые 5с, помимо протокольного ws ping/pong). */
   heartbeatIntervalMs?: number;
   heartbeatMessage?: string;
@@ -116,7 +116,7 @@ const CHAINLINK_RTDS_ADAPTER: ProviderAdapter = {
   },
   heartbeatIntervalMs: 5000,
   heartbeatMessage: 'PING',
-  parseMessage(raw) {
+  parseMessage(raw, logger) {
     if (raw?.topic !== 'crypto_prices_chainlink') return null;
     const payload = raw?.payload;
     if (!payload) return null;
@@ -125,6 +125,14 @@ const CHAINLINK_RTDS_ADAPTER: ProviderAdapter = {
     const price = parseFloat(payload.value);
     const ts = Number(payload.timestamp) || Date.now();
     if (!ticker || !Number.isFinite(price)) return null;
+    logger.log(
+      `[CHAINLINK PARSED] symbol=${wireSymbol} ticker=${ticker} ` +
+      `price=${price} ` +
+      `rawTimestamp=${payload.timestamp} ` +
+      `ts=${ts} ` +
+      `tsDigits=${String(ts).length} ` +
+      `date=${new Date(ts).toISOString()}`
+    );
     return { ticker, price, ts };
   },
 };
@@ -365,8 +373,8 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
           return;
         }
 
-        const trade = provider.parseMessage(JSON.parse(message));
-
+        const trade = provider.parseMessage(JSON.parse(message), this.logger);
+        console.log('ifTrade: ', trade)
         if (trade) {
           this.applyTrade(provider.name, trade);
         }
@@ -409,6 +417,14 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
 
   private applyTrade(source: string, trade: NormalizedTrade): void {
     const streamKeys = this.tickerToStreams.get(trade.ticker);
+
+    this.logger.log(
+      `[ATR APPLY] source=${source} ticker=${trade.ticker} ` +
+      `price=${trade.price} ts=${trade.ts} ` +
+      `date=${new Date(trade.ts).toISOString()} ` +
+      `streams=${JSON.stringify(streamKeys)}`
+    );
+
     if (!streamKeys) return;
 
     for (const streamKey of streamKeys) {
@@ -420,6 +436,16 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
       state.lastPriceSource = source;
 
       const bucketStart = Math.floor(trade.ts / state.candleMs) * state.candleMs;
+
+      this.logger.log(
+        `[ATR BUCKET] ${streamKey} ` +
+        `candleMs=${state.candleMs} ` +
+        `bucket=${bucketStart} (${new Date(bucketStart).toISOString()}) ` +
+        `current=${state.current?.start ?? null} ` +
+        `currentDate=${state.current ? new Date(state.current.start).toISOString() : null} ` +
+        `closed=${state.closed.length}`
+      );
+
       if (!state.current || state.current.start !== bucketStart) {
         if (state.current) {
           state.closed.push(state.current);
