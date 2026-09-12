@@ -13,55 +13,57 @@ interface Candle {
   close: number;
 }
 
-interface SymbolState {
-  symbol: string;
+interface StreamFeedState {
+  streamKey: string;
+  ticker: string; // "btc", "eth", ... — общий тикер для всех провайдеров
+  candleMs: number; // размер свечи ATR, ПОДОБРАН ПОД ТАЙМФРЕЙМ ЭТОГО ПОТОКА (см. ниже)
   lastPrice: number | null;
   lastPriceAt: number | null;
+  lastPriceSource: string | null;
   current: Candle | null;
   closed: Candle[]; // последние N ЗАКРЫТЫХ свечей, самая новая — в конце
 }
 
 export interface FeedSnapshot {
   price: number | null;
-  /** Момент, когда пришёл последний тик (для определения "фид протух"). */
   priceAt: number | null;
   atr: number | null;
   candleCount: number;
+  source: string | null;
 }
 
 interface NormalizedTrade {
-  symbol: string; // lowercase, напр. "btcusdt"
+  ticker: string; // "btc", "eth", ... (канонический, БЕЗ суффикса типа usdt/usd)
   price: number;
   ts: number; // мс
 }
 
-/**
- * Адаптер конкретной биржи: как собрать URL/подписку и как разобрать сырое
- * сообщение в нормализованный трейд. Единственный источник правды по
- * названиям бирж — FEED_PROVIDERS в .env (см. ниже).
- */
 interface ProviderAdapter {
   name: string;
-  buildUrl(symbols: string[]): string;
-  /** Что отправить сразу после открытия соединения (напр. Bybit требует явный subscribe). */
-  onOpenMessage?(symbols: string[]): string | null;
+  buildUrl(tickers: string[]): string;
+  /** Что отправить сразу после открытия соединения (напр. Bybit/RTDS требуют явный subscribe). */
+  onOpenMessage?(tickers: string[]): string | null;
   parseMessage(raw: any): NormalizedTrade | null;
+  /** Прикладной heartbeat (RTDS требует текстовый "PING" каждые 5с, помимо протокольного ws ping/pong). */
+  heartbeatIntervalMs?: number;
+  heartbeatMessage?: string;
 }
 
 const BINANCE_ADAPTER: ProviderAdapter = {
   name: 'binance',
-  buildUrl(symbols) {
-    const streams = symbols.map((s) => `${s}@trade`).join('/');
+  buildUrl(tickers) {
+    const streams = tickers.map((t) => `${t}usdt@trade`).join('/');
     return `wss://stream.binance.com:9443/stream?streams=${streams}`;
   },
   parseMessage(raw) {
     const data = raw?.data;
     if (!data || data.e !== 'trade') return null;
-    const symbol = String(data.s ?? '').toLowerCase();
+    const wireSymbol = String(data.s ?? '').toLowerCase(); // "btcusdt"
+    const ticker = wireSymbol.endsWith('usdt') ? wireSymbol.slice(0, -4) : wireSymbol;
     const price = parseFloat(data.p);
     const ts = Number(data.T) || Date.now();
-    if (!symbol || !Number.isFinite(price)) return null;
-    return { symbol, price, ts };
+    if (!ticker || !Number.isFinite(price)) return null;
+    return { ticker, price, ts };
   },
 };
 
@@ -70,53 +72,92 @@ const BYBIT_ADAPTER: ProviderAdapter = {
   buildUrl() {
     return 'wss://stream.bybit.com/v5/public/spot';
   },
-  onOpenMessage(symbols) {
-    return JSON.stringify({ op: 'subscribe', args: symbols.map((s) => `publicTrade.${s.toUpperCase()}`) });
+  onOpenMessage(tickers) {
+    return JSON.stringify({ op: 'subscribe', args: tickers.map((t) => `publicTrade.${t.toUpperCase()}USDT`) });
   },
   parseMessage(raw) {
     if (typeof raw?.topic !== 'string' || !raw.topic.startsWith('publicTrade.')) return null;
     const trade = raw?.data?.[0];
     if (!trade) return null;
-    const symbol = String(trade.s ?? '').toLowerCase();
+    const wireSymbol = String(trade.s ?? '').toLowerCase(); // "btcusdt"
+    const ticker = wireSymbol.endsWith('usdt') ? wireSymbol.slice(0, -4) : wireSymbol;
     const price = parseFloat(trade.p);
     const ts = Number(trade.T) || Date.now();
-    if (!symbol || !Number.isFinite(price)) return null;
-    return { symbol, price, ts };
+    if (!ticker || !Number.isFinite(price)) return null;
+    return { ticker, price, ts };
+  },
+};
+
+/**
+ * ГЛАВНЫЙ провайдер по умолчанию. Это буквально тот же фид, которым
+ * Polymarket резолвит крипто-маркеты (data.chain.link, см. README) — не
+ * приближение, а сам источник истины. Официальный публичный Polymarket RTDS
+ * (wss://ws-live-data.polymarket.com, топик `crypto_prices_chainlink`), без
+ * API-ключа, задокументирован на docs.polymarket.com. Требует прикладной
+ * PING каждые 5с (см. heartbeatIntervalMs) — это НЕ протокольный ws-пинг, а
+ * отдельный текстовый фрейм, который ждёт именно этот сервис.
+ */
+const CHAINLINK_RTDS_ADAPTER: ProviderAdapter = {
+  name: 'chainlink',
+  buildUrl() {
+    return 'wss://ws-live-data.polymarket.com';
+  },
+  onOpenMessage(tickers) {
+    return JSON.stringify({
+      action: 'subscribe',
+      subscriptions: tickers.map((t) => ({
+        topic: 'crypto_prices_chainlink',
+        type: '*',
+        filters: JSON.stringify({ symbol: `${t}/usd` }),
+      })),
+    });
+  },
+  heartbeatIntervalMs: 5000,
+  heartbeatMessage: 'PING',
+  parseMessage(raw) {
+    if (raw?.topic !== 'crypto_prices_chainlink') return null;
+    const payload = raw?.payload;
+    if (!payload) return null;
+    const wireSymbol = String(payload.symbol ?? '').toLowerCase(); // "btc/usd"
+    const ticker = wireSymbol.split('/')[0];
+    const price = parseFloat(payload.value);
+    const ts = Number(payload.timestamp) || Date.now();
+    if (!ticker || !Number.isFinite(price)) return null;
+    return { ticker, price, ts };
   },
 };
 
 const PROVIDERS: Record<string, ProviderAdapter> = {
+  chainlink: CHAINLINK_RTDS_ADAPTER,
   binance: BINANCE_ADAPTER,
   bybit: BYBIT_ADAPTER,
 };
 
 /**
- * Быстрый WS-фид цены базового актива (proxy-источник для нашей собственной
- * диагностики/ATR-гейта, НЕ тот же источник, что резолвит маркет на
- * Polymarket — резолвер использует Chainlink). Задача этого фида — не
- * повторить точный резолв, а дать дельту "цена сейчас vs цена на старте
- * окна" и локальную волатильность в реальном времени.
+ * Быстрый WS-фид цены базового актива для диагностики/ATR-гейта входа.
  *
- * ВАЖНО (реальный инцидент): Binance по WS периодически отвечает `451
- * Unavailable For Legal Reasons` на handshake — это гео-блокировка по IP
- * хостинга (типично для облачных провайдеров в юрисдикциях, которые Binance
- * не обслуживает), а НЕ временный сбой сети. Бесконечный ретрай на тот же
- * URL в этом случае никогда не восстановится сам — раньше именно так и
- * происходило (лог "ошибка WS: Unexpected server response: 451" каждые
- * ~30с без остановки), и весь фид был мёртв на протяжении ВСЕЙ сессии, а
- * не эпизодически. Из-за этого referencePrice/priceAtEntry были недоступны
- * ВСЕГДА — не потому, что ATR-гейт кого-то не защитил (он по умолчанию и
- * так выключен, см. ENTRY_FILTER_ENABLED), а потому что фид физически не
- * может подключиться с текущего хостинга.
+ * ИСТОЧНИК (важное изменение после разбора реальных сливов): по умолчанию
+ * теперь Chainlink через официальный Polymarket RTDS — это буквально то же,
+ * чем Polymarket резолвит крипто Up/Down маркеты (data.chain.link). Раньше
+ * дефолтом был Binance/Bybit — приближение, которое в моменты резких
+ * движений расходится с Chainlink на 0.3-0.8% на 10-30 секунд (в бинарном
+ * маркете у самой границы ¢99 этого достаточно, чтобы диагностика "цена
+ * уверенно ушла в одну сторону" оказалась просто неверной — ровно то, что
+ * происходило на разобранных инцидентах BTC/SOL). Binance/Bybit остаются
+ * доступны как фолбэк-провайдеры (`FEED_PROVIDERS`), но их значения всегда
+ * помечаются `source` в FeedSnapshot — не выдаём приближение за истину молча.
  *
- * Исправлено двумя независимыми механизмами (можно использовать оба сразу):
- *  1) Автоматический фолбэк на другого провайдера (`FEED_PROVIDERS`,
- *     по умолчанию `binance,bybit`) — после `FEED_PROVIDER_FAIL_THRESHOLD`
- *     подряд неудачных попыток подключения к текущему провайдеру бот сам
- *     переключается на следующего в списке (по кругу). Bybit в общем случае
- *     не блокирует те же юрисдикции, что и Binance, и не требует прокси.
- *  2) Опциональный прокси (`FEED_PROXY_URL`, http(s):// или socks5://) —
- *     если геоблок актуален для ВСЕХ настроенных провайдеров сразу.
+ * ОКНО ATR ТЕПЕРЬ МАСШТАБИРУЕТСЯ ПОД ТАЙМФРЕЙМ ПОТОКА. Раньше был единственный
+ * глобальный размер свечи (по умолчанию 1 секунда) и 20 таких свечей на ATR —
+ * то есть ATR буквально измерял волатильность последних 20 СЕКУНД, вне
+ * зависимости от того, идёт ли речь о 5-минутном или часовом маркете. Для
+ * часового/15-минутного окна это давало обманчиво ВЫСОКИЙ atrRatioAtEntry
+ * (типичное движение за 20 секунд — это шум на порядки меньше типичного
+ * дрейфа цены за 15-60 минут), из-за чего гейт выглядел бы "уверенным" даже
+ * на почти равновероятных входах у самой границы. Теперь размер свечи
+ * ATR для каждого потока считается как `intervalSec*1000 / FEED_ATR_CANDLES`
+ * — то есть ATR отражает типичный размах цены за период, СОПОСТАВИМЫЙ с
+ * длительностью самого окна, а не с несколькими секундами.
  */
 @Injectable()
 export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
@@ -126,31 +167,33 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
   private stopped = false;
   private reconnectAttempts = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private heartbeatTimer: NodeJS.Timeout | null = null;
 
-  private readonly candleMs: number;
   private readonly atrCandles: number;
+  private readonly staleMs: number;
 
   private readonly providers: ProviderAdapter[];
   private readonly failThreshold: number;
   private readonly proxyUrl: string | null;
   private providerIndex = 0;
-  // Подряд идущие неудачные попытки подключения ИМЕННО к текущему провайдеру
-  // (сбрасывается при успешном 'open' или при переключении на следующего).
   private consecutiveFailuresOnProvider = 0;
 
-  // assetPrefix ("btc-updown-5m") -> binance-style символ ("btcusdt")
-  private readonly assetToSymbol = new Map<string, string>();
-  // symbol -> состояние (несколько assetPrefix теоретически могут шарить один символ)
-  private readonly states = new Map<string, SymbolState>();
+  // assetPrefix/streamKey ("btc-updown-5m") -> тикер ("btc")
+  private readonly streamToTicker = new Map<string, string>();
+  // тикер -> какие streamKey на него подписаны (для фан-аута трейдов на
+  // несколько потоков с РАЗНЫМ размером свечи ATR, но общим источником трейдов)
+  private readonly tickerToStreams = new Map<string, string[]>();
+  // streamKey -> собственное состояние свечей/ATR (см. комментарий класса выше)
+  private readonly states = new Map<string, StreamFeedState>();
 
   constructor(private readonly config: ConfigService) {
-    this.candleMs = parseInt(this.config.get<string>('FEED_CANDLE_MS', '1000'), 10);
     this.atrCandles = parseInt(this.config.get<string>('FEED_ATR_CANDLES', '20'), 10);
+    this.staleMs = parseInt(this.config.get<string>('FEED_STALE_MS', '5000'), 10);
     this.failThreshold = parseInt(this.config.get<string>('FEED_PROVIDER_FAIL_THRESHOLD', '3'), 10);
     this.proxyUrl = this.config.get<string>('FEED_PROXY_URL', '').trim() || null;
 
     const providerNames = this.config
-      .get<string>('FEED_PROVIDERS', 'binance,bybit')
+      .get<string>('FEED_PROVIDERS', 'chainlink,binance,bybit')
       .split(',')
       .map((s) => s.trim().toLowerCase())
       .filter(Boolean);
@@ -167,23 +210,28 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
       throw new Error('FEED_PROVIDERS: список провайдеров не должен быть пустым.');
     }
 
-    // Раньше список активов брался из MARKET_ASSETS (общий на все потоки).
-    // Теперь единственный источник правды — STREAMS_CONFIG (см. п.3/п.4
-    // бэклога, src/trading/stream-config.ts) — каждый streamKey из него сам
-    // по себе ключ фида (для потоков без стандартного вывода символа из
-    // префикса, напр. "bitcoin-up-or-down", см. FEED_SYMBOL_OVERRIDES ниже).
-    const streamKeys = parseStreamsConfig(this.config.get<string>('STREAMS_CONFIG')).map(
-      (s) => s.streamKey,
-    );
-
+    const streams = parseStreamsConfig(this.config.get<string>('STREAMS_CONFIG'));
     const overrides = this.parseOverrides(this.config.get<string>('FEED_SYMBOL_OVERRIDES', ''));
+    const minCandleMs = parseInt(this.config.get<string>('FEED_MIN_CANDLE_MS', '1000'), 10);
 
-    for (const assetPrefix of streamKeys) {
-      const symbol = overrides.get(assetPrefix) ?? this.deriveSymbol(assetPrefix);
-      this.assetToSymbol.set(assetPrefix, symbol);
-      if (!this.states.has(symbol)) {
-        this.states.set(symbol, { symbol, lastPrice: null, lastPriceAt: null, current: null, closed: [] });
-      }
+    for (const stream of streams) {
+      const ticker = overrides.get(stream.streamKey) ?? this.deriveTicker(stream.streamKey);
+      this.streamToTicker.set(stream.streamKey, ticker);
+      const list = this.tickerToStreams.get(ticker) ?? [];
+      list.push(stream.streamKey);
+      this.tickerToStreams.set(ticker, list);
+
+      const candleMs = Math.max(minCandleMs, Math.round((stream.intervalSec * 1000) / this.atrCandles));
+      this.states.set(stream.streamKey, {
+        streamKey: stream.streamKey,
+        ticker,
+        candleMs,
+        lastPrice: null,
+        lastPriceAt: null,
+        lastPriceSource: null,
+        current: null,
+        closed: [],
+      });
     }
   }
 
@@ -194,42 +242,48 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
   onModuleDestroy(): void {
     this.stopped = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.ws?.close();
   }
 
-  /** Текущая цена + ATR по фиду для данного actice-префикса (btc-updown-5m и т.п.). */
-  getSnapshot(assetPrefix: string): FeedSnapshot {
-    const symbol = this.assetToSymbol.get(assetPrefix);
-    const state = symbol ? this.states.get(symbol) : undefined;
-    if (!state) return { price: null, priceAt: null, atr: null, candleCount: 0 };
+  /** Текущая цена + ATR по фиду для данного streamKey (btc-updown-5m и т.п.). */
+  getSnapshot(streamKey: string): FeedSnapshot {
+    const state = this.states.get(streamKey);
+    if (!state) return { price: null, priceAt: null, atr: null, candleCount: 0, source: null };
+
+    // Протухший тик (см. дев-разбор "инцидент Chainlink vs Binance": стейл
+    // фид у самого резолва — красный флаг, не данные) считаем недоступным —
+    // тем самым при включённом ENTRY_FILTER_ENABLED это уйдёт в fail-closed
+    // ровно так же, как полное отсутствие тиков.
+    const isStale = state.lastPriceAt != null && Date.now() - state.lastPriceAt > this.staleMs;
 
     return {
-      price: state.lastPrice,
-      priceAt: state.lastPriceAt,
+      price: isStale ? null : state.lastPrice,
+      priceAt: isStale ? null : state.lastPriceAt,
       atr: this.computeAtr(state),
       candleCount: state.closed.length,
+      source: isStale ? null : state.lastPriceSource,
     };
   }
 
-  private computeAtr(state: SymbolState): number | null {
+  private computeAtr(state: StreamFeedState): number | null {
     if (state.closed.length < this.atrCandles) return null;
     const sample = state.closed.slice(-this.atrCandles);
     const sum = sample.reduce((acc, c) => acc + Math.abs(c.high - c.low), 0);
     return sum / sample.length;
   }
 
-  private deriveSymbol(assetPrefix: string): string {
-    // "btc-updown-5m" -> "btc" -> "btcusdt". Для нестандартных активов лучше
-    // задать явный маппинг через FEED_SYMBOL_OVERRIDES.
-    const base = assetPrefix.split('-')[0]?.toLowerCase() ?? assetPrefix.toLowerCase();
-    return `${base}usdt`;
+  private deriveTicker(streamKey: string): string {
+    // "btc-updown-5m" -> "btc". Для нестандартных активов (напр. часовой
+    // "bitcoin-up-or-down") задай явный маппинг через FEED_SYMBOL_OVERRIDES.
+    return streamKey.split('-')[0]?.toLowerCase() ?? streamKey.toLowerCase();
   }
 
   private parseOverrides(raw: string): Map<string, string> {
     const map = new Map<string, string>();
     for (const pair of raw.split(',')) {
-      const [assetPrefix, symbol] = pair.split(':').map((s) => s.trim());
-      if (assetPrefix && symbol) map.set(assetPrefix, symbol.toLowerCase());
+      const [streamKey, ticker] = pair.split(':').map((s) => s.trim());
+      if (streamKey && ticker) map.set(streamKey, ticker.toLowerCase());
     }
     return map;
   }
@@ -249,31 +303,39 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
 
   private connect(): void {
     if (this.stopped) return;
-    const symbols = [...this.states.keys()];
-    if (symbols.length === 0) {
+    const tickers = [...this.tickerToStreams.keys()];
+    if (tickers.length === 0) {
       this.logger.warn('PriceFeedService: нет активов для подключения — фид не запущен.');
       return;
     }
 
     const provider = this.providers[this.providerIndex];
-    const url = provider.buildUrl(symbols);
+    const url = provider.buildUrl(tickers);
     const wsOptions = this.buildAgent();
     this.ws = new WebSocket(url, wsOptions as any);
 
     this.ws.on('open', () => {
       this.reconnectAttempts = 0;
       this.consecutiveFailuresOnProvider = 0;
-      const openMsg = provider.onOpenMessage?.(symbols);
+      const openMsg = provider.onOpenMessage?.(tickers);
       if (openMsg) this.ws?.send(openMsg);
+
+      if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+      if (provider.heartbeatIntervalMs && provider.heartbeatMessage) {
+        this.heartbeatTimer = setInterval(() => {
+          if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(provider.heartbeatMessage!);
+        }, provider.heartbeatIntervalMs);
+      }
+
       this.logger.log(
-        `PriceFeedService: подключен к ${provider.name} (${symbols.join(', ')})${this.proxyUrl ? ' через прокси' : ''}.`,
+        `PriceFeedService: подключен к ${provider.name} (${tickers.join(', ')})${this.proxyUrl ? ' через прокси' : ''}.`,
       );
     });
 
     this.ws.on('message', (raw: WebSocket.RawData) => {
       try {
         const trade = provider.parseMessage(JSON.parse(raw.toString()));
-        if (trade) this.applyTrade(trade);
+        if (trade) this.applyTrade(provider.name, trade);
       } catch (err) {
         this.logger.debug(`PriceFeedService: не удалось разобрать сообщение (${provider.name}): ${this.errMsg(err)}`);
       }
@@ -285,22 +347,19 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  /**
-   * Единая точка решения "переподключаться к тому же провайдеру или
-   * переключиться на следующего" — так же считает подряд идущие сбои и в
-   * `error`-ветке (сокет там тоже закрывается почти сразу после ошибки, что
-   * триггерит и 'close', так что двойного счёта не происходит — инкремент
-   * только здесь, в close).
-   */
   private handleDisconnect(provider: ProviderAdapter): void {
     if (this.stopped) return;
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
     this.consecutiveFailuresOnProvider += 1;
 
     if (this.consecutiveFailuresOnProvider >= this.failThreshold && this.providers.length > 1) {
       const next = (this.providerIndex + 1) % this.providers.length;
       this.logger.warn(
         `PriceFeedService: ${provider.name} не отвечает уже ${this.consecutiveFailuresOnProvider} подключений подряд ` +
-          `(похоже на гео-блокировку по IP хостинга, не на временный сбой сети) — ` +
+          `(похоже на гео-блокировку по IP хостинга или сбой сервиса, не на временный сбой сети) — ` +
           `переключаюсь на ${this.providers[next].name}.`,
       );
       this.providerIndex = next;
@@ -311,26 +370,32 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
     this.scheduleReconnect();
   }
 
-  private applyTrade(trade: NormalizedTrade): void {
-    const state = this.states.get(trade.symbol);
-    if (!state) return;
+  private applyTrade(source: string, trade: NormalizedTrade): void {
+    const streamKeys = this.tickerToStreams.get(trade.ticker);
+    if (!streamKeys) return;
 
-    state.lastPrice = trade.price;
-    state.lastPriceAt = trade.ts;
+    for (const streamKey of streamKeys) {
+      const state = this.states.get(streamKey);
+      if (!state) continue;
 
-    const bucketStart = Math.floor(trade.ts / this.candleMs) * this.candleMs;
-    if (!state.current || state.current.start !== bucketStart) {
-      if (state.current) {
-        state.closed.push(state.current);
-        if (state.closed.length > this.atrCandles * 2) {
-          state.closed.splice(0, state.closed.length - this.atrCandles * 2);
+      state.lastPrice = trade.price;
+      state.lastPriceAt = trade.ts;
+      state.lastPriceSource = source;
+
+      const bucketStart = Math.floor(trade.ts / state.candleMs) * state.candleMs;
+      if (!state.current || state.current.start !== bucketStart) {
+        if (state.current) {
+          state.closed.push(state.current);
+          if (state.closed.length > this.atrCandles * 2) {
+            state.closed.splice(0, state.closed.length - this.atrCandles * 2);
+          }
         }
+        state.current = { start: bucketStart, open: trade.price, high: trade.price, low: trade.price, close: trade.price };
+      } else {
+        state.current.close = trade.price;
+        state.current.high = Math.max(state.current.high, trade.price);
+        state.current.low = Math.min(state.current.low, trade.price);
       }
-      state.current = { start: bucketStart, open: trade.price, high: trade.price, low: trade.price, close: trade.price };
-    } else {
-      state.current.close = trade.price;
-      state.current.high = Math.max(state.current.high, trade.price);
-      state.current.low = Math.min(state.current.low, trade.price);
     }
   }
 

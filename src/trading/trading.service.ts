@@ -20,6 +20,10 @@ interface RestingOrder {
   price: number;
   // null в смоуке (ничего реального не выставляли)
   orderId: string | null;
+  // Момент, когда резюм-лимитка была выставлена (для orderSentAt в логе —
+  // фактическое исполнение может случиться намного позже, вплоть до
+  // истечения окна, см. BACKLOG "нужно время отправки ордера и его осуществления").
+  placedAt: Date;
 }
 
 interface EntryDiagnostics {
@@ -27,6 +31,10 @@ interface EntryDiagnostics {
   priceAtEntry: number | null;
   atrAtEntry: number | null;
   atrRatioAtEntry: number | null;
+  // Источник цены ('chainlink' | 'binance' | 'bybit' | null) — Chainlink это
+  // буквально то, чем Polymarket резолвит крипто-маркеты; binance/bybit —
+  // лишь приближение (см. PriceFeedService и README).
+  priceSource: string | null;
 }
 
 interface MarketState {
@@ -386,6 +394,8 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
           limitTier: resting.tier,
           status: 'pending_resolve',
           logMessage: `SMOKE: лимитка не отправлялась на биржу — эмуляция; накопленный объём продавцов по ¢${(resting.price * 100).toFixed(2)} и ниже составил $${availableUsd.toFixed(2)}, взяли ${filledShares.toFixed(2)} шт.`,
+          orderSentAt: resting.placedAt,
+          orderFilledAt: new Date(),
           ...diagnostics,
         });
         this.logger.log(
@@ -471,11 +481,12 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
   }
 
   // ---------------------------------------------------------------------
-  // ATR-гейт: считает диагностику по внешнему фиду и (если включено через
-  // .env) решает, достаточно ли убедительно цена отошла от точки старта окна
-  // относительно недавней волатильности. Fail-open: если фида/референса/ATR
-  // нет — гейт не блокирует (лучше торговать без фильтра, чем не торговать
-  // из-за временной недоступности WS Binance).
+  // ATR-гейт: считает диагностику по внешнему фиду (по умолчанию Chainlink —
+  // тот же фид, которым Polymarket резолвит крипто-маркеты, см. README) и
+  // (если включено через .env) решает, достаточно ли убедительно цена
+  // отошла от точки старта окна относительно недавней волатильности этого
+  // же таймфрейма (ATR теперь считается в масштабе окна потока, не в
+  // фиксированных 20 секундах — см. PriceFeedService).
   // ---------------------------------------------------------------------
   private captureDiagnostics(marketState: MarketState): EntryDiagnostics {
     const snap = this.priceFeed.getSnapshot(marketState.assetPrefix);
@@ -486,7 +497,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     if (referencePrice != null && priceAtEntry != null && atrAtEntry != null && atrAtEntry > 0) {
       atrRatioAtEntry = Math.abs(priceAtEntry - referencePrice) / atrAtEntry;
     }
-    return { referencePrice, priceAtEntry, atrAtEntry, atrRatioAtEntry };
+    return { referencePrice, priceAtEntry, atrAtEntry, atrRatioAtEntry, priceSource: snap.source };
   }
 
   private evaluateEntryGate(marketState: MarketState): { allow: boolean; diagnostics: EntryDiagnostics; reason: string | null } {
@@ -557,6 +568,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
 
     try {
       if (this.isSmoke) {
+        const orderSentAt = new Date();
         marketState.positioned = true;
         await this.cancelRestingIfAny(marketState);
         const savedId = await this.writeLog(marketState, {
@@ -572,6 +584,8 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
             fill.filledRatio < 0.999
               ? `SMOKE: частичное исполнение — забрали $${fill.filledUsd.toFixed(2)} из $${marketState.betAmount.toFixed(2)} (${(fill.filledRatio * 100).toFixed(0)}%) по VWAP ¢${(fill.vwapPrice! * 100).toFixed(2)}.`
               : `SMOKE: маркет-ордер не отправлялся, только эмуляция прохода по стакану (VWAP ¢${(fill.vwapPrice! * 100).toFixed(2)}).`,
+          orderSentAt,
+          orderFilledAt: new Date(),
           ...gate.diagnostics,
         });
         marketState.marketLogId = savedId;
@@ -582,6 +596,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
+      const orderSentAt = new Date();
       const result = await this.trader.placeMarketBuy({
         tokenId,
         amountUsd: marketState.betAmount,
@@ -589,6 +604,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
         tickSize: book.tickSize,
         negRisk: marketState.negRisk,
       });
+      const orderFilledAt = new Date();
 
       if (!result.success) {
         this.logger.warn(`[${marketState.assetPrefix}][LIVE][Market] ${marketState.slug}: ордер не исполнился (success=false), пробуем дальше`);
@@ -612,6 +628,8 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
         orderType: 'FAK',
         orderId: result.orderId,
         status: 'pending_resolve',
+        orderSentAt,
+        orderFilledAt,
         ...gate.diagnostics,
       });
       marketState.marketLogId = savedId;
@@ -655,7 +673,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       const size = Number((targetUsd / price).toFixed(2));
 
       if (this.isSmoke) {
-        marketState.restingOrder = { tier, outcome, price, orderId: null };
+        marketState.restingOrder = { tier, outcome, price, orderId: null, placedAt: new Date() };
         this.logger.log(
           `[${marketState.assetPrefix}][SMOKE][Limit] ${marketState.slug}: тир ${tier} — ${outcome} по ¢${(price * 100).toFixed(2)} (эмуляция, ждём накопления объёма продавцов $${targetUsd.toFixed(2)})`,
         );
@@ -677,7 +695,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
-      marketState.restingOrder = { tier, outcome, price, orderId: result.orderId };
+      marketState.restingOrder = { tier, outcome, price, orderId: result.orderId, placedAt: new Date() };
       this.logger.log(
         `[${marketState.assetPrefix}][LIVE][Limit] ${marketState.slug}: тир ${tier} — ${outcome} по ¢${(price * 100).toFixed(2)} выставлен, orderId=${result.orderId}`,
       );
@@ -733,6 +751,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
             limitTier: resting.tier,
             status: 'unfilled',
             skipReason: 'Симулированная лимитка не была перекрыта достаточным объёмом продавцов до конца окна.',
+            orderSentAt: resting.placedAt,
           });
           return;
         }
@@ -752,6 +771,11 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
             orderId: resting.orderId,
             status: 'pending_resolve',
             logMessage: `Исполнено ${status.sizeMatched}/${status.originalSize} шт.`,
+            orderSentAt: resting.placedAt,
+            // Момент фактического исполнения GTD-лимитки биржа не отдаёт отдельным
+            // полем в этом ответе — используем момент проверки статуса как приближение
+            // (честно позже реального момента матча, но точнее, чем ничего).
+            orderFilledAt: new Date(),
           });
           if (savedId) {
             const closeSnap = this.priceFeed.getSnapshot(marketState.assetPrefix);
@@ -771,6 +795,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
             orderId: resting.orderId,
             status: 'unfilled',
             skipReason: 'Лимитка не исполнилась до истечения (GTD).',
+            orderSentAt: resting.placedAt,
           });
         }
         await this.cancelRestingIfAny(marketState);
@@ -807,6 +832,9 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       priceAtEntry?: number | null;
       atrAtEntry?: number | null;
       atrRatioAtEntry?: number | null;
+      priceSource?: string | null;
+      orderSentAt?: Date | null;
+      orderFilledAt?: Date | null;
     },
   ): Promise<string | null> {
     if (marketState.logWritten) return null;
@@ -843,6 +871,9 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
         priceAtEntry: fields.priceAtEntry ?? null,
         atrAtEntry: fields.atrAtEntry ?? null,
         atrRatioAtEntry: fields.atrRatioAtEntry ?? null,
+        priceSource: fields.priceSource ?? null,
+        orderSentAt: fields.orderSentAt ?? null,
+        orderFilledAt: fields.orderFilledAt ?? null,
       }),
     );
     return saved.id;
@@ -971,12 +1002,18 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
    * момент входа или закрытия не было — честно об этом пишет, а не гадает.
    */
   private buildFailReason(log: MarketLog): string {
-    const { referencePrice, priceAtEntry, atrAtEntry, atrRatioAtEntry, priceAtClose, atrAtClose } = log;
+    const { referencePrice, priceAtEntry, atrAtEntry, atrRatioAtEntry, priceAtClose, atrAtClose, priceSource } = log;
 
     if (referencePrice == null || priceAtEntry == null) {
       return 'Слив без диагностики фида (referencePrice/priceAtEntry недоступны на момент входа — ' +
-        'см. логи PriceFeedService, вероятно WS Binance был недоступен в этот момент).';
+        'см. логи PriceFeedService, вероятно ни один из настроенных провайдеров (FEED_PROVIDERS) не был доступен в этот момент).';
     }
+
+    const sourceNote = priceSource
+      ? priceSource === 'chainlink'
+        ? '(источник: chainlink — тот же фид, которым резолвится сам маркет)'
+        : `(источник: ${priceSource} — приближение, не тот фид, которым резолвится маркет)`
+      : '(источник неизвестен)';
 
     const deltaAtEntry = priceAtEntry - referencePrice;
     const entrySide = deltaAtEntry >= 0 ? 'YES (цена была выше референса)' : 'NO (цена была ниже референса)';
@@ -984,7 +1021,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       (log.chosenOutcome === 'YES' && deltaAtEntry >= 0) || (log.chosenOutcome === 'NO' && deltaAtEntry < 0);
 
     const parts: string[] = [
-      `На входе: цена ${priceAtEntry}, референс окна ${referencePrice} (дельта ${deltaAtEntry.toFixed(2)}, сторона ${entrySide})` +
+      `На входе: цена ${priceAtEntry}, референс окна ${referencePrice} (дельта ${deltaAtEntry.toFixed(2)}, сторона ${entrySide}) ${sourceNote}` +
         (atrRatioAtEntry != null ? `, ATR-рацио ${atrRatioAtEntry.toFixed(2)}x` : ', ATR недоступен'),
     ];
 

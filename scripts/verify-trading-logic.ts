@@ -47,7 +47,7 @@ const fakeGamma: any = {
 const fakeClobPublic = { getBestQuote: async () => null };
 
 const fakePriceFeed: any = {
-  getSnapshot: () => ({ price: null, priceAt: null, atr: null, candleCount: 0 }),
+  getSnapshot: () => ({ price: null, priceAt: null, atr: null, candleCount: 0, source: null }),
 };
 
 const fakeTrader = {

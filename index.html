@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bot Analytics Dashboard</title>
+
+    <!-- Подключаем Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <!-- Подключаем React и ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+
+    <!-- Подключаем Babel для компиляции JSX прямо в браузере -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="bg-gray-50">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useEffect, useState } = React;
+
+        // Массив всех доступных рынков. Добавляй сюда новые, если появятся.
+        const MARKETS = ['BTC', 'SOL', 'ETH'];
+
+        function AnalyticsDashboard() {
+            const [activeTab, setActiveTab] = useState(MARKETS[0]);
+            const [activeStream, setActiveStream] = useState('all');
+            const [data, setData] = useState(null);
+            const [losses, setLosses] = useState(null);
+            const [loading, setLoading] = useState(true);
+            const [error, setError] = useState(null);
+
+            // Перезапрашиваем данные при каждом изменении activeTab (у каждого рынка свой бэкенд/деплой).
+            // Таб по потоку (5m/15m/1h) сбрасываем на "Все" — у разных бэкендов разный набор
+            // streamKey (напр. у SOL-бэкенда будут sol-updown-5m и т.п., не btc-*).
+            useEffect(() => {
+                setLoading(true);
+                setError(null);
+                setData(null);
+                setLosses(null);
+                setActiveStream('all');
+
+                // Динамически формируем URL на основе выбранного таба
+                const baseUrl = `https://polymarket-smoke-${activeTab.toLowerCase()}.up.railway.app`;
+                // const baseUrl = 'http://localhost:3000';
+
+                Promise.all([
+                    fetch(`${baseUrl}/analytics/summary`).then((res) => {
+                        if (!res.ok) throw new Error(`Ошибка сети (${activeTab}, summary). Проверьте CORS или доступность бекенда.`);
+                        return res.json();
+                    }),
+                    fetch(`${baseUrl}/analytics/losses?limit=50`).then((res) => {
+                        if (!res.ok) throw new Error(`Ошибка сети (${activeTab}, losses). Проверьте CORS или доступность бекенда.`);
+                        return res.json();
+                    }),
+                ])
+                    .then(([summaryJson, lossesJson]) => {
+                        setData(summaryJson);
+                        setLosses(lossesJson);
+                        setLoading(false);
+                    })
+                    .catch((err) => {
+                        setError(err.message);
+                        setLoading(false);
+                    });
+            }, [activeTab]);
+
+            const renderContent = () => {
+                if (loading) return <div className="py-12 text-center text-gray-500 font-sans">Загрузка аналитики {activeTab}...</div>;
+                if (error || !data) return <div className="py-12 text-center text-red-500 font-sans">Ошибка: {error}</div>;
+
+                const winRate = data.totals.wins + data.totals.losses > 0
+                    ? ((data.totals.wins / (data.totals.wins + data.totals.losses)) * 100).toFixed(1)
+                    : 0;
+
+                // Табы по потокам (5m/15m/1h) — набор streamKey берём из самих данных, а не
+                // хардкодим, потому что у разных бэкендов (разных активов) он разный.
+                const streamKeys = [...new Set((data.byAsset || []).map((a) => a.assetPrefix))].sort();
+                const inStream = (key) => activeStream === 'all' || key === activeStream;
+
+                const filteredByAsset = (data.byAsset || []).filter((a) => inStream(a.assetPrefix));
+                const filteredBestByStream = (data.bestByStream || []).filter((a) => inStream(a.streamKey));
+                const filteredAttempts = (data.attempts || []).filter((a) => inStream(a.streamKey));
+                const filteredLosses = (losses || []).filter((l) => inStream(l.assetPrefix));
+                const filteredStale = (data.staleUnresolved || []).filter((s) => inStream(s.assetPrefix));
+
+                // Сводка "сколько именно принёс/заработал/проиграл" конкретный поток —
+                // суммируем по всем строкам byAsset этого потока (может быть отдельно
+                // smoke/live) в одну цифру для карточки.
+                const streamSummary = filteredByAsset.reduce(
+                    (acc, r) => ({ wins: acc.wins + r.wins, losses: acc.losses + r.losses, profit: acc.profit + r.profit }),
+                    { wins: 0, losses: 0, profit: 0 },
+                );
+
+                return (
+                    <div className="animate-fade-in transition-opacity">
+                        {filteredStale.length > 0 && (
+                            <div className="bg-amber-50 border border-amber-300 text-amber-800 rounded-xl p-4 mb-8">
+                                <div className="font-semibold mb-2">⚠ Есть маркеты, зависшие в pending_resolve дольше нормы</div>
+                                <ul className="text-sm space-y-1">
+                                    {filteredStale.map((s) => (
+                                        <li key={s.slug}>
+                                            {s.assetPrefix} / {s.slug} — висит {s.ageSec}с (с {new Date(s.createdAt).toLocaleString()})
+                                        </li>
+                                    ))}
+                                </ul>
+                            </div>
+                        )}
+
+                        {/* Табы по потокам внутри текущего бэкенда */}
+                        {streamKeys.length > 0 && (
+                            <div className="flex flex-wrap gap-1 bg-gray-200/50 p-1 rounded-lg mb-6 w-fit">
+                                <button
+                                    onClick={() => setActiveStream('all')}
+                                    className={`px-4 py-1.5 rounded-md font-medium text-sm transition-all duration-200 ${
+                                        activeStream === 'all' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'
+                                    }`}
+                                >
+                                    Все
+                                </button>
+                                {streamKeys.map((key) => (
+                                    <button
+                                        key={key}
+                                        onClick={() => setActiveStream(key)}
+                                        className={`px-4 py-1.5 rounded-md font-medium text-sm transition-all duration-200 ${
+                                            activeStream === key ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'
+                                        }`}
+                                    >
+                                        {key}
+                                    </button>
+                                ))}
+                            </div>
+                        )}
+
+                        {/* Топ метрики — бэнкролл общий на все потоки сразу (так и задумано,
+                            это один кошелёк), поэтому НЕ фильтруется по табу потока. */}
+                        <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+                            <MetricCard title="Bankroll (Smoke)" value={`$${data.currentBankroll.smoke}`} />
+                            <MetricCard title="Win Rate" value={`${winRate}%`} subtext={`${data.totals.wins}W / ${data.totals.losses}L`} />
+                            <MetricCard title="Markets Scanned" value={data.totals.marketsScanned} />
+                            <MetricCard title="Bets Placed" value={data.totals.betsPlaced} />
+                        </div>
+
+                        {/* Сколько именно принёс/заработал/проиграл ВЫБРАННЫЙ поток —
+                            видно только когда выбран конкретный таб потока, не "Все". */}
+                        {activeStream !== 'all' && (
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+                                <MetricCard title={`${activeStream} — Wins`} value={streamSummary.wins} />
+                                <MetricCard title={`${activeStream} — Losses`} value={streamSummary.losses} />
+                                <MetricCard
+                                    title={`${activeStream} — Profit`}
+                                    value={`${streamSummary.profit >= 0 ? '+' : ''}$${streamSummary.profit.toFixed(2)}`}
+                                />
+                            </div>
+                        )}
+
+                        {/* Лучшая попытка по каждому независимому потоку (актив × таймфрейм) —
+                            раньше был один общий счётчик шагов на все активы сразу, теперь у
+                            каждого потока своя прогрессия/прогресс, см. BACKLOG п.3. */}
+                        {filteredBestByStream.length > 0 && (
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+                                {filteredBestByStream.map((a) => (
+                                    <div key={a.streamKey} className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+                                        <h2 className="text-sm font-semibold mb-1 text-gray-500 uppercase tracking-wide">{a.streamKey}</h2>
+                                        <div className="flex items-center justify-between mb-2">
+                                            <span className="text-sm font-medium text-gray-600">
+                                                Step {a.reachedStep} of {a.targetSteps}
+                                            </span>
+                                            <span className={`px-3 py-1 rounded-full text-xs font-semibold uppercase ${a.status === 'active' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                                                {a.status}
+                                            </span>
+                                        </div>
+                                        <ProgressBar reached={a.reachedStep} target={a.targetSteps} />
+                                        <p className="text-xs text-gray-500 mt-2">Attempt #{a.attemptNumber} — current stake ${Number(a.currentStake).toFixed(2)}</p>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+
+                        {/* История попыток */}
+                        <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden mb-8">
+                            <div className="p-6 border-b border-gray-100">
+                                <h2 className="text-xl font-semibold text-gray-800">Attempts History{activeStream !== 'all' ? ` — ${activeStream}` : ''}</h2>
+                            </div>
+                            <div className="overflow-x-auto">
+                                <table className="w-full text-left border-collapse">
+                                    <thead>
+                                        <tr className="bg-gray-50 text-gray-600 text-sm">
+                                            <th className="p-4 font-medium">Stream</th>
+                                            <th className="p-4 font-medium">Attempt</th>
+                                            <th className="p-4 font-medium">Status</th>
+                                            <th className="p-4 font-medium">Progress</th>
+                                            <th className="p-4 font-medium">Stake</th>
+                                            <th className="p-4 font-medium">Started</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-gray-100">
+                                        {filteredAttempts.map((attempt) => (
+                                            <tr key={`${attempt.isSmoke}-${attempt.streamKey}-${attempt.attemptNumber}`} className="hover:bg-gray-50 transition-colors">
+                                                <td className="p-4 text-xs text-gray-500">{attempt.streamKey}</td>
+                                                <td className="p-4 font-medium">#{attempt.attemptNumber}</td>
+                                                <td className="p-4">
+                                                    <span className={`px-2 py-1 rounded-md text-xs font-semibold uppercase ${attempt.status === 'active' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                                                        {attempt.status}
+                                                    </span>
+                                                </td>
+                                                <td className="p-4 w-1/3">
+                                                    <div className="flex items-center gap-3">
+                                                        <span className="text-xs text-gray-500 w-12">{attempt.reachedStep}/{attempt.targetSteps}</span>
+                                                        <ProgressBar reached={attempt.reachedStep} target={attempt.targetSteps} />
+                                                    </div>
+                                                </td>
+                                                <td className="p-4 text-sm text-gray-500">${Number(attempt.currentStake).toFixed(2)}</td>
+                                                <td className="p-4 text-sm text-gray-500">
+                                                    {new Date(attempt.createdAt).toLocaleString()}
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+
+                        {/* Разбор сливов: причина + дата + диагностика по фиду/ATR */}
+                        <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+                            <div className="p-6 border-b border-gray-100">
+                                <h2 className="text-xl font-semibold text-gray-800">Recent Losses — Diagnostics{activeStream !== 'all' ? ` (${activeStream})` : ''}</h2>
+                            </div>
+                            <div className="overflow-x-auto">
+                                <table className="w-full text-left border-collapse">
+                                    <thead>
+                                        <tr className="bg-gray-50 text-gray-600 text-sm">
+                                            <th className="p-4 font-medium">Date</th>
+                                            <th className="p-4 font-medium">Market</th>
+                                            <th className="p-4 font-medium">Side</th>
+                                            <th className="p-4 font-medium">Profit</th>
+                                            <th className="p-4 font-medium">ATR ratio (entry)</th>
+                                            <th className="p-4 font-medium">Reason</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-gray-100">
+                                        {filteredLosses.length === 0 && (
+                                            <tr><td className="p-4 text-sm text-gray-400" colSpan="6">Сливов пока нет.</td></tr>
+                                        )}
+                                        {filteredLosses.map((log) => (
+                                            <tr key={log.slug} className="hover:bg-gray-50 transition-colors align-top">
+                                                <td className="p-4 text-sm text-gray-500 whitespace-nowrap">
+                                                    {log.resolvedAt ? new Date(log.resolvedAt).toLocaleString() : '—'}
+                                                </td>
+                                                <td className="p-4 text-sm">
+                                                    <div className="font-medium">{log.assetPrefix}</div>
+                                                    <div className="text-gray-400">{log.slug}</div>
+                                                </td>
+                                                <td className="p-4 text-sm">{log.chosenOutcome ?? '—'}</td>
+                                                <td className="p-4 text-sm text-red-600 font-medium">
+                                                    {log.profit != null ? `$${log.profit.toFixed(2)}` : '—'}
+                                                </td>
+                                                <td className="p-4 text-sm">
+                                                    {log.atrRatioAtEntry != null ? `${log.atrRatioAtEntry.toFixed(2)}x` : '—'}
+                                                </td>
+                                                <td className="p-4 text-sm text-gray-600 max-w-md">{log.failReason ?? '—'}</td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                );
+            };
+
+            return (
+                <div className="max-w-6xl mx-auto p-6 font-sans text-gray-800">
+                    <div className="flex flex-col md:flex-row md:items-center justify-between mb-6 gap-4">
+                        <h1 className="text-3xl font-bold text-gray-900">Bot Analytics Dashboard</h1>
+
+                        {/* Навигация табов генерируется динамически из массива MARKETS */}
+                        <div className="flex flex-wrap gap-1 bg-gray-200/50 p-1 rounded-lg">
+                            {MARKETS.map((market) => (
+                                <button
+                                    key={market}
+                                    onClick={() => setActiveTab(market)}
+                                    className={`px-6 py-2 rounded-md font-medium text-sm transition-all duration-200 ${
+                                        activeTab === market
+                                            ? 'bg-white text-blue-600 shadow-sm'
+                                            : 'text-gray-500 hover:text-gray-700'
+                                    }`}
+                                >
+                                    {market}
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+
+                    {/* Отрисовка контента */}
+                    {renderContent()}
+                </div>
+            );
+        }
+
+        // Вспомогательные компоненты
+        function MetricCard({ title, value, subtext }) {
+            return (
+                <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-100 flex flex-col justify-center">
+                    <span className="text-sm text-gray-500 font-medium mb-1">{title}</span>
+                    <span className="text-2xl font-bold text-gray-900">{value}</span>
+                    {subtext && <span className="text-xs text-gray-400 mt-1">{subtext}</span>}
+                </div>
+            );
+        }
+
+        function ProgressBar({ reached, target }) {
+            const percentage = Math.min((reached / target) * 100, 100);
+            return (
+                <div className="w-full bg-gray-100 rounded-full h-2.5 overflow-hidden">
+                    <div
+                        className="bg-blue-600 h-2.5 rounded-full transition-all duration-500 ease-in-out"
+                        style={{ width: `${percentage}%` }}
+                    />
+                </div>
+            );
+        }
+
+        // Рендерим приложение
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<AnalyticsDashboard />);
+    </script>
+
+    <style>
+        .animate-fade-in {
+            animation: fadeIn 0.3s ease-in-out;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(5px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+    </style>
+</body>
+</html>
