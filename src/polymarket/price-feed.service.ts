@@ -104,7 +104,7 @@ const CHAINLINK_RTDS_ADAPTER: ProviderAdapter = {
     return 'wss://ws-live-data.polymarket.com';
   },
   onOpenMessage(tickers) {
-    return JSON.stringify({
+    const rawString = JSON.stringify({
       action: 'subscribe',
       subscriptions: tickers.map((t) => ({
         topic: 'crypto_prices_chainlink',
@@ -112,6 +112,7 @@ const CHAINLINK_RTDS_ADAPTER: ProviderAdapter = {
         filters: JSON.stringify({ symbol: `${t}/usd` }),
       })),
     });
+    return rawString;
   },
   heartbeatIntervalMs: 5000,
   heartbeatMessage: 'PING',
@@ -358,12 +359,24 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
 
     this.ws.on('message', (raw: WebSocket.RawData) => {
       try {
-        const trade = provider.parseMessage(JSON.parse(raw.toString()));
-        if (trade) this.applyTrade(provider.name, trade);
+        const message = raw.toString();
+
+        if (!message.trim()) {
+          return;
+        }
+
+        const trade = provider.parseMessage(JSON.parse(message));
+
+        if (trade) {
+          this.applyTrade(provider.name, trade);
+        }
       } catch (err) {
-        this.logger.debug(`PriceFeedService: не удалось разобрать сообщение (${provider.name}): ${this.errMsg(err)}`);
+        this.logger.debug(
+          `PriceFeedService: не удалось разобрать сообщение (${provider.name}): ${this.errMsg(err)}`
+        );
       }
     });
+
 
     this.ws.on('close', () => this.handleDisconnect(provider));
     this.ws.on('error', (err) => {
@@ -383,8 +396,8 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
       const next = (this.providerIndex + 1) % this.providers.length;
       this.logger.warn(
         `PriceFeedService: ${provider.name} не отвечает уже ${this.consecutiveFailuresOnProvider} подключений подряд ` +
-          `(похоже на гео-блокировку по IP хостинга или сбой сервиса, не на временный сбой сети) — ` +
-          `переключаюсь на ${this.providers[next].name}.`,
+        `(похоже на гео-блокировку по IP хостинга или сбой сервиса, не на временный сбой сети) — ` +
+        `переключаюсь на ${this.providers[next].name}.`,
       );
       this.providerIndex = next;
       this.consecutiveFailuresOnProvider = 0;
