@@ -48,6 +48,9 @@ const fakeClobPublic = { getBestQuote: async () => null };
 
 const fakePriceFeed: any = {
   getSnapshot: () => ({ price: null, priceAt: null, atr: null, candleCount: 0, source: null }),
+  // Сессия 11: реалистичный дефолт для тестов, которые НЕ подставляют свой —
+  // "буфер не достаёт так далеко" (соответствует getSnapshot тоже давая null).
+  getPriceAt: () => ({ price: null, tickAt: null, lagMs: null }),
 };
 
 const fakeTrader = {
@@ -85,12 +88,16 @@ const fakeAttemptRepo = {
 };
 
 let fakeLogIdSeq = 0;
+const updates: any[] = [];
 const fakeMarketLogRepo: any = {
   create: (x: any) => x,
   save: async (x: any) => {
     const saved = { ...x, id: x.id ?? `log-${++fakeLogIdSeq}` };
     writes.push(saved);
     return saved;
+  },
+  update: async (id: any, patch: any) => {
+    updates.push({ id, ...patch });
   },
   find: async () => [] as any[],
   findOne: async () => null as any,
@@ -222,6 +229,51 @@ async function main() {
     svc.onBookUpdate(ms, 'YES', deep);
     await sleep(30);
     console.log('[Тест 4] Достаточный объём -> лимитка исполнена по СВОЕЙ цене 0.99:', writes.length === 1 && writes[0].entryPrice === 0.99 && ms.positioned);
+  }
+  writes.length = 0;
+
+  // --- Тест 4b (Сессия 10, микрокейс №1): гейт должен ПЕРЕПРОВЕРЯТЬСЯ на
+  //     момент фактического исполнения резюм-лимитки, а не только на момент
+  //     её выставления — иначе капитал рискуется по УЖЕ УСТАРЕВШЕМУ разрешению,
+  //     если цена успела откатиться обратно к референсу, пока лимитка ждала
+  //     накопления объёма продавцов (ровно прод-кейс: гейт пропустил вход при
+  //     ATR-рацио ~1.7x на выставлении, к моменту исполнения было уже 0.44x). ---
+  {
+    // ATR-рацио = |price - referencePrice| / atr. referencePrice берётся из
+    // marketState.referencePrice (задаётся при создании через makeMarketState).
+    let mockAtr = 0.01;
+    let mockPrice = 0.94; // |0.99(референс)-0.94| = 0.05 -> 0.05/0.01 = 5x ATR: уверенно, гейт пропускает
+    const dynamicFeed: any = {
+      getSnapshot: () => ({ price: mockPrice, priceAt: Date.now(), atr: mockAtr, candleCount: 20, source: 'chainlink' }),
+    };
+    const gatedConfig = {
+      overrides: { ...fakeConfig.overrides, LAST_ENTRY_WINDOW_SEC: '600', ENTRY_FILTER_ENABLED: 'true', MIN_DISTANCE_ATR_RATIO: '1.5' },
+      get(key: string, def?: string) {
+        return this.overrides[key] ?? def;
+      },
+    };
+    const gatedSvc: any = new TradingService(
+      gatedConfig as any, fakeGamma as any, fakeClobPublic as any, fakeTrader as any,
+      dynamicFeed, fakeAttemptRepo as any, fakeMarketLogRepo as any,
+    );
+
+    const ms = makeMarketState({ closesAt: new Date(Date.now() + 280_000), referencePrice: 0.99 });
+    const bNoAsk = { outcome: 'YES' as const, tickSize: '0.01', asks: [], bids: [], bestAsk: null, bestBid: 0.95 };
+    gatedSvc.onBookUpdate(ms, 'YES', bNoAsk);
+    await sleep(30);
+    console.log('[Тест 4b] Лимитка выставлена при уверенном ATR-рацио (гейт пройден):', ms.restingOrder != null);
+
+    // Пока лимитка "висела" в ожидании объёма продавцов, цена ОТКАТИЛАСЬ
+    // почти к референсу — рацио упало намного ниже порога 1.5x.
+    mockPrice = 0.988; // |0.99-0.988| = 0.002 -> 0.002/0.01 = 0.2x ATR: гейт больше НЕ пропускает
+
+    const deep = book([{ price: 0.98, size: 10 }], 0.95); // объём накопился достаточный
+    gatedSvc.onBookUpdate(ms, 'YES', deep);
+    await sleep(30);
+    console.log(
+      '[Тест 4b] Объём накопился, но цена откатилась (0.2x < 1.5x) — лимитка ОТМЕНЕНА, а НЕ исполнена вслепую:',
+      writes.length === 0 && !ms.positioned && ms.restingOrder === null && ms.skippedLimitTier === 'T1',
+    );
   }
   writes.length = 0;
 
@@ -565,6 +617,37 @@ async function main() {
     svcPreWin.provisionalChainByStream.set('btc-updown-5m', 1); // уже 1 подряд при maxChain=1
     const cappedPrediction = await svcPreWin.tryPreResolve('btc-updown-5m');
     console.log(`[Тест 13d] PRE_RESOLVE_MAX_CHAIN=1 останавливает цепочку предсказаний без подтверждения: ${cappedPrediction === null}`);
+  }
+
+  // --- Тест 14 (Сессия 12): priceAtClose тоже должен браться точечно, НА
+  //     МОМЕНТ closesAt, а не "текущей" ценой в момент, когда исполнился
+  //     код finalizeMarket (симметрично фиксу референса открытия, Сессия 11). ---
+  {
+    updates.length = 0;
+    const closeAtMs = Date.now(); // конкретный "истинный" момент закрытия
+    const spyFeed: any = {
+      getSnapshot: () => ({ price: 999, priceAt: Date.now(), atr: 0.02, candleCount: 20, source: 'chainlink' }),
+      getPriceAt: (streamKey: string, targetMs: number) => {
+        console.log(`[Тест 14] getPriceAt вызван с targetMs === closesAt.getTime(): ${targetMs === closeAtMs}`);
+        return { price: 101.5, tickAt: targetMs, lagMs: 0 };
+      },
+    };
+    const svcClose: any = new TradingService(
+      fakeConfig as any, fakeGamma as any, fakeClobPublic as any, fakeTrader as any,
+      spyFeed, fakeAttemptRepo as any, fakeMarketLogRepo as any,
+    );
+    const ms = makeMarketState({
+      closesAt: new Date(closeAtMs),
+      positioned: true,
+      marketLogId: 'log-close-test',
+    });
+    await svcClose.finalizeMarket(ms);
+    const upd = updates.find((u) => u.id === 'log-close-test');
+    console.log(
+      '[Тест 14] priceAtClose взят из getPriceAt (101.5), а НЕ из getSnapshot (999):',
+      upd?.priceAtClose === 101.5,
+    );
+    console.log('[Тест 14] atrAtClose по-прежнему берётся из getSnapshot (0.02, агрегат по свечам, лаг тут не при чём):', upd?.atrAtClose === 0.02);
   }
 
   console.log('\nВСЕ ПРОВЕРКИ ВЫПОЛНЕНЫ.');

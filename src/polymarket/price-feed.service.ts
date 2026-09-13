@@ -24,6 +24,15 @@ interface StreamFeedState {
   lastPriceSource: string | null;
   current: Candle | null;
   closed: Candle[]; // последние N ЗАКРЫТЫХ свечей, самая новая — в конце
+  // Буфер СЫРЫХ тиков за последние recentTicksRetentionMs (Сессия 11, см.
+  // CONTEXT.md) — нужен, чтобы искать цену НА ТОЧНЫЙ момент старта окна
+  // (referencePrice), а не "текущую" цену на момент, когда мы вообще успели
+  // спросить (который может быть на секунды-другие позже true-границы из-за
+  // сетевых round-trip'ов между обнаружением окна и фиксацией снимка — см.
+  // getPriceAt). Отдельно от `closed`/`current` (те — агрегаты-свечи для ATR,
+  // с разрешением в целую свечу, этого недостаточно для поиска "цена ровно
+  // в 13:00:00.000").
+  recentTicks: { ts: number; price: number }[];
 }
 
 export interface FeedSnapshot {
@@ -32,6 +41,16 @@ export interface FeedSnapshot {
   atr: number | null;
   candleCount: number;
   source: string | null;
+}
+
+/** Результат getPriceAt (Сессия 11) — см. класс-комментарий метода. */
+export interface PriceAtResult {
+  price: number | null;
+  tickAt: number | null;
+  // На сколько мс фактический тик отстоит от запрошенного targetMs (0 —
+  // тик пришёлся ровно на цель; положительное — ближайший тик БЫЛ раньше
+  // цели на столько мс, это нормально и ожидаемо; см. комментарий метода).
+  lagMs: number | null;
 }
 
 interface NormalizedTrade {
@@ -182,9 +201,26 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
   private reconnectAttempts = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
+  // "Зомби-соединение" (Сессия 9, см. CONTEXT.md): сокет технически остаётся
+  // OPEN, но сервер перестаёт слать данные — ни 'close', ни 'error' в этом
+  // случае НЕ срабатывают (это не обрыв TCP, а тихая остановка данных на
+  // уровне приложения), поэтому существующий реконнект/ротация провайдера
+  // (завязанные на handleDisconnect, который вызывается только из 'close')
+  // никогда не сработают сами по себе — соединение виснет часами, именно
+  // так, как в проде: ATR/диагностика "недоступны" на протяжении часов, а не
+  // секунд. Вотчдог не заменяет staleMs (тот про "не доверять гейту старую
+  // цену"), а обнаруживает сам факт "фид не шлёт ничего вообще" и форсирует
+  // разрыв соединения, чтобы штатный реконнект/ротация провайдера включились.
+  private dataWatchdogTimer: NodeJS.Timeout | null = null;
+  private lastAnyTradeAt = 0;
 
   private readonly atrCandles: number;
   private readonly staleMs: number;
+  private readonly dataWatchdogMs: number;
+  // Сколько храним буфер сырых тиков для getPriceAt (Сессия 11) — с запасом
+  // относительно discoveryPollMs + типичных сетевых round-trip'ов между
+  // обнаружением нового окна и фиксацией referencePrice (см. openMarket).
+  private readonly recentTicksRetentionMs: number;
 
   private readonly providers: ProviderAdapter[];
   private readonly failThreshold: number;
@@ -206,6 +242,12 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
   ) {
     this.atrCandles = parseInt(this.config.get<string>('FEED_ATR_CANDLES', '20'), 10);
     this.staleMs = parseInt(this.config.get<string>('FEED_STALE_MS', '5000'), 10);
+    // По умолчанию заметно больше staleMs (5с): staleMs — это "не доверяй
+    // цене, если ей больше 5с" (консервативно для входа), а watchdog — это
+    // "фид вообще ничего не шлёт уже 20с при активном тикере вроде BTC — это
+    // не тихий рынок, это мёртвое соединение" (см. комментарий у поля выше).
+    this.dataWatchdogMs = parseInt(this.config.get<string>('FEED_DATA_WATCHDOG_MS', '20000'), 10);
+    this.recentTicksRetentionMs = parseInt(this.config.get<string>('FEED_RECENT_TICKS_RETENTION_MS', '15000'), 10);
     this.failThreshold = parseInt(this.config.get<string>('FEED_PROVIDER_FAIL_THRESHOLD', '3'), 10);
     this.proxyUrl = this.config.get<string>('FEED_PROXY_URL', '').trim() || null;
 
@@ -259,6 +301,7 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
         lastPriceSource: null,
         current: null,
         closed: [],
+        recentTicks: [],
       });
     }
   }
@@ -306,6 +349,7 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
     this.stopped = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    if (this.dataWatchdogTimer) clearInterval(this.dataWatchdogTimer);
     this.ws?.close();
   }
 
@@ -327,6 +371,47 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
       candleCount: state.closed.length,
       source: isStale ? null : state.lastPriceSource,
     };
+  }
+
+  /**
+   * Цена НА ТОЧНЫЙ момент времени targetMs — точечный поиск по буферу сырых
+   * тиков (Сессия 11, см. CONTEXT.md), а НЕ "текущая" цена на момент вызова.
+   *
+   * Зачем это вообще нужно: `referencePrice` окна (страйк/таргет, от которого
+   * считается вся дельта/ATR-гейт) раньше брался через getSnapshot() ВНУТРИ
+   * openMarket — то есть УЖЕ ПОСЛЕ нескольких сетевых round-trip'ов
+   * (fetchMarketBySlug на Gamma, затем getBestQuote x2 на CLOB), которые
+   * выполняются каждый раз, когда обнаруживается новое окно. За эти секунды
+   * (иногда несколько секунд) цена вполне успевает заметно отойти от того,
+   * что было РОВНО в момент официального старта окна (тот самый "Price To
+   * Beat" на Polymarket) — то есть наш референс был систематически, а не
+   * случайно, смещён по времени относительно официального страйка. Это и
+   * есть корень найденного пользователем расхождения на живом кейсе (наш
+   * референс $102.13 против официального Price To Beat $102.03 на ТОМ ЖЕ
+   * окне SOL 5m).
+   *
+   * Ищет тик с временем <= targetMs, ближайший к нему (последний ДО или
+   * РОВНО в targetMs) — это корректно отражает "какая цена была известна на
+   * тот момент", а не "текущая цена сейчас". Если буфер не содержит тиков
+   * настолько старых (например фид только что переподключился) — возвращает
+   * null, а НЕ приближение текущей ценой: приближение здесь хуже честного
+   * "недоступно", потому что именно оно и было исходным багом.
+   */
+  getPriceAt(streamKey: string, targetMs: number): PriceAtResult {
+    const state = this.states.get(streamKey);
+    if (!state || state.recentTicks.length === 0) return { price: null, tickAt: null, lagMs: null };
+
+    // Буфер отсортирован по времени поступления (append-only) — ищем с конца
+    // первый тик, чьё время <= targetMs.
+    for (let i = state.recentTicks.length - 1; i >= 0; i--) {
+      const tick = state.recentTicks[i];
+      if (tick.ts <= targetMs) {
+        return { price: tick.price, tickAt: tick.ts, lagMs: targetMs - tick.ts };
+      }
+    }
+    // Все тики в буфере НОВЕЕ targetMs (targetMs старше, чем глубина буфера,
+    // либо фид подключился уже после целевого момента) — честно недоступно.
+    return { price: null, tickAt: null, lagMs: null };
   }
 
   private computeAtr(state: StreamFeedState): number | null {
@@ -372,6 +457,13 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
+    // Обнуляем "часы жизни" ПЕРЕД установкой соединения — иначе если фид
+    // молчал уже долго до этого вызова (например мы сюда попали из самого
+    // вотчдога), он немедленно перезапустит сам себя ещё раз, не дав новому
+    // соединению ни единого шанса прислать хоть один трейд.
+    this.lastAnyTradeAt = Date.now();
+    this.restartDataWatchdog();
+
     const provider = this.providers[this.providerIndex];
     const url = provider.buildUrl(tickers);
     const wsOptions = this.buildAgent();
@@ -404,7 +496,10 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
         if (!message.trim()) return;
 
         const trade = provider.parseMessage(JSON.parse(message));
-        if (trade) this.applyTrade(provider.name, trade);
+        if (trade) {
+          this.lastAnyTradeAt = Date.now(); // фид жив — см. dataWatchdogTimer
+          this.applyTrade(provider.name, trade);
+        }
       } catch (err) {
         this.logger.debug(`PriceFeedService: не удалось разобрать сообщение (${provider.name}): ${this.errMsg(err)}`);
       }
@@ -451,6 +546,15 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
       state.lastPriceAt = trade.ts;
       state.lastPriceSource = source;
 
+      // Буфер сырых тиков для точечного поиска "цена ровно на момент X"
+      // (Сессия 11, см. getPriceAt) — храним с запасом чуть больше
+      // recentTicksRetentionMs, чистим по мере поступления новых тиков.
+      state.recentTicks.push({ ts: trade.ts, price: trade.price });
+      const cutoff = trade.ts - this.recentTicksRetentionMs;
+      while (state.recentTicks.length > 0 && state.recentTicks[0].ts < cutoff) {
+        state.recentTicks.shift();
+      }
+
       const bucketStart = Math.floor(trade.ts / state.candleMs) * state.candleMs;
       if (!state.current || state.current.start !== bucketStart) {
         if (state.current) {
@@ -468,6 +572,37 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
         state.current.high = Math.max(state.current.high, trade.price);
         state.current.low = Math.min(state.current.low, trade.price);
       }
+    }
+  }
+
+  private restartDataWatchdog(): void {
+    if (this.dataWatchdogTimer) clearInterval(this.dataWatchdogTimer);
+    // Проверяем на удвоенной частоте относительно порога — не для точности,
+    // а чтобы не растягивать обнаружение почти в 2 раза от dataWatchdogMs.
+    const checkEveryMs = Math.max(1000, Math.floor(this.dataWatchdogMs / 2));
+    this.dataWatchdogTimer = setInterval(() => this.checkDataWatchdog(), checkEveryMs);
+  }
+
+  private checkDataWatchdog(): void {
+    if (this.stopped || !this.ws) return;
+    const silentMs = Date.now() - this.lastAnyTradeAt;
+    if (silentMs < this.dataWatchdogMs) return;
+
+    const provider = this.providers[this.providerIndex];
+    this.logger.warn(
+      `PriceFeedService: зомби-соединение — от ${provider.name} нет ни одного трейда уже ${Math.round(silentMs / 1000)}с ` +
+        `при том, что сокет всё ещё OPEN — это не тихий рынок, это мёртвый фид. Форсирую разрыв соединения, ` +
+        `чтобы включился обычный реконнект/ротация провайдера (handleDisconnect сам посчитает это как сбой ` +
+        `провайдера, когда придёт событие 'close' от terminate() — не дублируем счётчик здесь).`,
+    );
+    this.ws.terminate(); // жёстче, чем close() — не ждёт handshake закрытия от уже не отвечающей стороны
+    // Останавливаем вотчдог до следующего connect() (см. restartDataWatchdog
+    // внутри него) — иначе он продолжит тикать на уже терминированном сокете
+    // и будет звать terminate() повторно на каждой проверке, пока не пройдёт
+    // задержка scheduleReconnect (до 30с по бэкоффу).
+    if (this.dataWatchdogTimer) {
+      clearInterval(this.dataWatchdogTimer);
+      this.dataWatchdogTimer = null;
     }
   }
 

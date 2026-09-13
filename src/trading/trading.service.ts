@@ -89,6 +89,13 @@ interface MarketState {
   // исхода предыдущего ещё не зарезолвленного шага (см. tryPreResolve).
   stakePredicted: boolean;
   predictedFromLogId: string | null;
+  // Троттлинг лога "вход заблокирован ATR-гейтом" (Сессия 9, баг из прод-логов:
+  // onBookUpdate дёргается на каждый тик стакана во время окна входа — без
+  // троттлинга это давало десятки одинаковых строк в секунду, пока гейт
+  // держит блокировку). Отдельное поле НА ОКНО (не глобальная карта, как для
+  // discoveryTick) — окно и так живёт не дольше нескольких минут, поэтому
+  // сбрасывать вручную не нужно, новое окно = новый объект = чистый счётчик.
+  lastEntryGateLogAt: number;
   // Уже залогировали переход в "окно входа" (последние LAST_ENTRY_WINDOW_SEC
   // секунд) для этого маркета? Чтобы не спамить лог на каждый WS-тик до
   // наступления этого момента — см. onBookUpdate.
@@ -190,6 +197,10 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
   // для постоянного потока.
   private lastGateSkipLogAt = new Map<string, number>();
   private static readonly GATE_SKIP_LOG_THROTTLE_MS = 30_000;
+  private static readonly ENTRY_GATE_LOG_THROTTLE_MS = 15_000;
+  // Порог "подозрительно большого" лага найденного тика от истинной границы
+  // окна (Сессия 12) — чисто информационный, ничего не блокирует.
+  private static readonly REFERENCE_LAG_WARN_MS = 3_000;
   private stopped = false;
 
   constructor(
@@ -401,6 +412,14 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /** Троттлинг лога блокировки входа ATR-гейтом (Сессия 9) — см. MarketState.lastEntryGateLogAt. */
+  private logEntryGateBlockThrottled(marketState: MarketState, message: string): void {
+    const now = Date.now();
+    if (now - marketState.lastEntryGateLogAt < TradingService.ENTRY_GATE_LOG_THROTTLE_MS) return;
+    marketState.lastEntryGateLogAt = now;
+    this.logger.log(message);
+  }
+
   /** Троттлинг спама из discoveryTick (Сессия 8, баг №2) — см. lastGateSkipLogAt. */
   private logGateSkipThrottled(streamKey: string, message: string): void {
     const key = `${streamKey}`;
@@ -464,6 +483,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
         market.negRisk,
         forcedBetAmount,
         predictedFromLogId,
+        startTs,
       );
     }
   }
@@ -547,6 +567,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     negRisk: boolean,
     forcedBetAmount: number | null = null,
     predictedFromLogId: string | null = null,
+    windowStartTs: number | null = null,
   ): Promise<void> {
     const streamKey = stream.streamKey;
 
@@ -573,16 +594,55 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     const attemptId = attempt.id;
     const attemptStepNumber = attempt.currentStep + 1;
 
-    // Фиксируем ориентир по внешнему фиду в момент открытия окна — от него будем
-    // считать дельту/ATR-рацио на входе и на закрытии. Если фид ещё не успел
-    // прогреться (нет ни одного тика), просто останется null — вся диагностика
-    // и гейт в этом случае молча отключаются для конкретного окна (fail-open).
-    const referenceSnapshot = this.priceFeed.getSnapshot(streamKey);
-    if (referenceSnapshot.price == null) {
-      this.logger.warn(
-        `[${streamKey}] ${slug}: внешний ценовой фид ещё не отдал ни одного тика — ` +
-          `диагностика/ATR-гейт для этого окна будут недоступны.`,
-      );
+    // Фиксируем ориентир по внешнему фиду В МОМЕНТ ОФИЦИАЛЬНОГО СТАРТА ОКНА
+    // (windowStartTs), а НЕ "текущую" цену на момент, когда мы вообще успели
+    // сюда дойти (Сессия 11, см. CONTEXT.md — реальный найденный пользователем
+    // баг: между обнаружением нового окна в discoveryTick и этой строкой уже
+    // произошло 1-3 сетевых round-trip'а — fetchMarketBySlug + getBestQuote x2
+    // выше в этой же функции — и наш референс систематически отставал по
+    // времени от официального страйка Polymarket на эти самые секунды).
+    // getPriceAt ищет цену ИЗ БУФЕРА СЫРЫХ ТИКОВ ровно на нужный момент
+    // времени, а не "текущий" снимок — см. PriceFeedService.getPriceAt.
+    let referenceSnapshot: { price: number | null; source?: string | null };
+    let referenceLagMs: number | null = null;
+    if (windowStartTs != null) {
+      const atStart = this.priceFeed.getPriceAt(streamKey, windowStartTs * 1000);
+      referenceSnapshot = { price: atStart.price };
+      referenceLagMs = atStart.lagMs;
+      if (atStart.price != null && referenceLagMs != null && referenceLagMs > TradingService.REFERENCE_LAG_WARN_MS) {
+        // Тик нашёлся, но подозрительно далеко от истинной границы окна —
+        // похоже на дыру в потоке трейдов ровно рядом со стартом (просадка
+        // ликвидности/провайдера), а не на нормальную работу буфера.
+        // Не блокируем (у нас и так нет ничего точнее) — просто фиксируем
+        // в логе, чтобы было видно при разборе, если что-то пойдёт не так.
+        this.logger.warn(
+          `[${streamKey}] ${slug}: ближайший тик к истинному старту окна найден с лагом ${referenceLagMs}мс ` +
+            `(> ${TradingService.REFERENCE_LAG_WARN_MS}мс) — похоже на дыру в потоке трейдов рядом с границей окна, ` +
+            `референс всё равно используется (это лучшее, что есть), но точность может быть снижена.`,
+        );
+      }
+      if (atStart.price == null) {
+        // Буфер тиков не достаёт так далеко назад (например, фид только что
+        // переподключился, либо ещё вообще не прислал ни одного тика) —
+        // единственный доступный фолбэк это "текущая" цена, но это ХУЖЕ, чем
+        // честно считать референс недоступным (именно приближение и было
+        // исходным багом) — поэтому НЕ подставляем getSnapshot() сюда молча.
+        this.logger.warn(
+          `[${streamKey}] ${slug}: не нашли в буфере тиков цену на точный момент старта окна ` +
+            `(буфер не достаёт так далеко назад — фид либо только что переподключился, либо ещё ` +
+            `не прислал ни одного тика) — referencePrice для этого окна будет недоступен, ` +
+            `а не приближён текущей ценой. Диагностика/ATR-гейт для этого окна будут недоступны.`,
+        );
+      }
+    } else {
+      // Вызвано не из штатного discoveryTick (напр. тесты) — фолбэк на старое поведение.
+      referenceSnapshot = this.priceFeed.getSnapshot(streamKey);
+      if (referenceSnapshot.price == null) {
+        this.logger.warn(
+          `[${streamKey}] ${slug}: внешний ценовой фид ещё не отдал ни одного тика — ` +
+            `диагностика/ATR-гейт для этого окна будут недоступны.`,
+        );
+      }
     }
 
     const marketState: MarketState = {
@@ -612,6 +672,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       attemptStepNumber,
       stakePredicted: forcedBetAmount != null,
       predictedFromLogId,
+      lastEntryGateLogAt: 0,
       lastMinuteAnnounced: false,
     };
 
@@ -632,7 +693,11 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     this.logger.log(
       `[${streamKey}] ${slug}: открыт WS-поток (закрытие через ${(msUntilClose / 1000).toFixed(0)}с, стейк шага $${betAmount.toFixed(2)} ` +
         `[попытка #${attempt.attemptNumber}, шаг ${attempt.currentStep + 1}/${attempt.targetSteps}], min_order_size=${minOrderSize}, tick=${initialTickSize}, ` +
-        `referencePrice=${referenceSnapshot.price ?? 'н/д'})`,
+        `referencePrice=${referenceSnapshot.price ?? 'н/д'}` +
+        // Лаг найденного тика от истинной границы окна (Сессия 12, см. CONTEXT.md) —
+        // видимость точности референса прямо в логе открытия, как просил пользователь.
+        (referenceLagMs != null ? `, лаг референса от истинного старта окна ${referenceLagMs}мс` : '') +
+        ')',
     );
   }
 
@@ -648,18 +713,40 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
 
     // 0) Если по этому исходу уже стоит наша (смоук-)лимитка — проверяем, накопилось
     //    ли ДОСТАТОЧНО объёма продавцов по нашей цене или ниже (а не просто "касание").
-    //    Гейт по ATR здесь НЕ применяем повторно — он уже был проверен в момент
-    //    выставления резюм-лимитки (placeOrReplaceLimit); здесь только фиксируем
-    //    диагностику на момент фактического исполнения для лога.
+    //
+    //    ФИКС (Сессия 10, микрокейс №1): раньше ATR-гейт перепроверялся ТОЛЬКО в
+    //    момент ВЫСТАВЛЕНИЯ резюм-лимитки (placeOrReplaceLimit), а не в момент
+    //    её ФАКТИЧЕСКОГО исполнения — который может наступить намного позже
+    //    (лимитка просто ждёт, пока стакан накопит нужный объём продавцов).
+    //    Диагностика для лога бралась ЗАНОВО в момент исполнения
+    //    (captureDiagnostics), но сам факт исполнения гейтом уже не проверялся —
+    //    из-за этого капитал реально рисковался в момент, когда цена успела
+    //    "отскочить" почти обратно к референсу (см. прод-кейс: гейт пропустил
+    //    вход при ATR-рацио ~1.7x на выставлении, а к моменту исполнения
+    //    рацио упало до 0.44x — сделка всё равно прошла, хотя в момент
+    //    РЕАЛЬНОГО риска условие входа уже не выполнялось). Теперь гейт
+    //    перепроверяется заново прямо здесь: если к моменту накопления объёма
+    //    условие входа больше не выполняется — лимитка отменяется, а не
+    //    исполняется вслепую на устаревшем разрешении.
     if (this.isSmoke && marketState.restingOrder?.outcome === outcome) {
       const resting = marketState.restingOrder;
       const targetUsd = this.limitOrderTargetUsd(marketState, resting.price);
       const availableUsd = cumulativeUsdAtOrBelow(book.asks, resting.price);
       if (availableUsd >= targetUsd) {
+        const gate = this.evaluateEntryGate(marketState);
+        if (!gate.allow) {
+          marketState.restingOrder = null;
+          marketState.skippedLimitTier = resting.tier;
+          this.logger.log(
+            `[${marketState.assetPrefix}][SMOKE][Limit] ${marketState.slug}: тир ${resting.tier} — объём продавцов накопился, ` +
+              `НО гейт при повторной проверке НА МОМЕНТ ИСПОЛНЕНИЯ уже не пропускает вход (цена откатилась к референсу ` +
+              `с момента выставления лимитки) — отменяем, не рискуем капиталом на устаревшем разрешении. ${gate.reason}`,
+          );
+          return;
+        }
         marketState.positioned = true;
         marketState.restingOrder = null;
         const filledShares = targetUsd / resting.price;
-        const diagnostics = this.captureDiagnostics(marketState);
         void this.writeLog(marketState, {
           chosenOutcome: outcome,
           chosenTokenId: outcome === 'YES' ? marketState.yesTokenId : marketState.noTokenId,
@@ -673,7 +760,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
           logMessage: `SMOKE: лимитка не отправлялась на биржу — эмуляция; накопленный объём продавцов по ¢${(resting.price * 100).toFixed(2)} и ниже составил $${availableUsd.toFixed(2)}, взяли ${filledShares.toFixed(2)} шт.`,
           orderSentAt: resting.placedAt,
           orderFilledAt: new Date(),
-          ...diagnostics,
+          ...gate.diagnostics,
         });
         this.logger.log(
           `[${marketState.assetPrefix}][SMOKE][Limit fill] ${marketState.slug}: ${outcome} по ¢${(resting.price * 100).toFixed(2)} (тир ${resting.tier})`,
@@ -839,7 +926,10 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
 
     const gate = this.evaluateEntryGate(marketState);
     if (!gate.allow) {
-      this.logger.log(`[${marketState.assetPrefix}][Market] ${marketState.slug}: ${outcome} — вход заблокирован. ${gate.reason}`);
+      this.logEntryGateBlockThrottled(
+        marketState,
+        `[${marketState.assetPrefix}][Market] ${marketState.slug}: ${outcome} — вход заблокирован. ${gate.reason}`,
+      );
       return;
     }
 
@@ -943,7 +1033,10 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       const gate = this.evaluateEntryGate(marketState);
       if (!gate.allow) {
         marketState.skippedLimitTier = tier;
-        this.logger.log(`[${marketState.assetPrefix}][Limit] ${marketState.slug}: тир ${tier} — выставление заблокировано. ${gate.reason}`);
+        this.logEntryGateBlockThrottled(
+          marketState,
+          `[${marketState.assetPrefix}][Limit] ${marketState.slug}: тир ${tier} — выставление заблокировано. ${gate.reason}`,
+        );
         return;
       }
 
@@ -1005,10 +1098,18 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
         // на момент закрытия окна, чтобы потом было видно, что произошло с
         // ценой между входом и резолвом (это и есть материал для разбора сливов).
         if (marketState.marketLogId) {
-          const closeSnap = this.priceFeed.getSnapshot(marketState.assetPrefix);
+          // Сессия 12 (симметрично фиксу референса открытия в Сессии 11):
+          // раньше здесь брали getSnapshot() — "текущую" цену на момент,
+          // когда фактически выполнился этот код, а не цену РОВНО на
+          // marketState.closesAt. Между вызовом finalizeMarket по таймеру
+          // и этой строкой уже прошёл await cancelRestingIfAny (для LIVE —
+          // реальный сетевой запрос отмены ордера) — та же категория лага,
+          // что была у референса открытия. Теперь ищем цену в буфере тиков
+          // точно на официальный момент закрытия, а не "как получится".
+          const closeSnap = this.priceFeed.getPriceAt(marketState.assetPrefix, marketState.closesAt.getTime());
           await this.marketLogRepo.update(marketState.marketLogId, {
             priceAtClose: closeSnap.price,
-            atrAtClose: closeSnap.atr,
+            atrAtClose: this.priceFeed.getSnapshot(marketState.assetPrefix).atr,
           });
         }
         return;
@@ -1055,10 +1156,12 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
             orderFilledAt: new Date(),
           });
           if (savedId) {
-            const closeSnap = this.priceFeed.getSnapshot(marketState.assetPrefix);
+            // Сессия 12 — тот же фикс, что и выше: точка на момент истинного
+            // закрытия окна, а не "текущая" цена на момент, когда мы сюда дошли.
+            const closeSnap = this.priceFeed.getPriceAt(marketState.assetPrefix, marketState.closesAt.getTime());
             await this.marketLogRepo.update(savedId, {
               priceAtClose: closeSnap.price,
-              atrAtClose: closeSnap.atr,
+              atrAtClose: this.priceFeed.getSnapshot(marketState.assetPrefix).atr,
             });
           }
         } else {
