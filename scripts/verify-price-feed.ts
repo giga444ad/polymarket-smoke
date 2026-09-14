@@ -91,13 +91,16 @@ async function main() {
   }
 
   // --- Тест F: applyTrade кладёт тики в recentTicks и подрезает буфер старше
-  //     recentTicksRetentionMs (по умолчанию 15с, здесь используем реальный
-  //     дефолт сервиса — 15000мс). ---
+  //     state.recentTicksRetentionMs. Сессия 13: ретеншн теперь per-stream
+  //     (длительность окна потока + FEED_RECENT_TICKS_RETENTION_MS), а не
+  //     фиксированные 15с на все потоки — здесь явно задаём его тестовым
+  //     значением 15000мс, чтобы тест не зависел от STREAMS_CONFIG. ---
   {
     const streamKey = 'btc-updown-5m';
     const state = svc.states.get(streamKey);
     state.recentTicks = [];
     state.candleMs = 300_000;
+    state.recentTicksRetentionMs = 15_000;
     state.closed = [];
     state.current = null;
 
@@ -105,8 +108,49 @@ async function main() {
     (svc as any).applyTrade('chainlink', { ticker: 'btc', price: 50000, ts: now - 20_000 }); // старше retention (15с) — должен быть вычищен следующим тиком
     (svc as any).applyTrade('chainlink', { ticker: 'btc', price: 50010, ts: now });
     const stillOld = state.recentTicks.some((t: any) => t.ts === now - 20_000);
-    console.log(`[Тест F] Тик старше FEED_RECENT_TICKS_RETENTION_MS вычищен из буфера: ${!stillOld}`);
+    console.log(`[Тест F] Тик старше recentTicksRetentionMs вычищен из буфера: ${!stillOld}`);
     console.log(`[Тест F] Свежий тик остался в буфере: ${state.recentTicks.some((t: any) => t.ts === now)}`);
+  }
+
+  // --- Тест G (Сессия 13): per-stream ретеншн действительно вычисляется как
+  //     intervalSec*1000 + FEED_RECENT_TICKS_RETENTION_MS при старте сервиса
+  //     (не общий фиксированный дефолт на все потоки). Проверяем на
+  //     btc-updown-15m — btc-updown-5m в этом файле уже был перезаписан
+  //     Тестом F вручную, 15m ещё не трогали. ---
+  {
+    const state15m = svc.states.get('btc-updown-15m');
+    const expected15m = 900 * 1000 + 15000; // intervalSec(900)*1000 + дефолт FEED_RECENT_TICKS_RETENTION_MS(15000)
+    console.log(`[Тест G] Ретеншн btc-updown-15m = intervalSec(900с)*1000 + запас = ${expected15m}мс: ${state15m?.recentTicksRetentionMs === expected15m}`);
+  }
+
+  // --- Тест H (Сессия 13): getTimeInZoneRatio — доля прошедшего времени
+  //     окна на нужной стороне референса, времявзвешенно по буферу тиков. ---
+  {
+    const streamKey = 'btc-updown-15m';
+    const state = svc.states.get(streamKey);
+    const windowStart = 1_000_000;
+    // Референс = 100. Цена держится НИЖЕ референса (NO) 90% времени окна,
+    // затем в последние 10% времени резко выскакивает ВЫШЕ референса (YES) —
+    // классический прострел, который и обсуждался с Gemini.
+    state.recentTicks = [
+      { ts: windowStart, price: 95 }, // ниже референса с самого начала окна
+      { ts: windowStart + 900, price: 105 }, // прострел выше референса за последние 10% времени
+    ];
+    const now = windowStart + 1000;
+
+    const noRatio = svc.getTimeInZoneRatio(streamKey, windowStart, now, 100, 'NO');
+    const yesRatio = svc.getTimeInZoneRatio(streamKey, windowStart, now, 100, 'YES');
+    console.log(`[Тест H] NO держался ~90% прошедшего времени окна: ${noRatio != null && Math.abs(noRatio - 0.9) < 0.01}`);
+    console.log(`[Тест H] YES (прострел) держался только ~10%: ${yesRatio != null && Math.abs(yesRatio - 0.1) < 0.01}`);
+
+    // Буфер не достаёт до начала окна (самый ранний тик позже windowStart) -> null, не приближение.
+    state.recentTicks = [{ ts: windowStart + 500, price: 95 }];
+    const insufficient = svc.getTimeInZoneRatio(streamKey, windowStart, now, 100, 'NO');
+    console.log(`[Тест H] Буфер не достаёт до начала окна — честно null: ${insufficient === null}`);
+
+    // Неизвестный поток — null без исключения.
+    const unknown = svc.getTimeInZoneRatio('no-such-stream', windowStart, now, 100, 'YES');
+    console.log(`[Тест H] Неизвестный поток — null без исключения: ${unknown === null}`);
   }
 
   console.log('\nВСЕ ПРОВЕРКИ ВЫПОЛНЕНЫ.');

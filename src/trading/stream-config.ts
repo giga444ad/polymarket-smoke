@@ -34,6 +34,17 @@ export interface StreamDefinition {
   // потока 20 окон это 20 ЧАСОВ прогрева, что может быть избыточно строго;
   // здесь можно задать меньше, не трогая 5m/15m.
   atrCandles?: number;
+  // Сессия 14 (разбор реальной статистики: UNFILLED на 15m — 61.5% против
+  // 45% на 5m) — переопределяют глобальные LAST_ENTRY_WINDOW_SEC/
+  // LIMIT_TIER2_SECONDS/LIMIT_TIER3_SECONDS конкретно для этого потока.
+  // Гипотеза: одинаковое ОКНО В СЕКУНДАХ на конце разных по длине рынков —
+  // это разная ДОЛЯ рынка (60с из 300с = 20%, но 60с из 900с = 6.7%), а
+  // значит и разная динамика конвергенции книги/глубины к моменту входа.
+  // Если не заданы — используется глобальный ENV-дефолт (обратная
+  // совместимость, поведение не меняется, пока явно не переопределат).
+  lastEntryWindowSec?: number;
+  tier2Seconds?: number;
+  tier3Seconds?: number;
 }
 
 // 4ч/1д сознательно не включены сейчас (см. BACKLOG п.5) — только 5m/15m/1h.
@@ -89,12 +100,54 @@ export function parseStreamsConfig(raw: string | undefined): StreamDefinition[] 
       }
     }
 
+    // Сессия 14: опциональные per-stream переопределения окна входа/тиров
+    // (см. комментарий у полей в StreamDefinition выше).
+    let lastEntryWindowSec: number | undefined;
+    if (entry?.lastEntryWindowSec != null) {
+      lastEntryWindowSec = parseInt(entry.lastEntryWindowSec, 10);
+      if (!Number.isFinite(lastEntryWindowSec) || lastEntryWindowSec <= 0) {
+        throw new Error(`STREAMS_CONFIG[${streamKey}]: lastEntryWindowSec, если задан, должен быть > 0.`);
+      }
+      if (lastEntryWindowSec >= intervalSec) {
+        throw new Error(
+          `STREAMS_CONFIG[${streamKey}]: lastEntryWindowSec (${lastEntryWindowSec}с) должен быть меньше intervalSec (${intervalSec}с) — иначе окно входа охватывает весь рынок или больше.`,
+        );
+      }
+    }
+    let tier2Seconds: number | undefined;
+    if (entry?.tier2Seconds != null) {
+      tier2Seconds = parseInt(entry.tier2Seconds, 10);
+      if (!Number.isFinite(tier2Seconds) || tier2Seconds <= 0) {
+        throw new Error(`STREAMS_CONFIG[${streamKey}]: tier2Seconds, если задан, должен быть > 0.`);
+      }
+    }
+    let tier3Seconds: number | undefined;
+    if (entry?.tier3Seconds != null) {
+      tier3Seconds = parseInt(entry.tier3Seconds, 10);
+      if (!Number.isFinite(tier3Seconds) || tier3Seconds <= 0) {
+        throw new Error(`STREAMS_CONFIG[${streamKey}]: tier3Seconds, если задан, должен быть > 0.`);
+      }
+    }
+    // Инвариант T3 < T2 <= lastEntryWindowSec проверяем, только если ОБЕ
+    // стороны сравнения заданы явно на уровне потока — частичное
+    // переопределение (например только lastEntryWindowSec) разрешено,
+    // смешанная валидация со глобальными ENV-дефолтами делается отдельно в
+    // TradingService при старте (там доступны оба источника разом).
+    if (tier2Seconds != null && tier3Seconds != null && tier2Seconds <= tier3Seconds) {
+      throw new Error(`STREAMS_CONFIG[${streamKey}]: tier2Seconds (${tier2Seconds}) должен быть больше tier3Seconds (${tier3Seconds}).`);
+    }
+    if (lastEntryWindowSec != null && tier2Seconds != null && tier2Seconds > lastEntryWindowSec) {
+      throw new Error(
+        `STREAMS_CONFIG[${streamKey}]: tier2Seconds (${tier2Seconds}) не должен превышать lastEntryWindowSec (${lastEntryWindowSec}) — иначе T2 недостижим.`,
+      );
+    }
+
     if (kind === 'hourly-et') {
       const etSlugBase = String(entry?.etSlugBase ?? streamKey).trim();
-      return { streamKey, kind, intervalSec, etSlugBase, baseStake, atrCandles };
+      return { streamKey, kind, intervalSec, etSlugBase, baseStake, atrCandles, lastEntryWindowSec, tier2Seconds, tier3Seconds };
     }
 
     const slugPrefix = String(entry?.slugPrefix ?? streamKey).trim();
-    return { streamKey, kind, intervalSec, slugPrefix, baseStake, atrCandles };
+    return { streamKey, kind, intervalSec, slugPrefix, baseStake, atrCandles, lastEntryWindowSec, tier2Seconds, tier3Seconds };
   });
 }

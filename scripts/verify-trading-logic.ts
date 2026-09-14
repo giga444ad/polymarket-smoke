@@ -14,8 +14,8 @@ const fakeConfig = {
     LIMIT_TIER1_PRICE: '0.99',
     LIMIT_TIER2_PRICE: '0.995',
     LIMIT_TIER3_PRICE: '0.999',
-    LIMIT_TIER2_SECONDS: '150',
-    LIMIT_TIER3_SECONDS: '60',
+    LIMIT_TIER2_SECONDS: '40',
+    LIMIT_TIER3_SECONDS: '15',
     MAX_OVERSPEND_MULTIPLIER: '1.5',
     MIN_FILL_RATIO: '0.5',
     // Тесты 1-6 проверяют механику стакана/резолва, не новые гейты — держим
@@ -51,6 +51,8 @@ const fakePriceFeed: any = {
   // Сессия 11: реалистичный дефолт для тестов, которые НЕ подставляют свой —
   // "буфер не достаёт так далеко" (соответствует getSnapshot тоже давая null).
   getPriceAt: () => ({ price: null, tickAt: null, lagMs: null }),
+  // Сессия 13: Time-in-Zone фильтр — дефолт "недоступно" (буфер не достаёт).
+  getTimeInZoneRatio: () => null,
 };
 
 const fakeTrader = {
@@ -130,6 +132,12 @@ function makeMarketState(overrides: any = {}) {
     // окна (реинвест-прогрессия, см. BACKLOG п.1) — в тестах фиксируем $5,
     // как раньше был константный BET_AMOUNT.
     betAmount: 5,
+    // Сессия 13: доп. фильтры входа — дефолты нейтральны для тестов, которые
+    // их не касаются (intervalSec=300 соответствует дефолтному btc-updown-5m,
+    // windowStartMs=null означает "Time-in-Zone недоступен", как и раньше
+    // было для окон, открытых не через штатный discoveryTick).
+    intervalSec: 300,
+    windowStartMs: null,
     ...overrides,
   };
 }
@@ -245,6 +253,12 @@ async function main() {
     let mockPrice = 0.94; // |0.99(референс)-0.94| = 0.05 -> 0.05/0.01 = 5x ATR: уверенно, гейт пропускает
     const dynamicFeed: any = {
       getSnapshot: () => ({ price: mockPrice, priceAt: Date.now(), atr: mockAtr, candleCount: 20, source: 'chainlink' }),
+      // Сессия 13: captureDiagnostics теперь всегда зовёт getPriceAt для
+      // driftRateAtEntry (SHADOW-диагностика) — фейк должен его реализовывать,
+      // как и реальный PriceFeedService. Возвращаем "недоступно", этот тест
+      // директиональный дрифт не проверяет (см. отдельный тест ниже).
+      getPriceAt: () => ({ price: null, tickAt: null, lagMs: null }),
+      getTimeInZoneRatio: () => null,
     };
     const gatedConfig = {
       overrides: { ...fakeConfig.overrides, LAST_ENTRY_WINDOW_SEC: '600', ENTRY_FILTER_ENABLED: 'true', MIN_DISTANCE_ATR_RATIO: '1.5' },
@@ -648,6 +662,180 @@ async function main() {
       upd?.priceAtClose === 101.5,
     );
     console.log('[Тест 14] atrAtClose по-прежнему берётся из getSnapshot (0.02, агрегат по свечам, лаг тут не при чём):', upd?.atrAtClose === 0.02);
+  }
+
+  // --- Тесты 15-18 (Сессия 13): 4 доп. фильтра входа — каждый проверяем
+  //     независимо (заблокировано при неблагоприятной диагностике / вход
+  //     проходит при благоприятной), с ENTRY_FILTER_ENABLED='false', чтобы
+  //     исходный ATR-гейт не мешал изолированно проверить именно новый
+  //     фильтр. Общий сценарий стакана/окна — как в Тесте 9 (ask=0.99,
+  //     bestBid=0.97, closesAt через 50с < LAST_ENTRY_WINDOW_SEC=60с). ---
+  function makeGatedSvc(overrides: Record<string, string>, feed: any) {
+    const cfg = {
+      overrides: { ...fakeConfig.overrides, LAST_ENTRY_WINDOW_SEC: '60', ENTRY_FILTER_ENABLED: 'false', ...overrides },
+      get(key: string, def?: string) {
+        return this.overrides[key] ?? def;
+      },
+    };
+    const svc: any = new TradingService(cfg as any, fakeGamma as any, fakeClobPublic as any, fakeTrader as any, feed, fakeAttemptRepo as any, fakeMarketLogRepo as any);
+    svc.currentAttempts.set('btc-updown-5m', { id: 'attempt-1', streamKey: 'btc-updown-5m', currentStep: 0, targetSteps: 500, baseStake: 5, currentStake: 5 });
+    return svc;
+  }
+  const gateBook = book([{ price: 0.99, size: 10 }], 0.97);
+
+  // --- Тест 15: Time-of-Day Blackout ---
+  {
+    const nowHour = new Date().getUTCHours();
+
+    writes.length = 0;
+    const blockedSvc = makeGatedSvc({ BLACKOUT_HOURS_FILTER_ENABLED: 'true', BLACKOUT_HOURS_UTC: String(nowHour) }, fakePriceFeed);
+    const msBlocked = makeMarketState({ closesAt: new Date(Date.now() + 50_000) });
+    blockedSvc.onBookUpdate(msBlocked, 'YES', gateBook);
+    await sleep(30);
+    console.log('\n[Тест 15] Blackout: текущий час в списке -> вход заблокирован:', writes.length === 0 && !msBlocked.positioned);
+
+    writes.length = 0;
+    const otherHour = (nowHour + 12) % 24;
+    const allowedSvc = makeGatedSvc({ BLACKOUT_HOURS_FILTER_ENABLED: 'true', BLACKOUT_HOURS_UTC: String(otherHour) }, fakePriceFeed);
+    const msAllowed = makeMarketState({ closesAt: new Date(Date.now() + 50_000) });
+    allowedSvc.onBookUpdate(msAllowed, 'YES', gateBook);
+    await sleep(30);
+    console.log('[Тест 15] Blackout: текущий час НЕ в списке -> вход проходит:', writes.length === 1 && msAllowed.positioned);
+  }
+
+  // --- Тест 16: Expected Move (динамический запас, тот же временной масштаб, что и ATR) ---
+  {
+    // intervalSec=300 (btc-updown-5m), timeLeftSec≈50 -> sqrt(50/300)≈0.4082,
+    // requiredDelta = atr(0.01) * 0.4082 * SAFETY_K_FACTOR(1.5) ≈ 0.006124.
+    writes.length = 0;
+    const tooCloseFeed: any = { getSnapshot: () => ({ price: 0.503, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }), getPriceAt: () => ({ price: null, tickAt: null, lagMs: null }) };
+    const blockedSvc = makeGatedSvc({ EXPECTED_MOVE_FILTER_ENABLED: 'true', SAFETY_K_FACTOR: '1.5' }, tooCloseFeed);
+    const msBlocked = makeMarketState({ closesAt: new Date(Date.now() + 50_000), referencePrice: 0.5 });
+    blockedSvc.onBookUpdate(msBlocked, 'YES', gateBook);
+    await sleep(30);
+    console.log('\n[Тест 16] Expected-move: дельта (0.003) меньше требуемого запаса (~0.006) -> заблокировано:', writes.length === 0 && !msBlocked.positioned);
+
+    writes.length = 0;
+    const farEnoughFeed: any = { getSnapshot: () => ({ price: 0.51, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }), getPriceAt: () => ({ price: null, tickAt: null, lagMs: null }) };
+    const allowedSvc = makeGatedSvc({ EXPECTED_MOVE_FILTER_ENABLED: 'true', SAFETY_K_FACTOR: '1.5' }, farEnoughFeed);
+    const msAllowed = makeMarketState({ closesAt: new Date(Date.now() + 50_000), referencePrice: 0.5 });
+    allowedSvc.onBookUpdate(msAllowed, 'YES', gateBook);
+    await sleep(30);
+    console.log('[Тест 16] Expected-move: дельта (0.01) больше требуемого запаса (~0.006) -> вход проходит:', writes.length === 1 && msAllowed.positioned);
+  }
+
+  // --- Тест 17: Directional Volatility Drift (сигнатурная дельта схлопывается против стороны) ---
+  {
+    writes.length = 0;
+    const fallingFeed: any = {
+      getSnapshot: () => ({ price: 0.5, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }),
+      getPriceAt: () => ({ price: 0.52, tickAt: Date.now(), lagMs: 0 }), // цена 10с назад была ВЫШЕ -> падает -> против YES
+    };
+    const blockedSvc = makeGatedSvc({ DIRECTIONAL_DRIFT_FILTER_ENABLED: 'true', DRIFT_LOOKBACK_SEC: '10' }, fallingFeed);
+    const msBlocked = makeMarketState({ closesAt: new Date(Date.now() + 50_000), referencePrice: 0.5 });
+    blockedSvc.onBookUpdate(msBlocked, 'YES', gateBook);
+    await sleep(30);
+    console.log('\n[Тест 17] Directional-drift: дельта падает против YES -> заблокировано:', writes.length === 0 && !msBlocked.positioned);
+
+    writes.length = 0;
+    const risingFeed: any = {
+      getSnapshot: () => ({ price: 0.52, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }),
+      getPriceAt: () => ({ price: 0.5, tickAt: Date.now(), lagMs: 0 }), // цена 10с назад была НИЖЕ -> растёт -> в пользу YES
+    };
+    const allowedSvc = makeGatedSvc({ DIRECTIONAL_DRIFT_FILTER_ENABLED: 'true', DRIFT_LOOKBACK_SEC: '10' }, risingFeed);
+    const msAllowed = makeMarketState({ closesAt: new Date(Date.now() + 50_000), referencePrice: 0.5 });
+    allowedSvc.onBookUpdate(msAllowed, 'YES', gateBook);
+    await sleep(30);
+    console.log('[Тест 17] Directional-drift: дельта растёт в пользу YES -> вход проходит:', writes.length === 1 && msAllowed.positioned);
+  }
+
+  // --- Тест 18: Time-in-Zone Ratio (доля прошедшего времени окна на нужной стороне) ---
+  {
+    writes.length = 0;
+    const zoneLowFeed: any = {
+      getSnapshot: () => ({ price: 0.52, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }),
+      getTimeInZoneRatio: () => 0.1, // YES держался только 10% прошедшего времени окна
+      getPriceAt: () => ({ price: null, tickAt: null, lagMs: null }),
+    };
+    const blockedSvc = makeGatedSvc({ TIME_IN_ZONE_FILTER_ENABLED: 'true', MIN_ZONE_RATIO: '0.65' }, zoneLowFeed);
+    const msBlocked = makeMarketState({ closesAt: new Date(Date.now() + 50_000), referencePrice: 0.5, windowStartMs: Date.now() - 250_000 });
+    blockedSvc.onBookUpdate(msBlocked, 'YES', gateBook);
+    await sleep(30);
+    console.log('\n[Тест 18] Time-in-Zone: YES держался только 10% окна (< 65%) -> заблокировано:', writes.length === 0 && !msBlocked.positioned);
+
+    writes.length = 0;
+    const zoneHighFeed: any = {
+      getSnapshot: () => ({ price: 0.52, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }),
+      getTimeInZoneRatio: () => 0.9, // YES держался 90% прошедшего времени окна
+      getPriceAt: () => ({ price: null, tickAt: null, lagMs: null }),
+    };
+    const allowedSvc = makeGatedSvc({ TIME_IN_ZONE_FILTER_ENABLED: 'true', MIN_ZONE_RATIO: '0.65' }, zoneHighFeed);
+    const msAllowed = makeMarketState({ closesAt: new Date(Date.now() + 50_000), referencePrice: 0.5, windowStartMs: Date.now() - 250_000 });
+    allowedSvc.onBookUpdate(msAllowed, 'YES', gateBook);
+    await sleep(30);
+    console.log('[Тест 18] Time-in-Zone: YES держался 90% окна (>= 65%) -> вход проходит:', writes.length === 1 && msAllowed.positioned);
+
+    writes.length = 0;
+    const zoneNullFeed: any = {
+      getSnapshot: () => ({ price: 0.52, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }),
+      getTimeInZoneRatio: () => null, // буфер не достаёт до начала окна
+      getPriceAt: () => ({ price: null, tickAt: null, lagMs: null }),
+    };
+    const failClosedSvc = makeGatedSvc({ TIME_IN_ZONE_FILTER_ENABLED: 'true', MIN_ZONE_RATIO: '0.65' }, zoneNullFeed);
+    const msFailClosed = makeMarketState({ closesAt: new Date(Date.now() + 50_000), referencePrice: 0.5, windowStartMs: Date.now() - 250_000 });
+    failClosedSvc.onBookUpdate(msFailClosed, 'YES', gateBook);
+    await sleep(30);
+    console.log('[Тест 18] Time-in-Zone: диагностика недоступна (null) -> fail-closed, вход заблокирован:', writes.length === 0 && !msFailClosed.positioned);
+  }
+
+  // --- Тест 19 (Сессия 14): per-stream переопределение LAST_ENTRY_WINDOW_SEC —
+  //     значение из marketState (снятое в openMarket из STREAMS_CONFIG)
+  //     должно ПЕРЕКРЫВАТЬ глобальный ENV-дефолт, а не наоборот. ---
+  {
+    writes.length = 0;
+    // Глобальный дефолт разрешил бы вход за 200с (широкий), но у ЭТОГО
+    // конкретного маркета (снимок из STREAMS_CONFIG на момент открытия)
+    // окно уже сужено до 30с — 50с до закрытия должно блокировать.
+    const wideGlobalSvc = makeGatedSvc({ LAST_ENTRY_WINDOW_SEC: '200' }, fakePriceFeed);
+    const msNarrow = makeMarketState({ closesAt: new Date(Date.now() + 50_000), lastEntryWindowSec: 30 });
+    wideGlobalSvc.onBookUpdate(msNarrow, 'YES', gateBook);
+    await sleep(30);
+    console.log(
+      '\n[Тест 19] per-stream lastEntryWindowSec=30 < 50с до закрытия -> блокирует, ХОТЯ глобальный ENV=200с разрешил бы:',
+      writes.length === 0 && !msNarrow.positioned,
+    );
+
+    writes.length = 0;
+    // Обратный случай: глобальный дефолт узкий (10с, заблокировал бы), но у
+    // потока переопределено на 90с — вход должен пройти.
+    const narrowGlobalSvc = makeGatedSvc({ LAST_ENTRY_WINDOW_SEC: '10', LIMIT_TIER2_SECONDS: '5', LIMIT_TIER3_SECONDS: '2' }, fakePriceFeed);
+    const msWide = makeMarketState({ closesAt: new Date(Date.now() + 50_000), lastEntryWindowSec: 90 });
+    narrowGlobalSvc.onBookUpdate(msWide, 'YES', gateBook);
+    await sleep(30);
+    console.log(
+      '[Тест 19] per-stream lastEntryWindowSec=90 > 50с до закрытия -> вход проходит, ХОТЯ глобальный ENV=10с заблокировал бы:',
+      writes.length === 1 && msWide.positioned,
+    );
+  }
+
+  // --- Тест 20 (Сессия 14): per-stream переопределение computeTier
+  //     (tier2Seconds/tier3Seconds) через marketState. ---
+  {
+    const anySvc: any = makeGatedSvc({ LAST_ENTRY_WINDOW_SEC: '200', LIMIT_TIER2_SECONDS: '150', LIMIT_TIER3_SECONDS: '60' }, fakePriceFeed);
+    const msDefault = makeMarketState(); // без override — берёт глобальные 150/60
+    console.log(
+      '\n[Тест 20] Без override: 100с до закрытия при глобальных T2=150/T3=60 -> тир T2:',
+      anySvc.computeTier(100, msDefault) === 'T2',
+    );
+    const msOverridden = makeMarketState({ tier2Seconds: 40, tier3Seconds: 15 });
+    console.log(
+      '[Тест 20] С override T2=40/T3=15: те же 100с -> уже тир T1 (за пределами обоих порогов потока):',
+      anySvc.computeTier(100, msOverridden) === 'T1',
+    );
+    console.log(
+      '[Тест 20] С override T2=40/T3=15: 20с до закрытия -> тир T2 (между T3=15 и T2=40):',
+      anySvc.computeTier(20, msOverridden) === 'T2',
+    );
   }
 
   console.log('\nВСЕ ПРОВЕРКИ ВЫПОЛНЕНЫ.');

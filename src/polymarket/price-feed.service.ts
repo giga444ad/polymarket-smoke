@@ -33,6 +33,17 @@ interface StreamFeedState {
   // с разрешением в целую свечу, этого недостаточно для поиска "цена ровно
   // в 13:00:00.000").
   recentTicks: { ts: number; price: number }[];
+  // Сколько мс держим recentTicks ДЛЯ ЭТОГО КОНКРЕТНОГО ПОТОКА (Сессия 13,
+  // фильтры входа). Раньше был единый глобальный FEED_RECENT_TICKS_RETENTION_MS
+  // (15с по умолчанию) — этого достаточно для getPriceAt (точный референс/
+  // цена закрытия, нужны секунды). Но Time-in-Zone фильтру (см.
+  // getTimeInZoneRatio) нужна история ЗА ВСЁ ПРОШЕДШЕЕ ОКНО потока (до
+  // 60 минут для часового потока) — поэтому теперь ретеншн БУФЕРА
+  // per-stream = длительность окна потока + тот же глобальный запас
+  // (последний остаётся как margin на случай сетевых задержек, как и
+  // раньше). getPriceAt/зона от этого работают так же, просто буфер держит
+  // больше истории — семантика поиска не меняется, меняется только глубина.
+  recentTicksRetentionMs: number;
 }
 
 export interface FeedSnapshot {
@@ -53,13 +64,13 @@ export interface PriceAtResult {
   lagMs: number | null;
 }
 
-interface NormalizedTrade {
+export interface NormalizedTrade {
   ticker: string; // "btc", "eth", ... (канонический, БЕЗ суффикса типа usdt/usd)
   price: number;
   ts: number; // мс
 }
 
-interface ProviderAdapter {
+export interface ProviderAdapter {
   name: string;
   buildUrl(tickers: string[]): string;
   /** Что отправить сразу после открытия соединения (напр. Bybit/RTDS требуют явный subscribe). */
@@ -70,7 +81,7 @@ interface ProviderAdapter {
   heartbeatMessage?: string;
 }
 
-const BINANCE_ADAPTER: ProviderAdapter = {
+export const BINANCE_ADAPTER: ProviderAdapter = {
   name: 'binance',
   buildUrl(tickers) {
     const streams = tickers.map((t) => `${t}usdt@trade`).join('/');
@@ -88,7 +99,7 @@ const BINANCE_ADAPTER: ProviderAdapter = {
   },
 };
 
-const BYBIT_ADAPTER: ProviderAdapter = {
+export const BYBIT_ADAPTER: ProviderAdapter = {
   name: 'bybit',
   buildUrl() {
     return 'wss://stream.bybit.com/v5/public/spot';
@@ -118,7 +129,7 @@ const BYBIT_ADAPTER: ProviderAdapter = {
  * PING каждые 5с (см. heartbeatIntervalMs) — это НЕ протокольный ws-пинг, а
  * отдельный текстовый фрейм, который ждёт именно этот сервис.
  */
-const CHAINLINK_RTDS_ADAPTER: ProviderAdapter = {
+export const CHAINLINK_RTDS_ADAPTER: ProviderAdapter = {
   name: 'chainlink',
   buildUrl() {
     return 'wss://ws-live-data.polymarket.com';
@@ -148,7 +159,10 @@ const CHAINLINK_RTDS_ADAPTER: ProviderAdapter = {
   },
 };
 
-const PROVIDERS: Record<string, ProviderAdapter> = {
+// Сессия 15: экспортированы (были module-private) — переиспользуются как есть
+// в scripts/tick-recorder.ts (отдельный процесс, независимо слушает те же
+// публичные источники и пишет сырые тики в БД для будущего бэктеста).
+export const PROVIDERS: Record<string, ProviderAdapter> = {
   chainlink: CHAINLINK_RTDS_ADAPTER,
   binance: BINANCE_ADAPTER,
   bybit: BYBIT_ADAPTER,
@@ -191,6 +205,11 @@ const PROVIDERS: Record<string, ProviderAdapter> = {
  * `ENTRY_FILTER_ENABLED` это уходит в fail-closed так же, как отсутствие
  * тиков: лучше не торговать этим потоком, чем гадать на нерепрезентативной
  * статистике.
+ *
+ * СЕССИЯ 13 (доп. фильтры входа, см. TradingService.evaluateEntryGate):
+ * `recentTicks` теперь хранится per-stream на всю длительность окна потока
+ * (не фиксированные 15с на все потоки) — нужно для `getTimeInZoneRatio`
+ * (доля прошедшего времени окна на нужной стороне референса).
  */
 @Injectable()
 export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
@@ -291,6 +310,12 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
       // диапазон цены за одно из прошлых окон этого актива/таймфрейма.
       const candleMs = Math.max(minCandleMs, stream.intervalSec * 1000);
       const atrCandles = stream.atrCandles ?? this.atrCandles;
+      // Per-stream ретеншн буфера сырых тиков (см. комментарий поля
+      // StreamFeedState.recentTicksRetentionMs) — вся длительность окна
+      // потока плюс прежний глобальный запас, а не фиксированные 15с на все
+      // потоки разом (для часового потока это 60 мин + запас, для 5m — 5 мин
+      // + запас).
+      const recentTicksRetentionMs = stream.intervalSec * 1000 + this.recentTicksRetentionMs;
       this.states.set(stream.streamKey, {
         streamKey: stream.streamKey,
         ticker,
@@ -302,6 +327,7 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
         current: null,
         closed: [],
         recentTicks: [],
+        recentTicksRetentionMs,
       });
     }
   }
@@ -412,6 +438,70 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
     // Все тики в буфере НОВЕЕ targetMs (targetMs старше, чем глубина буфера,
     // либо фид подключился уже после целевого момента) — честно недоступно.
     return { price: null, tickAt: null, lagMs: null };
+  }
+
+  /**
+   * Time-in-Zone Ratio (Сессия 13, фильтры входа — обсуждение с Gemini,
+   * см. CONTEXT.md) — доля УЖЕ ПРОШЕДШЕГО времени текущего окна
+   * (`windowStartMs`..`nowMs`), в течение которого цена держалась на
+   * стороне `side` относительно `referencePrice`. Нужна, чтобы отличать
+   * "актив стабильно шёл в эту сторону всё окно" от "актив 95% окна был на
+   * противоположной стороне и только что дёрнулся сюда за секунды до
+   * закрытия" — второе исторически и было источником поздних разворотов
+   * (см. разбор в CONTEXT.md/диалоге с Gemini).
+   *
+   * Времявзвешенный расчёт по буферу сырых тиков: между двумя соседними
+   * тиками цена считается равной значению РАННЕГО тика (то же допущение,
+   * что и в getPriceAt — "какая цена была ИЗВЕСТНА в этот момент"), сегмент
+   * времени целиком относится к той стороне, на которой была эта цена.
+   *
+   * Возвращает null (честно "недоступно", не приближение), если буфер
+   * тиков не достаёт так далеко назад, как windowStartMs (например поток
+   * только что запущен и ещё не набрал историю на всё окно) — ровно та же
+   * fail-closed философия, что и у getPriceAt/ATR-гейта.
+   */
+  getTimeInZoneRatio(streamKey: string, windowStartMs: number, nowMs: number, referencePrice: number, side: 'YES' | 'NO'): number | null {
+    const state = this.states.get(streamKey);
+    if (!state) return null;
+    const ticks = state.recentTicks;
+    if (ticks.length === 0 || ticks[0].ts > windowStartMs) return null;
+
+    let startIdx = -1;
+    for (let i = ticks.length - 1; i >= 0; i--) {
+      if (ticks[i].ts <= windowStartMs) {
+        startIdx = i;
+        break;
+      }
+    }
+    if (startIdx === -1) return null;
+
+    let aboveMs = 0;
+    let belowMs = 0;
+    let curPrice = ticks[startIdx].price;
+    let curTs = windowStartMs;
+
+    for (let i = startIdx + 1; i < ticks.length && curTs < nowMs; i++) {
+      const tick = ticks[i];
+      if (tick.ts <= windowStartMs) continue; // не должно происходить (startIdx уже последний <= windowStartMs), защитная проверка
+      const segEnd = Math.min(tick.ts, nowMs);
+      const dur = segEnd - curTs;
+      if (dur > 0) {
+        if (curPrice > referencePrice) aboveMs += dur;
+        else belowMs += dur;
+      }
+      curPrice = tick.price;
+      curTs = segEnd;
+    }
+    if (curTs < nowMs) {
+      const dur = nowMs - curTs;
+      if (curPrice > referencePrice) aboveMs += dur;
+      else belowMs += dur;
+    }
+
+    const total = aboveMs + belowMs;
+    if (total <= 0) return null;
+    const aboveRatio = aboveMs / total;
+    return side === 'YES' ? aboveRatio : 1 - aboveRatio;
   }
 
   private computeAtr(state: StreamFeedState): number | null {
@@ -550,7 +640,7 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
       // (Сессия 11, см. getPriceAt) — храним с запасом чуть больше
       // recentTicksRetentionMs, чистим по мере поступления новых тиков.
       state.recentTicks.push({ ts: trade.ts, price: trade.price });
-      const cutoff = trade.ts - this.recentTicksRetentionMs;
+      const cutoff = trade.ts - state.recentTicksRetentionMs;
       while (state.recentTicks.length > 0 && state.recentTicks[0].ts < cutoff) {
         state.recentTicks.shift();
       }

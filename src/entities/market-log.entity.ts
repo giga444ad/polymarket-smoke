@@ -196,4 +196,29 @@ export class MarketLog {
   // официальным резолвом Gamma.
   @Column({ type: 'uuid', nullable: true })
   predictedFromLogId: string | null;
+
+  // --- Сессия 13: 4 доп. фильтра входа (обсуждение с Gemini по реальным
+  // сливам, см. CONTEXT.md) — каждый включается своим ENV независимо от
+  // остальных. Поля ниже пишутся ВСЕГДА (SHADOW-диагностика), даже когда
+  // соответствующий фильтр выключен — материал для калибровки порогов до
+  // включения блокировки, как и с исходным ATR-гейтом на старте проекта. ---
+
+  // Час UTC на момент входа (см. BLACKOUT_HOURS_UTC).
+  @Column({ type: 'int', nullable: true })
+  blackoutHourAtEntry: number | null;
+
+  // Требуемый запас цены от референса (Expected Move): atrAtEntry *
+  // sqrt(t_rem/intervalSec) * SAFETY_K_FACTOR — см. EXPECTED_MOVE_FILTER_ENABLED.
+  @Column({ type: 'double precision', nullable: true })
+  requiredDeltaAtEntry: number | null;
+
+  // Скорость изменения сигнатурной дельты цена-референс за DRIFT_LOOKBACK_SEC
+  // секунд — положительно = дельта растёт к YES, отрицательно = к NO.
+  @Column({ type: 'double precision', nullable: true })
+  driftRateAtEntry: number | null;
+
+  // Доля прошедшего времени текущего окна, когда цена была на стороне
+  // ВЫБРАННОГО исхода относительно референса (Time-in-Zone, см. MIN_ZONE_RATIO).
+  @Column({ type: 'double precision', nullable: true })
+  zoneRatioAtEntry: number | null;
 }
