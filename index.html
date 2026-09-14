@@ -41,11 +41,14 @@
       const [error, setError] = useState(null);
 
       // Сессия 6: отдельный саб-таб "Сделки" внутри дашборда — ходит на
-      // отдельную лёгкую ручку /analytics/trades (не грузит /summary),
-      // подгружается лениво (только когда открыт этот саб-тап).
+      // отдельную лёгкую ручку /analytics/trades (не грузит /summary).
       const [view, setView] = useState('summary'); // 'summary' | 'trades'
       const [trades, setTrades] = useState(null);
       const [tradesLoading, setTradesLoading] = useState(false);
+      
+      // Пагинация для сделок
+      const [tradesPage, setTradesPage] = useState(1);
+      const [tradesMeta, setTradesMeta] = useState({ total: 0, totalPages: 1, limit: 50 });
 
       // Drill-down модалки: по потоку (streamKey) и по конкретной попытке (attemptId).
       const [streamDetail, setStreamDetail] = useState(null); // { streamKey, data, loading }
@@ -58,11 +61,10 @@
       const [secondsLeft, setSecondsLeft] = useState(REFRESH_INTERVAL_SEC);
       const [isAutoRefreshEnabled, setIsAutoRefreshEnabled] = useState(true);
 
-      // Базовый URL бэкенда текущего таба (BTC/SOL/ETH/DOGE — разные деплои) —
-      // используется и старой fetchData, и новыми ручками (trades/streams/attempts).
+      // Базовый URL бэкенда текущего таба (BTC/SOL/ETH/DOGE — разные деплои)
       const baseUrl = `https://polymarket-smoke-${activeTab.toLowerCase()}.up.railway.app`;
 
-      // Функция загрузки данных
+      // Функция загрузки данных summary
       const fetchData = useCallback((isInitial = false) => {
         if (isInitial) {
           setLoading(true);
@@ -97,6 +99,12 @@
         setActiveTab(market);
         sessionStorage.setItem('activeTab', market);
         setActiveStream('all');
+        setTradesPage(1); // сбрасываем страницу на 1-ю
+      };
+
+      const handleStreamChange = (streamKey) => {
+        setActiveStream(streamKey);
+        setTradesPage(1); // сбрасываем страницу на 1-ю
       };
 
       // Запрос при смене активного таба
@@ -125,36 +133,41 @@
       const toggleAutoRefresh = () => {
         if (!isAutoRefreshEnabled) {
           setIsAutoRefreshEnabled(true);
-          fetchData(false); // сразу подтягиваем свежие данные при повторном включении
+          fetchData(false);
         } else {
           setIsAutoRefreshEnabled(false);
         }
       };
 
-      // --- Сессия 6, п.1: отдельная лёгкая ручка /analytics/trades ---
+      // --- Сессия 6, п.1: отдельная ручка /analytics/trades с пагинацией ---
       const fetchTrades = useCallback(() => {
         setTradesLoading(true);
         setActionError(null);
         const qs = activeStream !== 'all' ? `&streamKey=${encodeURIComponent(activeStream)}` : '';
+        const limit = tradesMeta.limit || 50;
 
-        // Запрашиваем с запасом (например, limit=1000)
-        fetch(`${baseUrl}/analytics/trades?limit=1000${qs}`)
+        fetch(`${baseUrl}/analytics/trades?page=${tradesPage}&limit=${limit}${qs}`)
           .then((res) => {
             if (!res.ok) throw new Error(`Ошибка сети (${activeTab}, trades).`);
             return res.json();
           })
           .then((json) => {
-            // Поддержка нового формата { data: [...], meta: {...} } 
-            // с фоллбеком на старый чистый массив
-            const tradesList = Array.isArray(json) ? json : (json?.data || []);
-            setTrades(tradesList);
+            // Если ответ в новом формате { data, meta }
+            if (json && !Array.isArray(json) && json.data) {
+              setTrades(json.data);
+              setTradesMeta(json.meta || { total: json.data.length, totalPages: 1, page: tradesPage, limit });
+            } else {
+              // Фоллбек на старый массив
+              const list = Array.isArray(json) ? json : [];
+              setTrades(list);
+              setTradesMeta({ total: list.length, totalPages: 1, page: 1, limit });
+            }
           })
           .catch((err) => setActionError(err.message))
           .finally(() => setTradesLoading(false));
-      }, [baseUrl, activeTab, activeStream]);
+      }, [baseUrl, activeTab, activeStream, tradesPage, tradesMeta.limit]);
 
-      // Подгружаем сделки лениво: только когда открыт саб-таб "Сделки", и
-      // перезагружаем при смене таба бэкенда/потока или тике автообновления.
+      // Подгружаем сделки при открытии саб-таба, смене страницы или тике таймера
       useEffect(() => {
         if (view === 'trades') fetchTrades();
       }, [view, fetchTrades, secondsLeft === REFRESH_INTERVAL_SEC]);
@@ -244,7 +257,7 @@
             {streamKeys.length > 0 && (
               <div className="flex flex-wrap gap-1 bg-gray-200/50 p-1 rounded-lg mb-6 w-fit">
                 <button
-                  onClick={() => setActiveStream('all')}
+                  onClick={() => handleStreamChange('all')}
                   className={`px-4 py-1.5 rounded-md font-medium text-sm transition-all duration-200 ${activeStream === 'all' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'
                     }`}
                 >
@@ -253,7 +266,7 @@
                 {streamKeys.map((key) => (
                   <button
                     key={key}
-                    onClick={() => setActiveStream(key)}
+                    onClick={() => handleStreamChange(key)}
                     className={`px-4 py-1.5 rounded-md font-medium text-sm transition-all duration-200 ${activeStream === key ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'
                       }`}
                   >
@@ -451,7 +464,6 @@
         );
       };
 
-      // Сколько секунд прошло с момента последнего обновления
       const timeSinceUpdate = lastUpdated
         ? Math.floor((new Date() - lastUpdated) / 1000)
         : 0;
@@ -508,6 +520,9 @@
                 <TradesView
                   trades={trades}
                   loading={tradesLoading}
+                  meta={tradesMeta}
+                  page={tradesPage}
+                  onPageChange={setTradesPage}
                   onOpenStream={openStream}
                   onOpenAttempt={openAttempt}
                   onCloseEarly={closeEarly}
@@ -551,7 +566,7 @@
       );
     }
 
-    // --- Сессия 6: статус-бейдж, лента сделок, модалка drill-down ---
+    // --- Сессия 6: статус-бейдж, лента сделок с пагинацией, модалка drill-down ---
     function statusBadgeClass(status) {
       if (status === 'win' || status === 'active') return 'bg-green-100 text-green-700';
       if (status === 'pending_resolve') return 'bg-blue-100 text-blue-700';
@@ -560,16 +575,47 @@
       return 'bg-red-100 text-red-700';
     }
 
-    function TradesView({ trades, loading, onOpenStream, onOpenAttempt, onCloseEarly, closingId }) {
+    function TradesView({ trades, loading, meta, page, onPageChange, onOpenStream, onOpenAttempt, onCloseEarly, closingId }) {
       if (loading && !trades) return <div className="py-12 text-center text-gray-500 font-sans">Загрузка сделок...</div>;
       if (!trades || trades.length === 0) return <div className="py-12 text-center text-gray-400 font-sans">Сделок пока нет.</div>;
 
+      const totalPages = meta?.totalPages || 1;
+      const total = meta?.total ?? trades.length;
+
       return (
         <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
-          <div className="p-6 border-b border-gray-100">
-            <h2 className="text-xl font-semibold text-gray-800">Лента сделок (все потоки, активные + история)</h2>
-            <p className="text-xs text-gray-400 mt-1">Отдельная лёгкая ручка /analytics/trades — не влияет на загрузку Summary.</p>
+          <div className="p-6 border-b border-gray-100 flex flex-col md:flex-row md:items-center justify-between gap-4">
+            <div>
+              <h2 className="text-xl font-semibold text-gray-800">Лента сделок (все потоки, активные + история)</h2>
+              <p className="text-xs text-gray-400 mt-1">Всего записей: {total}</p>
+            </div>
+
+            {/* Блок переключения страниц */}
+            {totalPages > 1 && (
+              <div className="flex items-center gap-2">
+                <button
+                  disabled={page <= 1 || loading}
+                  onClick={() => onPageChange(page - 1)}
+                  className="px-3 py-1.5 text-xs font-semibold rounded-md border border-gray-200 bg-white text-gray-700 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  ← Назад
+                </button>
+
+                <span className="text-xs text-gray-600 font-medium px-2">
+                  Стр. {page} из {totalPages}
+                </span>
+
+                <button
+                  disabled={page >= totalPages || loading}
+                  onClick={() => onPageChange(page + 1)}
+                  className="px-3 py-1.5 text-xs font-semibold rounded-md border border-gray-200 bg-white text-gray-700 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  Вперед →
+                </button>
+              </div>
+            )}
           </div>
+
           <div className="overflow-x-auto">
             <table className="w-full text-left border-collapse">
               <thead>
@@ -641,6 +687,34 @@
               </tbody>
             </table>
           </div>
+
+          {/* Нижний блок пагинации */}
+          {totalPages > 1 && (
+            <div className="p-4 border-t border-gray-100 bg-gray-50/50 flex items-center justify-between">
+              <span className="text-xs text-gray-500">
+                Показаны записи {((page - 1) * meta.limit) + 1}–{Math.min(page * meta.limit, total)} из {total}
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  disabled={page <= 1 || loading}
+                  onClick={() => onPageChange(page - 1)}
+                  className="px-3 py-1 text-xs font-semibold rounded border border-gray-200 bg-white text-gray-700 hover:bg-gray-100 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  ← Назад
+                </button>
+                <span className="text-xs text-gray-600 px-1 font-medium">
+                  {page} / {totalPages}
+                </span>
+                <button
+                  disabled={page >= totalPages || loading}
+                  onClick={() => onPageChange(page + 1)}
+                  className="px-3 py-1 text-xs font-semibold rounded border border-gray-200 bg-white text-gray-700 hover:bg-gray-100 disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  Вперед →
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       );
     }
