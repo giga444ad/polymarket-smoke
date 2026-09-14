@@ -1,825 +1,840 @@
 <!DOCTYPE html>
 <html lang="ru">
+
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Bot Analytics Dashboard</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bot Analytics Dashboard</title>
 
-    <!-- Подключаем Tailwind CSS -->
-    <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Подключаем Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
 
-    <!-- Подключаем React и ReactDOM -->
-    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <!-- Подключаем React и ReactDOM -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 
-    <!-- Подключаем Babel для компиляции JSX прямо в браузере -->
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Подключаем Babel для компиляции JSX прямо в браузере -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 </head>
+
 <body class="bg-gray-50">
-    <div id="root"></div>
+  <div id="root"></div>
 
-    <script type="text/babel">
-        const { useEffect, useState, useRef, useCallback } = React;
+  <script type="text/babel">
+    const { useEffect, useState, useRef, useCallback } = React;
 
-        // Массив всех доступных рынков.
-        const MARKETS = ['BTC', 'SOL', 'ETH', 'DOGE'];
-        const REFRESH_INTERVAL_SEC = 60;
+    // Массив всех доступных рынков.
+    const MARKETS = ['BTC', 'SOL', 'ETH', 'DOGE'];
+    const REFRESH_INTERVAL_SEC = 60;
 
-        function AnalyticsDashboard() {
-            // Вариант 3: Инициализация вкладки из sessionStorage
-            const [activeTab, setActiveTab] = useState(() => {
-                const savedTab = sessionStorage.getItem('activeTab');
-                return MARKETS.includes(savedTab) ? savedTab : MARKETS[0];
-            });
+    function AnalyticsDashboard() {
+      // Вариант 3: Инициализация вкладки из sessionStorage
+      const [activeTab, setActiveTab] = useState(() => {
+        const savedTab = sessionStorage.getItem('activeTab');
+        return MARKETS.includes(savedTab) ? savedTab : MARKETS[0];
+      });
 
-            const [activeStream, setActiveStream] = useState('all');
-            const [data, setData] = useState(null);
-            const [losses, setLosses] = useState(null);
-            const [loading, setLoading] = useState(true);
-            const [error, setError] = useState(null);
+      const [activeStream, setActiveStream] = useState('all');
+      const [data, setData] = useState(null);
+      const [losses, setLosses] = useState(null);
+      const [loading, setLoading] = useState(true);
+      const [error, setError] = useState(null);
 
-            // Сессия 6: отдельный саб-таб "Сделки" внутри дашборда — ходит на
-            // отдельную лёгкую ручку /analytics/trades (не грузит /summary),
-            // подгружается лениво (только когда открыт этот саб-тап).
-            const [view, setView] = useState('summary'); // 'summary' | 'trades'
-            const [trades, setTrades] = useState(null);
-            const [tradesLoading, setTradesLoading] = useState(false);
+      // Сессия 6: отдельный саб-таб "Сделки" внутри дашборда — ходит на
+      // отдельную лёгкую ручку /analytics/trades (не грузит /summary),
+      // подгружается лениво (только когда открыт этот саб-тап).
+      const [view, setView] = useState('summary'); // 'summary' | 'trades'
+      const [trades, setTrades] = useState(null);
+      const [tradesLoading, setTradesLoading] = useState(false);
 
-            // Drill-down модалки: по потоку (streamKey) и по конкретной попытке (attemptId).
-            const [streamDetail, setStreamDetail] = useState(null); // { streamKey, data, loading }
-            const [attemptDetail, setAttemptDetail] = useState(null); // { id, data, loading }
-            const [closingId, setClosingId] = useState(null);
-            const [actionError, setActionError] = useState(null);
+      // Drill-down модалки: по потоку (streamKey) и по конкретной попытке (attemptId).
+      const [streamDetail, setStreamDetail] = useState(null); // { streamKey, data, loading }
+      const [attemptDetail, setAttemptDetail] = useState(null); // { id, data, loading }
+      const [closingId, setClosingId] = useState(null);
+      const [actionError, setActionError] = useState(null);
 
-            // Состояние таймера автообновления
-            const [lastUpdated, setLastUpdated] = useState(null);
-            const [secondsLeft, setSecondsLeft] = useState(REFRESH_INTERVAL_SEC);
-            const [isAutoRefreshEnabled, setIsAutoRefreshEnabled] = useState(true);
+      // Состояние таймера автообновления
+      const [lastUpdated, setLastUpdated] = useState(null);
+      const [secondsLeft, setSecondsLeft] = useState(REFRESH_INTERVAL_SEC);
+      const [isAutoRefreshEnabled, setIsAutoRefreshEnabled] = useState(true);
 
-            // Базовый URL бэкенда текущего таба (BTC/SOL/ETH/DOGE — разные деплои) —
-            // используется и старой fetchData, и новыми ручками (trades/streams/attempts).
-            const baseUrl = `https://polymarket-smoke-${activeTab.toLowerCase()}.up.railway.app`;
+      // Базовый URL бэкенда текущего таба (BTC/SOL/ETH/DOGE — разные деплои) —
+      // используется и старой fetchData, и новыми ручками (trades/streams/attempts).
+      const baseUrl = `https://polymarket-smoke-${activeTab.toLowerCase()}.up.railway.app`;
 
-            // Функция загрузки данных
-            const fetchData = useCallback((isInitial = false) => {
-                if (isInitial) {
-                    setLoading(true);
-                }
-                setError(null);
-
-                Promise.all([
-                    fetch(`${baseUrl}/analytics/summary`).then((res) => {
-                        if (!res.ok) throw new Error(`Ошибка сети (${activeTab}, summary). Проверьте CORS или доступность бекенда.`);
-                        return res.json();
-                    }),
-                    fetch(`${baseUrl}/analytics/losses?limit=50`).then((res) => {
-                        if (!res.ok) throw new Error(`Ошибка сети (${activeTab}, losses). Проверьте CORS или доступность бекенда.`);
-                        return res.json();
-                    }),
-                ])
-                    .then(([summaryJson, lossesJson]) => {
-                        setData(summaryJson);
-                        setLosses(lossesJson);
-                        setLoading(false);
-                        setLastUpdated(new Date());
-                        setSecondsLeft(REFRESH_INTERVAL_SEC);
-                    })
-                    .catch((err) => {
-                        setError(err.message);
-                        setLoading(false);
-                    });
-            }, [activeTab]);
-
-            // Сохранение переключенной вкладки в sessionStorage и первичный запрос
-            const handleTabChange = (market) => {
-                setActiveTab(market);
-                sessionStorage.setItem('activeTab', market);
-                setActiveStream('all');
-            };
-
-            // Запрос при смене активного таба
-            useEffect(() => {
-                fetchData(true);
-            }, [fetchData]);
-
-            // Эффект для обратного отсчета и таймера автообновления каждые 60 секунд
-            useEffect(() => {
-                if (!isAutoRefreshEnabled) return;
-
-                const timer = setInterval(() => {
-                    setSecondsLeft((prev) => {
-                        if (prev <= 1) {
-                            fetchData(false);
-                            return REFRESH_INTERVAL_SEC;
-                        }
-                        return prev - 1;
-                    });
-                }, 1000);
-
-                return () => clearInterval(timer);
-            }, [isAutoRefreshEnabled, fetchData]);
-
-            // Переключение активности автообновления по клику на футер
-            const toggleAutoRefresh = () => {
-                if (!isAutoRefreshEnabled) {
-                    setIsAutoRefreshEnabled(true);
-                    fetchData(false); // сразу подтягиваем свежие данные при повторном включении
-                } else {
-                    setIsAutoRefreshEnabled(false);
-                }
-            };
-
-            // --- Сессия 6, п.1: отдельная лёгкая ручка /analytics/trades ---
-            const fetchTrades = useCallback(() => {
-                setTradesLoading(true);
-                setActionError(null);
-                const qs = activeStream !== 'all' ? `&streamKey=${encodeURIComponent(activeStream)}` : '';
-                fetch(`${baseUrl}/analytics/trades?limit=150${qs}`)
-                    .then((res) => {
-                        if (!res.ok) throw new Error(`Ошибка сети (${activeTab}, trades).`);
-                        return res.json();
-                    })
-                    .then((json) => setTrades(json))
-                    .catch((err) => setActionError(err.message))
-                    .finally(() => setTradesLoading(false));
-            }, [baseUrl, activeTab, activeStream]);
-
-            // Подгружаем сделки лениво: только когда открыт саб-таб "Сделки", и
-            // перезагружаем при смене таба бэкенда/потока или тике автообновления.
-            useEffect(() => {
-                if (view === 'trades') fetchTrades();
-            }, [view, fetchTrades, secondsLeft === REFRESH_INTERVAL_SEC]);
-
-            // --- Сессия 6, п.3/п.4: drill-down по потоку и по попытке ---
-            const openStream = (streamKey) => {
-                setStreamDetail({ streamKey, data: null, loading: true, error: null });
-                fetch(`${baseUrl}/analytics/streams/${encodeURIComponent(streamKey)}`)
-                    .then((res) => {
-                        if (!res.ok) throw new Error('Не удалось загрузить поток.');
-                        return res.json();
-                    })
-                    .then((json) => setStreamDetail({ streamKey, data: json, loading: false, error: null }))
-                    .catch((err) => setStreamDetail({ streamKey, data: null, loading: false, error: err.message }));
-            };
-
-            const openAttempt = (id) => {
-                setAttemptDetail({ id, data: null, loading: true, error: null });
-                fetch(`${baseUrl}/analytics/attempts/${encodeURIComponent(id)}`)
-                    .then((res) => {
-                        if (!res.ok) throw new Error('Не удалось загрузить попытку.');
-                        return res.json();
-                    })
-                    .then((json) => setAttemptDetail({ id, data: json, loading: false, error: null }))
-                    .catch((err) => setAttemptDetail({ id, data: null, loading: false, error: err.message }));
-            };
-
-            // --- Сессия 6, п.5: досрочное закрытие попытки ---
-            const closeEarly = (id) => {
-                if (!window.confirm('Закрыть попытку досрочно и зафиксировать текущий профит? Поток сразу продолжит новую попытку с базовым стейком.')) {
-                    return;
-                }
-                setClosingId(id);
-                setActionError(null);
-                fetch(`${baseUrl}/trading/attempts/${encodeURIComponent(id)}/close-early`, { method: 'POST' })
-                    .then((res) => {
-                        if (!res.ok) return res.json().then((j) => { throw new Error(j.message || 'Не удалось закрыть попытку.'); });
-                        return res.json();
-                    })
-                    .then(() => {
-                        fetchData(false);
-                        if (view === 'trades') fetchTrades();
-                        if (attemptDetail) setAttemptDetail(null);
-                    })
-                    .catch((err) => setActionError(err.message))
-                    .finally(() => setClosingId(null));
-            };
-
-            const renderContent = () => {
-                if (loading) return <div className="py-12 text-center text-gray-500 font-sans">Загрузка аналитики {activeTab}...</div>;
-                if (error || !data) return <div className="py-12 text-center text-red-500 font-sans">Ошибка: {error}</div>;
-
-                const winRate = data.totals.wins + data.totals.losses > 0
-                    ? ((data.totals.wins / (data.totals.wins + data.totals.losses)) * 100).toFixed(1)
-                    : 0;
-
-                const streamKeys = [...new Set((data.byAsset || []).map((a) => a.assetPrefix))].sort();
-                const inStream = (key) => activeStream === 'all' || key === activeStream;
-
-                const filteredByAsset = (data.byAsset || []).filter((a) => inStream(a.assetPrefix));
-                const filteredBestByStream = (data.bestByStream || []).filter((a) => inStream(a.streamKey));
-                const filteredAttempts = (data.attempts || []).filter((a) => inStream(a.streamKey));
-                const filteredLosses = (losses || []).filter((l) => inStream(l.assetPrefix));
-                const filteredStale = (data.staleUnresolved || []).filter((s) => inStream(s.assetPrefix));
-
-                const streamSummary = filteredByAsset.reduce(
-                    (acc, r) => ({ wins: acc.wins + r.wins, losses: acc.losses + r.losses, profit: acc.profit + r.profit }),
-                    { wins: 0, losses: 0, profit: 0 },
-                );
-
-                return (
-                    <div className="animate-fade-in transition-opacity">
-                        {filteredStale.length > 0 && (
-                            <div className="bg-amber-50 border border-amber-300 text-amber-800 rounded-xl p-4 mb-8">
-                                <div className="font-semibold mb-2">⚠ Есть маркеты, зависшие в pending_resolve дольше нормы</div>
-                                <ul className="text-sm space-y-1">
-                                    {filteredStale.map((s) => (
-                                        <li key={s.slug}>
-                                            {s.assetPrefix} / {s.slug} — висит {s.ageSec}с (с {new Date(s.createdAt).toLocaleString()})
-                                        </li>
-                                    ))}
-                                </ul>
-                            </div>
-                        )}
-
-                        {/* Табы по потокам внутри текущего бэкенда */}
-                        {streamKeys.length > 0 && (
-                            <div className="flex flex-wrap gap-1 bg-gray-200/50 p-1 rounded-lg mb-6 w-fit">
-                                <button
-                                    onClick={() => setActiveStream('all')}
-                                    className={`px-4 py-1.5 rounded-md font-medium text-sm transition-all duration-200 ${
-                                        activeStream === 'all' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'
-                                    }`}
-                                >
-                                    Все
-                                </button>
-                                {streamKeys.map((key) => (
-                                    <button
-                                        key={key}
-                                        onClick={() => setActiveStream(key)}
-                                        className={`px-4 py-1.5 rounded-md font-medium text-sm transition-all duration-200 ${
-                                            activeStream === key ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'
-                                        }`}
-                                    >
-                                        {key}
-                                    </button>
-                                ))}
-                            </div>
-                        )}
-
-                        {/* Топ метрики */}
-                        <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
-                            <MetricCard title="Bankroll (Smoke)" value={`$${data.currentBankroll.smoke}`} />
-                            <MetricCard title="Win Rate" value={`${winRate}%`} subtext={`${data.totals.wins}W / ${data.totals.losses}L`} />
-                            <MetricCard title="Markets Scanned" value={data.totals.marketsScanned} />
-                            <MetricCard title="Bets Placed" value={data.totals.betsPlaced} />
-                        </div>
-
-                        {/* Сколько именно принёс/заработал/проиграл ВЫБРАННЫЙ поток */}
-                        {activeStream !== 'all' && (
-                            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
-                                <MetricCard title={`${activeStream} — Wins`} value={streamSummary.wins} />
-                                <MetricCard title={`${activeStream} — Losses`} value={streamSummary.losses} />
-                                <MetricCard
-                                    title={`${activeStream} — Profit`}
-                                    value={`${streamSummary.profit >= 0 ? '+' : ''}$${streamSummary.profit.toFixed(2)}`}
-                                />
-                            </div>
-                        )}
-
-                        {/* Лучшая попытка по каждому независимому потоку */}
-                        {filteredBestByStream.length > 0 && (
-                            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
-                                {filteredBestByStream.map((a) => (
-                                    <div key={a.streamKey} className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
-                                        <button
-                                            onClick={() => openStream(a.streamKey)}
-                                            className="text-sm font-semibold mb-1 text-gray-500 uppercase tracking-wide hover:text-blue-600 hover:underline"
-                                        >
-                                            {a.streamKey}
-                                        </button>
-                                        <div className="flex items-center justify-between mb-2">
-                                            <span className="text-sm font-medium text-gray-600">
-                                                Step {a.reachedStep} of {a.targetSteps}
-                                            </span>
-                                            <span className={`px-3 py-1 rounded-full text-xs font-semibold uppercase ${a.status === 'active' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
-                                                {a.status}
-                                            </span>
-                                        </div>
-                                        <ProgressBar reached={a.reachedStep} target={a.targetSteps} />
-                                        <div className="flex items-center justify-between mt-2">
-                                            <p className="text-xs text-gray-500">
-                                                {a.id ? (
-                                                    <button className="hover:underline hover:text-blue-600" onClick={() => openAttempt(a.id)}>
-                                                        Attempt #{a.attemptNumber}
-                                                    </button>
-                                                ) : (
-                                                    <>Attempt #{a.attemptNumber}</>
-                                                )}
-                                                {' '}— current stake ${Number(a.currentStake).toFixed(2)}
-                                            </p>
-                                            {a.status === 'active' && a.id && (
-                                                <button
-                                                    disabled={closingId === a.id}
-                                                    onClick={() => closeEarly(a.id)}
-                                                    className="text-xs font-semibold text-amber-700 hover:underline disabled:opacity-50"
-                                                >
-                                                    {closingId === a.id ? 'Закрываю…' : 'Закрыть досрочно'}
-                                                </button>
-                                            )}
-                                        </div>
-                                    </div>
-                                ))}
-                            </div>
-                        )}
-
-                        {/* История попыток */}
-                        <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden mb-8">
-                            <div className="p-6 border-b border-gray-100 flex items-center justify-between gap-4">
-                                <h2 className="text-xl font-semibold text-gray-800">Attempts History{activeStream !== 'all' ? ` — ${activeStream}` : ''}</h2>
-                                <button
-                                    onClick={() => setView('trades')}
-                                    className="text-sm font-medium text-blue-600 hover:text-blue-800"
-                                >
-                                    Открыть ленту сделок →
-                                </button>
-                            </div>
-                            <div className="overflow-x-auto">
-                                <table className="w-full text-left border-collapse">
-                                    <thead>
-                                        <tr className="bg-gray-50 text-gray-600 text-sm">
-                                            <th className="p-4 font-medium">Stream</th>
-                                            <th className="p-4 font-medium">Attempt</th>
-                                            <th className="p-4 font-medium">Status</th>
-                                            <th className="p-4 font-medium">Progress</th>
-                                            <th className="p-4 font-medium">Stake</th>
-                                            <th className="p-4 font-medium">Started</th>
-                                            <th className="p-4 font-medium">Actions</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody className="divide-y divide-gray-100">
-                                        {filteredAttempts.map((attempt) => (
-                                            <tr key={`${attempt.isSmoke}-${attempt.streamKey}-${attempt.attemptNumber}`} className="hover:bg-gray-50 transition-colors">
-                                                <td className="p-4 text-xs text-gray-500">
-                                                    <button className="hover:underline hover:text-blue-600" onClick={() => openStream(attempt.streamKey)}>
-                                                        {attempt.streamKey}
-                                                    </button>
-                                                </td>
-                                                <td className="p-4 font-medium">
-                                                    {attempt.id ? (
-                                                        <button className="hover:underline hover:text-blue-600" onClick={() => openAttempt(attempt.id)}>
-                                                            #{attempt.attemptNumber}
-                                                        </button>
-                                                    ) : (
-                                                        <span>#{attempt.attemptNumber}</span>
-                                                    )}
-                                                </td>
-                                                <td className="p-4">
-                                                    <span className={`px-2 py-1 rounded-md text-xs font-semibold uppercase ${attempt.status === 'active' ? 'bg-green-100 text-green-700' : attempt.status === 'closed_early' ? 'bg-amber-100 text-amber-700' : 'bg-red-100 text-red-700'}`}>
-                                                        {attempt.status}
-                                                    </span>
-                                                </td>
-                                                <td className="p-4 w-1/3">
-                                                    <div className="flex items-center gap-3">
-                                                        <span className="text-xs text-gray-500 w-12">{attempt.reachedStep}/{attempt.targetSteps}</span>
-                                                        <ProgressBar reached={attempt.reachedStep} target={attempt.targetSteps} />
-                                                    </div>
-                                                </td>
-                                                <td className="p-4 text-sm text-gray-500">${Number(attempt.currentStake).toFixed(2)}</td>
-                                                <td className="p-4 text-sm text-gray-500">
-                                                    {new Date(attempt.createdAt).toLocaleString()}
-                                                </td>
-                                                <td className="p-4 text-sm">
-                                                    {attempt.status === 'active' && attempt.id && (
-                                                        <button
-                                                            disabled={closingId === attempt.id}
-                                                            onClick={() => closeEarly(attempt.id)}
-                                                            className="px-2 py-1 rounded-md text-xs font-semibold bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100 disabled:opacity-50"
-                                                        >
-                                                            {closingId === attempt.id ? 'Закрываю…' : 'Закрыть досрочно'}
-                                                        </button>
-                                                    )}
-                                                </td>
-                                            </tr>
-                                        ))}
-                                    </tbody>
-                                </table>
-                            </div>
-                        </div>
-
-                        {/* Разбор сливов */}
-                        <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
-                            <div className="p-6 border-b border-gray-100">
-                                <h2 className="text-xl font-semibold text-gray-800">Recent Losses — Diagnostics{activeStream !== 'all' ? ` (${activeStream})` : ''}</h2>
-                            </div>
-                            <div className="overflow-x-auto">
-                                <table className="w-full text-left border-collapse">
-                                    <thead>
-                                        <tr className="bg-gray-50 text-gray-600 text-sm">
-                                            <th className="p-4 font-medium">Date</th>
-                                            <th className="p-4 font-medium">Market</th>
-                                            <th className="p-4 font-medium">Side</th>
-                                            <th className="p-4 font-medium">Profit</th>
-                                            <th className="p-4 font-medium">ATR ratio (entry)</th>
-                                            <th className="p-4 font-medium">Reason</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody className="divide-y divide-gray-100">
-                                        {filteredLosses.length === 0 && (
-                                            <tr><td className="p-4 text-sm text-gray-400" colSpan="6">Сливов пока нет.</td></tr>
-                                        )}
-                                        {filteredLosses.map((log) => (
-                                            <tr key={log.slug} className="hover:bg-gray-50 transition-colors align-top">
-                                                <td className="p-4 text-sm text-gray-500 whitespace-nowrap">
-                                                    {log.resolvedAt ? new Date(log.resolvedAt).toLocaleString() : '—'}
-                                                </td>
-                                                <td className="p-4 text-sm">
-                                                    <div className="font-medium">{log.assetPrefix}</div>
-                                                    <div className="text-gray-400">{log.slug}</div>
-                                                </td>
-                                                <td className="p-4 text-sm">{log.chosenOutcome ?? '—'}</td>
-                                                <td className="p-4 text-sm text-red-600 font-medium">
-                                                    {log.profit != null ? `$${log.profit.toFixed(2)}` : '—'}
-                                                </td>
-                                                <td className="p-4 text-sm">
-                                                    {log.atrRatioAtEntry != null ? `${log.atrRatioAtEntry.toFixed(2)}x` : '—'}
-                                                </td>
-                                                <td className="p-4 text-sm text-gray-600 max-w-md">{log.failReason ?? '—'}</td>
-                                            </tr>
-                                        ))}
-                                    </tbody>
-                                </table>
-                            </div>
-                        </div>
-                    </div>
-                );
-            };
-
-            // Сколько секунд прошло с момента последнего обновления
-            const timeSinceUpdate = lastUpdated
-                ? Math.floor((new Date() - lastUpdated) / 1000)
-                : 0;
-
-            return (
-                <div className="min-h-screen flex flex-col justify-between max-w-6xl mx-auto p-6 font-sans text-gray-800">
-                    <div>
-                        <div className="flex flex-col md:flex-row md:items-center justify-between mb-6 gap-4">
-                            <h1 className="text-3xl font-bold text-gray-900">Bot Analytics Dashboard</h1>
-
-                            {/* Навигация табов */}
-                            <div className="flex flex-wrap gap-1 bg-gray-200/50 p-1 rounded-lg">
-                                {MARKETS.map((market) => (
-                                    <button
-                                        key={market}
-                                        onClick={() => handleTabChange(market)}
-                                        className={`px-6 py-2 rounded-md font-medium text-sm transition-all duration-200 ${
-                                            activeTab === market
-                                                ? 'bg-white text-blue-600 shadow-sm'
-                                                : 'text-gray-500 hover:text-gray-700'
-                                        }`}
-                                    >
-                                        {market}
-                                    </button>
-                                ))}
-                            </div>
-                        </div>
-
-                        {/* Саб-табы: сводный дашборд / лента сделок (Сессия 6, п.1) */}
-                        <div className="flex gap-1 bg-gray-200/50 p-1 rounded-lg mb-6 w-fit">
-                            <button
-                                onClick={() => setView('summary')}
-                                className={`px-4 py-1.5 rounded-md font-medium text-sm transition-all duration-200 ${view === 'summary' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
-                            >
-                                Summary
-                            </button>
-                            <button
-                                onClick={() => setView('trades')}
-                                className={`px-4 py-1.5 rounded-md font-medium text-sm transition-all duration-200 ${view === 'trades' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
-                            >
-                                Сделки
-                            </button>
-                        </div>
-
-                        {actionError && (
-                            <div className="bg-red-50 border border-red-200 text-red-700 text-sm rounded-lg p-3 mb-4">
-                                {actionError}
-                            </div>
-                        )}
-
-                        {/* Отрисовка контента */}
-                        {view === 'summary'
-                            ? renderContent()
-                            : (
-                                <TradesView
-                                    trades={trades}
-                                    loading={tradesLoading}
-                                    onOpenStream={openStream}
-                                    onOpenAttempt={openAttempt}
-                                    onCloseEarly={closeEarly}
-                                    closingId={closingId}
-                                />
-                            )}
-                    </div>
-
-                    {streamDetail && (
-                        <DetailModal onClose={() => setStreamDetail(null)} title={`Поток: ${streamDetail.streamKey}`}>
-                            <StreamDetailBody detail={streamDetail} onOpenAttempt={openAttempt} onCloseEarly={closeEarly} closingId={closingId} />
-                        </DetailModal>
-                    )}
-
-                    {attemptDetail && (
-                        <DetailModal onClose={() => setAttemptDetail(null)} title={`Попытка ${attemptDetail.data ? '#' + attemptDetail.data.attempt.attemptNumber : ''}`}>
-                            <AttemptDetailBody detail={attemptDetail} onCloseEarly={closeEarly} closingId={closingId} />
-                        </DetailModal>
-                    )}
-
-                    {/* Интерактивный футер с информацией об автообновлении */}
-                    <footer className="mt-12 pt-6 border-t border-gray-200 text-center text-xs text-gray-500">
-                        <div
-                            onClick={toggleAutoRefresh}
-                            className="inline-flex items-center gap-2 cursor-pointer select-none bg-gray-100 hover:bg-gray-200 text-gray-600 px-4 py-2 rounded-full transition-colors"
-                            title="Нажмите, чтобы включить/отключить автообновление"
-                        >
-                            <span className={`w-2 h-2 rounded-full ${isAutoRefreshEnabled ? 'bg-green-500 animate-pulse' : 'bg-red-400'}`}></span>
-                            {isAutoRefreshEnabled ? (
-                                <span>
-                                    Обновлено {timeSinceUpdate} сек. назад • Следующее через {secondsLeft} сек. <span className="text-gray-400">(нажмите для паузы)</span>
-                                </span>
-                            ) : (
-                                <span className="font-medium text-amber-700">
-                                    Автообновление: отключено <span className="text-gray-400">(нажмите, чтобы включить)</span>
-                                </span>
-                            )}
-                        </div>
-                    </footer>
-                </div>
-            );
+      // Функция загрузки данных
+      const fetchData = useCallback((isInitial = false) => {
+        if (isInitial) {
+          setLoading(true);
         }
+        setError(null);
 
-        // --- Сессия 6: статус-бейдж, лента сделок, модалка drill-down ---
-        function statusBadgeClass(status) {
-            if (status === 'win' || status === 'active') return 'bg-green-100 text-green-700';
-            if (status === 'pending_resolve') return 'bg-blue-100 text-blue-700';
-            if (status === 'closed_early') return 'bg-amber-100 text-amber-700';
-            if (status === 'skipped' || status === 'unfilled') return 'bg-gray-100 text-gray-600';
-            return 'bg-red-100 text-red-700';
+        Promise.all([
+          fetch(`${baseUrl}/analytics/summary`).then((res) => {
+            if (!res.ok) throw new Error(`Ошибка сети (${activeTab}, summary). Проверьте CORS или доступность бекенда.`);
+            return res.json();
+          }),
+          fetch(`${baseUrl}/analytics/losses?limit=50`).then((res) => {
+            if (!res.ok) throw new Error(`Ошибка сети (${activeTab}, losses). Проверьте CORS или доступность бекенда.`);
+            return res.json();
+          }),
+        ])
+          .then(([summaryJson, lossesJson]) => {
+            setData(summaryJson);
+            setLosses(lossesJson);
+            setLoading(false);
+            setLastUpdated(new Date());
+            setSecondsLeft(REFRESH_INTERVAL_SEC);
+          })
+          .catch((err) => {
+            setError(err.message);
+            setLoading(false);
+          });
+      }, [activeTab]);
+
+      // Сохранение переключенной вкладки в sessionStorage и первичный запрос
+      const handleTabChange = (market) => {
+        setActiveTab(market);
+        sessionStorage.setItem('activeTab', market);
+        setActiveStream('all');
+      };
+
+      // Запрос при смене активного таба
+      useEffect(() => {
+        fetchData(true);
+      }, [fetchData]);
+
+      // Эффект для обратного отсчета и таймера автообновления каждые 60 секунд
+      useEffect(() => {
+        if (!isAutoRefreshEnabled) return;
+
+        const timer = setInterval(() => {
+          setSecondsLeft((prev) => {
+            if (prev <= 1) {
+              fetchData(false);
+              return REFRESH_INTERVAL_SEC;
+            }
+            return prev - 1;
+          });
+        }, 1000);
+
+        return () => clearInterval(timer);
+      }, [isAutoRefreshEnabled, fetchData]);
+
+      // Переключение активности автообновления по клику на футер
+      const toggleAutoRefresh = () => {
+        if (!isAutoRefreshEnabled) {
+          setIsAutoRefreshEnabled(true);
+          fetchData(false); // сразу подтягиваем свежие данные при повторном включении
+        } else {
+          setIsAutoRefreshEnabled(false);
         }
+      };
 
-        function TradesView({ trades, loading, onOpenStream, onOpenAttempt, onCloseEarly, closingId }) {
-            if (loading && !trades) return <div className="py-12 text-center text-gray-500 font-sans">Загрузка сделок...</div>;
-            if (!trades || trades.length === 0) return <div className="py-12 text-center text-gray-400 font-sans">Сделок пока нет.</div>;
+      // --- Сессия 6, п.1: отдельная лёгкая ручка /analytics/trades ---
+      const fetchTrades = useCallback(() => {
+        setTradesLoading(true);
+        setActionError(null);
+        const qs = activeStream !== 'all' ? `&streamKey=${encodeURIComponent(activeStream)}` : '';
 
-            return (
-                <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
-                    <div className="p-6 border-b border-gray-100">
-                        <h2 className="text-xl font-semibold text-gray-800">Лента сделок (все потоки, активные + история)</h2>
-                        <p className="text-xs text-gray-400 mt-1">Отдельная лёгкая ручка /analytics/trades — не влияет на загрузку Summary.</p>
-                    </div>
-                    <div className="overflow-x-auto">
-                        <table className="w-full text-left border-collapse">
-                            <thead>
-                                <tr className="bg-gray-50 text-gray-600 text-sm">
-                                    <th className="p-4 font-medium">Stream / Attempt / Step</th>
-                                    <th className="p-4 font-medium">Mode</th>
-                                    <th className="p-4 font-medium">Status</th>
-                                    <th className="p-4 font-medium">Side</th>
-                                    <th className="p-4 font-medium">Entry Price</th>
-                                    <th className="p-4 font-medium">Amount</th>
-                                    <th className="p-4 font-medium">Profit</th>
-                                    <th className="p-4 font-medium">Event</th>
-                                    <th className="p-4 font-medium">When</th>
-                                </tr>
-                            </thead>
-                            <tbody className="divide-y divide-gray-100">
-                                {trades.map((t) => (
-                                    <tr key={t.id} className="hover:bg-gray-50 transition-colors align-top">
-                                        <td className="p-4 text-xs">
-                                            <button className="font-medium hover:underline hover:text-blue-600 block" onClick={() => onOpenStream(t.streamKey)}>
-                                                {t.streamKey}
-                                            </button>
-                                            <button className="text-gray-400 hover:underline hover:text-blue-600" onClick={() => onOpenAttempt(t.attemptId)}>
-                                                попытка #{t.attemptNumber ?? '?'} / шаг {t.stepNumber}
-                                            </button>
-                                        </td>
-                                        <td className="p-4 text-xs font-semibold">
-                                            <span className={`px-2 py-0.5 rounded ${t.isSmoke ? 'bg-gray-100 text-gray-600' : 'bg-purple-100 text-purple-700'}`}>
-                                                {t.isSmoke ? 'SMOKE' : 'LIVE'}
-                                            </span>
-                                            {t.stakePredicted && (
-                                                <span
-                                                    title="Сумма ставки взята из pre_resolve-предсказания исхода предыдущего шага по Chainlink, официальный резолв Gamma ещё не подтверждал её на момент открытия."
-                                                    className="ml-1 px-2 py-0.5 rounded bg-indigo-100 text-indigo-700 whitespace-nowrap"
-                                                >
-                                                    прогноз
-                                                </span>
-                                            )}
-                                        </td>
-                                        <td className="p-4">
-                                            <span className={`px-2 py-1 rounded-md text-xs font-semibold uppercase ${statusBadgeClass(t.status)}`}>
-                                                {t.status}
-                                            </span>
-                                        </td>
-                                        <td className="p-4 text-sm">{t.chosenOutcome ?? '—'}</td>
-                                        <td className="p-4 text-sm">{t.entryPrice != null ? `¢${(t.entryPrice * 100).toFixed(2)}` : '—'}</td>
-                                        <td className="p-4 text-sm">
-                                            <div>${Number(t.filledAmount ?? t.betAmount ?? 0).toFixed(2)}</div>
-                                            {t.fillRatio != null && t.fillRatio < 0.999 && (
-                                                <div className="text-xs text-amber-600">{(t.fillRatio * 100).toFixed(0)}% fill</div>
-                                            )}
-                                        </td>
-                                        <td className={`p-4 text-sm font-medium ${t.profit == null ? 'text-gray-400' : t.profit >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                                            {t.profit != null ? `${t.profit >= 0 ? '+' : ''}$${t.profit.toFixed(2)}` : '—'}
-                                            {t.profitPct != null && (
-                                                <div className="text-xs font-normal text-gray-400">{t.profitPct >= 0 ? '+' : ''}{t.profitPct.toFixed(1)}%</div>
-                                            )}
-                                        </td>
-                                        <td className="p-4 text-sm">
-                                            <a href={t.eventUrl} target="_blank" rel="noreferrer" className="text-blue-600 hover:underline">
-                                                Событие ↗
-                                            </a>
-                                        </td>
-                                        <td className="p-4 text-xs text-gray-500 whitespace-nowrap">
-                                            {new Date(t.createdAt).toLocaleString()}
-                                        </td>
-                                    </tr>
-                                ))}
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-            );
+        // Запрашиваем с запасом (например, limit=1000)
+        fetch(`${baseUrl}/analytics/trades?limit=1000${qs}`)
+          .then((res) => {
+            if (!res.ok) throw new Error(`Ошибка сети (${activeTab}, trades).`);
+            return res.json();
+          })
+          .then((json) => {
+            // Поддержка нового формата { data: [...], meta: {...} } 
+            // с фоллбеком на старый чистый массив
+            const tradesList = Array.isArray(json) ? json : (json?.data || []);
+            setTrades(tradesList);
+          })
+          .catch((err) => setActionError(err.message))
+          .finally(() => setTradesLoading(false));
+      }, [baseUrl, activeTab, activeStream]);
+
+      // Подгружаем сделки лениво: только когда открыт саб-таб "Сделки", и
+      // перезагружаем при смене таба бэкенда/потока или тике автообновления.
+      useEffect(() => {
+        if (view === 'trades') fetchTrades();
+      }, [view, fetchTrades, secondsLeft === REFRESH_INTERVAL_SEC]);
+
+      // --- Сессия 6, п.3/п.4: drill-down по потоку и по попытке ---
+      const openStream = (streamKey) => {
+        setStreamDetail({ streamKey, data: null, loading: true, error: null });
+        fetch(`${baseUrl}/analytics/streams/${encodeURIComponent(streamKey)}`)
+          .then((res) => {
+            if (!res.ok) throw new Error('Не удалось загрузить поток.');
+            return res.json();
+          })
+          .then((json) => setStreamDetail({ streamKey, data: json, loading: false, error: null }))
+          .catch((err) => setStreamDetail({ streamKey, data: null, loading: false, error: err.message }));
+      };
+
+      const openAttempt = (id) => {
+        setAttemptDetail({ id, data: null, loading: true, error: null });
+        fetch(`${baseUrl}/analytics/attempts/${encodeURIComponent(id)}`)
+          .then((res) => {
+            if (!res.ok) throw new Error('Не удалось загрузить попытку.');
+            return res.json();
+          })
+          .then((json) => setAttemptDetail({ id, data: json, loading: false, error: null }))
+          .catch((err) => setAttemptDetail({ id, data: null, loading: false, error: err.message }));
+      };
+
+      // --- Сессия 6, п.5: досрочное закрытие попытки ---
+      const closeEarly = (id) => {
+        if (!window.confirm('Закрыть попытку досрочно и зафиксировать текущий профит? Поток сразу продолжит новую попытку с базовым стейком.')) {
+          return;
         }
+        setClosingId(id);
+        setActionError(null);
+        fetch(`${baseUrl}/trading/attempts/${encodeURIComponent(id)}/close-early`, { method: 'POST' })
+          .then((res) => {
+            if (!res.ok) return res.json().then((j) => { throw new Error(j.message || 'Не удалось закрыть попытку.'); });
+            return res.json();
+          })
+          .then(() => {
+            fetchData(false);
+            if (view === 'trades') fetchTrades();
+            if (attemptDetail) setAttemptDetail(null);
+          })
+          .catch((err) => setActionError(err.message))
+          .finally(() => setClosingId(null));
+      };
 
-        function DetailModal({ title, onClose, children }) {
-            return (
-                <div className="fixed inset-0 bg-black/40 flex items-start justify-center p-4 md:p-10 z-50 overflow-y-auto" onClick={onClose}>
-                    <div
-                        className="bg-white rounded-xl shadow-xl max-w-4xl w-full p-6 mt-4"
-                        onClick={(e) => e.stopPropagation()}
+      const renderContent = () => {
+        if (loading) return <div className="py-12 text-center text-gray-500 font-sans">Загрузка аналитики {activeTab}...</div>;
+        if (error || !data) return <div className="py-12 text-center text-red-500 font-sans">Ошибка: {error}</div>;
+
+        const winRate = data.totals.wins + data.totals.losses > 0
+          ? ((data.totals.wins / (data.totals.wins + data.totals.losses)) * 100).toFixed(1)
+          : 0;
+
+        const streamKeys = [...new Set((data.byAsset || []).map((a) => a.assetPrefix))].sort();
+        const inStream = (key) => activeStream === 'all' || key === activeStream;
+
+        const filteredByAsset = (data.byAsset || []).filter((a) => inStream(a.assetPrefix));
+        const filteredBestByStream = (data.bestByStream || []).filter((a) => inStream(a.streamKey));
+        const filteredAttempts = (data.attempts || []).filter((a) => inStream(a.streamKey));
+        const filteredLosses = (losses || []).filter((l) => inStream(l.assetPrefix));
+        const filteredStale = (data.staleUnresolved || []).filter((s) => inStream(s.assetPrefix));
+
+        const streamSummary = filteredByAsset.reduce(
+          (acc, r) => ({ wins: acc.wins + r.wins, losses: acc.losses + r.losses, profit: acc.profit + r.profit }),
+          { wins: 0, losses: 0, profit: 0 },
+        );
+
+        return (
+          <div className="animate-fade-in transition-opacity">
+            {filteredStale.length > 0 && (
+              <div className="bg-amber-50 border border-amber-300 text-amber-800 rounded-xl p-4 mb-8">
+                <div className="font-semibold mb-2">⚠ Есть маркеты, зависшие в pending_resolve дольше нормы</div>
+                <ul className="text-sm space-y-1">
+                  {filteredStale.map((s) => (
+                    <li key={s.slug}>
+                      {s.assetPrefix} / {s.slug} — висит {s.ageSec}с (с {new Date(s.createdAt).toLocaleString()})
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {/* Табы по потокам внутри текущего бэкенда */}
+            {streamKeys.length > 0 && (
+              <div className="flex flex-wrap gap-1 bg-gray-200/50 p-1 rounded-lg mb-6 w-fit">
+                <button
+                  onClick={() => setActiveStream('all')}
+                  className={`px-4 py-1.5 rounded-md font-medium text-sm transition-all duration-200 ${activeStream === 'all' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'
+                    }`}
+                >
+                  Все
+                </button>
+                {streamKeys.map((key) => (
+                  <button
+                    key={key}
+                    onClick={() => setActiveStream(key)}
+                    className={`px-4 py-1.5 rounded-md font-medium text-sm transition-all duration-200 ${activeStream === key ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'
+                      }`}
+                  >
+                    {key}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* Топ метрики */}
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+              <MetricCard title="Bankroll (Smoke)" value={`$${data.currentBankroll.smoke}`} />
+              <MetricCard title="Win Rate" value={`${winRate}%`} subtext={`${data.totals.wins}W / ${data.totals.losses}L`} />
+              <MetricCard title="Markets Scanned" value={data.totals.marketsScanned} />
+              <MetricCard title="Bets Placed" value={data.totals.betsPlaced} />
+            </div>
+
+            {/* Сколько именно принёс/заработал/проиграл ВЫБРАННЫЙ поток */}
+            {activeStream !== 'all' && (
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+                <MetricCard title={`${activeStream} — Wins`} value={streamSummary.wins} />
+                <MetricCard title={`${activeStream} — Losses`} value={streamSummary.losses} />
+                <MetricCard
+                  title={`${activeStream} — Profit`}
+                  value={`${streamSummary.profit >= 0 ? '+' : ''}$${streamSummary.profit.toFixed(2)}`}
+                />
+              </div>
+            )}
+
+            {/* Лучшая попытка по каждому независимому потоку */}
+            {filteredBestByStream.length > 0 && (
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+                {filteredBestByStream.map((a) => (
+                  <div key={a.streamKey} className="bg-white p-6 rounded-xl shadow-sm border border-gray-100">
+                    <button
+                      onClick={() => openStream(a.streamKey)}
+                      className="text-sm font-semibold mb-1 text-gray-500 uppercase tracking-wide hover:text-blue-600 hover:underline"
                     >
-                        <div className="flex items-center justify-between mb-4">
-                            <h3 className="text-lg font-semibold text-gray-900">{title}</h3>
-                            <button onClick={onClose} className="text-gray-400 hover:text-gray-700 text-xl leading-none">×</button>
-                        </div>
-                        {children}
+                      {a.streamKey}
+                    </button>
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-sm font-medium text-gray-600">
+                        Step {a.reachedStep} of {a.targetSteps}
+                      </span>
+                      <span className={`px-3 py-1 rounded-full text-xs font-semibold uppercase ${a.status === 'active' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                        {a.status}
+                      </span>
                     </div>
-                </div>
-            );
-        }
-
-        // Компактная таблица шагов — переиспользуется и в StreamDetailBody, и в AttemptDetailBody.
-        function StepsTable({ steps, onOpenAttempt }) {
-            if (!steps || steps.length === 0) return <div className="text-sm text-gray-400 py-4">Ставок пока нет.</div>;
-            return (
-                <div className="overflow-x-auto border border-gray-100 rounded-lg">
-                    <table className="w-full text-left border-collapse text-sm">
-                        <thead>
-                            <tr className="bg-gray-50 text-gray-600">
-                                {onOpenAttempt && <th className="p-3 font-medium">Attempt</th>}
-                                <th className="p-3 font-medium">Step</th>
-                                <th className="p-3 font-medium">Status</th>
-                                <th className="p-3 font-medium">Side</th>
-                                <th className="p-3 font-medium">Entry</th>
-                                <th className="p-3 font-medium">Amount</th>
-                                <th className="p-3 font-medium">Profit</th>
-                                <th className="p-3 font-medium">Event</th>
-                                <th className="p-3 font-medium">When</th>
-                            </tr>
-                        </thead>
-                        <tbody className="divide-y divide-gray-100">
-                            {steps.map((s) => (
-                                <tr key={s.id}>
-                                    {onOpenAttempt && (
-                                        <td className="p-3">
-                                            <button className="hover:underline hover:text-blue-600" onClick={() => onOpenAttempt(s.attemptId)}>
-                                                #{s.attemptNumber ?? '?'}
-                                            </button>
-                                        </td>
-                                    )}
-                                    <td className="p-3">{s.stepNumber}</td>
-                                    <td className="p-3">
-                                        <span className={`px-2 py-0.5 rounded text-xs font-semibold uppercase ${statusBadgeClass(s.status)}`}>{s.status}</span>
-                                        {s.stakePredicted && (
-                                            <span title="Сумма взята из pre_resolve-предсказания, ещё не подтверждена официальным резолвом Gamma" className="ml-1 px-1.5 py-0.5 rounded text-[10px] bg-indigo-100 text-indigo-700">
-                                                прогноз
-                                            </span>
-                                        )}
-                                    </td>
-                                    <td className="p-3">{s.chosenOutcome ?? '—'}</td>
-                                    <td className="p-3">{s.entryPrice != null ? `¢${(s.entryPrice * 100).toFixed(2)}` : '—'}</td>
-                                    <td className="p-3">${Number(s.filledAmount ?? s.betAmount ?? 0).toFixed(2)}</td>
-                                    <td className={`p-3 font-medium ${s.profit == null ? 'text-gray-400' : s.profit >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                                        {s.profit != null ? `${s.profit >= 0 ? '+' : ''}$${s.profit.toFixed(2)}` : '—'}
-                                    </td>
-                                    <td className="p-3">
-                                        <a href={s.eventUrl} target="_blank" rel="noreferrer" className="text-blue-600 hover:underline">↗</a>
-                                    </td>
-                                    <td className="p-3 text-xs text-gray-500 whitespace-nowrap">{new Date(s.createdAt).toLocaleString()}</td>
-                                </tr>
-                            ))}
-                        </tbody>
-                    </table>
-                </div>
-            );
-        }
-
-        function StreamDetailBody({ detail, onOpenAttempt, onCloseEarly, closingId }) {
-            if (detail.loading) return <div className="py-8 text-center text-gray-500">Загрузка...</div>;
-            if (detail.error) return <div className="py-8 text-center text-red-500">Ошибка: {detail.error}</div>;
-            const { data } = detail;
-            return (
-                <div>
-                    <div className="grid grid-cols-3 gap-3 mb-4">
-                        <MetricCard title="Попыток на потоке" value={data.attemptsCount} />
-                        <MetricCard title="Суммарный профит потока" value={`${data.totalProfit >= 0 ? '+' : ''}$${data.totalProfit.toFixed(2)}`} />
-                        <MetricCard title="Активных попыток" value={data.attempts.filter((a) => a.status === 'active').length} />
-                    </div>
-                    <h4 className="text-sm font-semibold text-gray-600 mb-2">Попытки</h4>
-                    <div className="space-y-2 mb-6">
-                        {data.attempts.map((a) => (
-                            <div key={a.id} className="flex items-center justify-between border border-gray-100 rounded-lg p-3">
-                                <div className="flex items-center gap-3">
-                                    <button className="font-medium hover:underline hover:text-blue-600" onClick={() => onOpenAttempt(a.id)}>#{a.attemptNumber}</button>
-                                    <span className={`px-2 py-0.5 rounded text-xs font-semibold uppercase ${statusBadgeClass(a.status)}`}>{a.status}</span>
-                                    <span className="text-xs text-gray-500">{a.reachedStep}/{a.targetSteps} шагов, стейк ${Number(a.currentStake).toFixed(2)}</span>
-                                </div>
-                                {a.status === 'active' && (
-                                    <button
-                                        disabled={closingId === a.id}
-                                        onClick={() => onCloseEarly(a.id)}
-                                        className="px-2 py-1 rounded-md text-xs font-semibold bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100 disabled:opacity-50"
-                                    >
-                                        {closingId === a.id ? 'Закрываю…' : 'Закрыть досрочно'}
-                                    </button>
-                                )}
-                            </div>
-                        ))}
-                    </div>
-                    <h4 className="text-sm font-semibold text-gray-600 mb-2">Ставки (история + активные)</h4>
-                    <StepsTable steps={data.trades} onOpenAttempt={onOpenAttempt} />
-                </div>
-            );
-        }
-
-        function AttemptDetailBody({ detail, onCloseEarly, closingId }) {
-            if (detail.loading) return <div className="py-8 text-center text-gray-500">Загрузка...</div>;
-            if (detail.error) return <div className="py-8 text-center text-red-500">Ошибка: {detail.error}</div>;
-            const { attempt, steps } = detail.data;
-            return (
-                <div>
-                    <div className="flex items-center justify-between mb-4">
-                        <div className="flex items-center gap-3">
-                            <span className={`px-3 py-1 rounded-full text-xs font-semibold uppercase ${statusBadgeClass(attempt.status)}`}>{attempt.status}</span>
-                            <span className="text-sm text-gray-600">{attempt.streamKey} — {attempt.isSmoke ? 'SMOKE' : 'LIVE'}</span>
-                        </div>
-                        {attempt.status === 'active' && (
-                            <button
-                                disabled={closingId === attempt.id}
-                                onClick={() => onCloseEarly(attempt.id)}
-                                className="px-3 py-1.5 rounded-md text-xs font-semibold bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100 disabled:opacity-50"
-                            >
-                                {closingId === attempt.id ? 'Закрываю…' : 'Закрыть досрочно (зафиксировать профит)'}
-                            </button>
+                    <ProgressBar reached={a.reachedStep} target={a.targetSteps} />
+                    <div className="flex items-center justify-between mt-2">
+                      <p className="text-xs text-gray-500">
+                        {a.id ? (
+                          <button className="hover:underline hover:text-blue-600" onClick={() => openAttempt(a.id)}>
+                            Attempt #{a.attemptNumber}
+                          </button>
+                        ) : (
+                          <>Attempt #{a.attemptNumber}</>
                         )}
+                        {' '}— current stake ${Number(a.currentStake).toFixed(2)}
+                      </p>
+                      {a.status === 'active' && a.id && (
+                        <button
+                          disabled={closingId === a.id}
+                          onClick={() => closeEarly(a.id)}
+                          className="text-xs font-semibold text-amber-700 hover:underline disabled:opacity-50"
+                        >
+                          {closingId === a.id ? 'Закрываю…' : 'Закрыть досрочно'}
+                        </button>
+                      )}
                     </div>
-                    <div className="mb-4">
-                        <div className="flex items-center gap-3 mb-2">
-                            <span className="text-xs text-gray-500 w-16">{attempt.reachedStep}/{attempt.targetSteps}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* История попыток */}
+            <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden mb-8">
+              <div className="p-6 border-b border-gray-100 flex items-center justify-between gap-4">
+                <h2 className="text-xl font-semibold text-gray-800">Attempts History{activeStream !== 'all' ? ` — ${activeStream}` : ''}</h2>
+                <button
+                  onClick={() => setView('trades')}
+                  className="text-sm font-medium text-blue-600 hover:text-blue-800"
+                >
+                  Открыть ленту сделок →
+                </button>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse">
+                  <thead>
+                    <tr className="bg-gray-50 text-gray-600 text-sm">
+                      <th className="p-4 font-medium">Stream</th>
+                      <th className="p-4 font-medium">Attempt</th>
+                      <th className="p-4 font-medium">Status</th>
+                      <th className="p-4 font-medium">Progress</th>
+                      <th className="p-4 font-medium">Stake</th>
+                      <th className="p-4 font-medium">Started</th>
+                      <th className="p-4 font-medium">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-100">
+                    {filteredAttempts.map((attempt) => (
+                      <tr key={`${attempt.isSmoke}-${attempt.streamKey}-${attempt.attemptNumber}`} className="hover:bg-gray-50 transition-colors">
+                        <td className="p-4 text-xs text-gray-500">
+                          <button className="hover:underline hover:text-blue-600" onClick={() => openStream(attempt.streamKey)}>
+                            {attempt.streamKey}
+                          </button>
+                        </td>
+                        <td className="p-4 font-medium">
+                          {attempt.id ? (
+                            <button className="hover:underline hover:text-blue-600" onClick={() => openAttempt(attempt.id)}>
+                              #{attempt.attemptNumber}
+                            </button>
+                          ) : (
+                            <span>#{attempt.attemptNumber}</span>
+                          )}
+                        </td>
+                        <td className="p-4">
+                          <span className={`px-2 py-1 rounded-md text-xs font-semibold uppercase ${attempt.status === 'active' ? 'bg-green-100 text-green-700' : attempt.status === 'closed_early' ? 'bg-amber-100 text-amber-700' : 'bg-red-100 text-red-700'}`}>
+                            {attempt.status}
+                          </span>
+                        </td>
+                        <td className="p-4 w-1/3">
+                          <div className="flex items-center gap-3">
+                            <span className="text-xs text-gray-500 w-12">{attempt.reachedStep}/{attempt.targetSteps}</span>
                             <ProgressBar reached={attempt.reachedStep} target={attempt.targetSteps} />
-                        </div>
-                        <p className="text-xs text-gray-500">Текущий стейк ${Number(attempt.currentStake).toFixed(2)} (базовый ${Number(attempt.baseStake).toFixed(2)}) — начата {new Date(attempt.createdAt).toLocaleString()}{attempt.finishedAt ? `, завершена ${new Date(attempt.finishedAt).toLocaleString()}` : ''}</p>
-                    </div>
-                    <h4 className="text-sm font-semibold text-gray-600 mb-2">Шаги</h4>
-                    <StepsTable steps={steps} />
+                          </div>
+                        </td>
+                        <td className="p-4 text-sm text-gray-500">${Number(attempt.currentStake).toFixed(2)}</td>
+                        <td className="p-4 text-sm text-gray-500">
+                          {new Date(attempt.createdAt).toLocaleString()}
+                        </td>
+                        <td className="p-4 text-sm">
+                          {attempt.status === 'active' && attempt.id && (
+                            <button
+                              disabled={closingId === attempt.id}
+                              onClick={() => closeEarly(attempt.id)}
+                              className="px-2 py-1 rounded-md text-xs font-semibold bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100 disabled:opacity-50"
+                            >
+                              {closingId === attempt.id ? 'Закрываю…' : 'Закрыть досрочно'}
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Разбор сливов */}
+            <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+              <div className="p-6 border-b border-gray-100">
+                <h2 className="text-xl font-semibold text-gray-800">Recent Losses — Diagnostics{activeStream !== 'all' ? ` (${activeStream})` : ''}</h2>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse">
+                  <thead>
+                    <tr className="bg-gray-50 text-gray-600 text-sm">
+                      <th className="p-4 font-medium">Date</th>
+                      <th className="p-4 font-medium">Market</th>
+                      <th className="p-4 font-medium">Side</th>
+                      <th className="p-4 font-medium">Profit</th>
+                      <th className="p-4 font-medium">ATR ratio (entry)</th>
+                      <th className="p-4 font-medium">Reason</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-100">
+                    {filteredLosses.length === 0 && (
+                      <tr><td className="p-4 text-sm text-gray-400" colSpan="6">Сливов пока нет.</td></tr>
+                    )}
+                    {filteredLosses.map((log) => (
+                      <tr key={log.slug} className="hover:bg-gray-50 transition-colors align-top">
+                        <td className="p-4 text-sm text-gray-500 whitespace-nowrap">
+                          {log.resolvedAt ? new Date(log.resolvedAt).toLocaleString() : '—'}
+                        </td>
+                        <td className="p-4 text-sm">
+                          <div className="font-medium">{log.assetPrefix}</div>
+                          <div className="text-gray-400">{log.slug}</div>
+                        </td>
+                        <td className="p-4 text-sm">{log.chosenOutcome ?? '—'}</td>
+                        <td className="p-4 text-sm text-red-600 font-medium">
+                          {log.profit != null ? `$${log.profit.toFixed(2)}` : '—'}
+                        </td>
+                        <td className="p-4 text-sm">
+                          {log.atrRatioAtEntry != null ? `${log.atrRatioAtEntry.toFixed(2)}x` : '—'}
+                        </td>
+                        <td className="p-4 text-sm text-gray-600 max-w-md">{log.failReason ?? '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        );
+      };
+
+      // Сколько секунд прошло с момента последнего обновления
+      const timeSinceUpdate = lastUpdated
+        ? Math.floor((new Date() - lastUpdated) / 1000)
+        : 0;
+
+      return (
+        <div className="min-h-screen flex flex-col justify-between max-w-6xl mx-auto p-6 font-sans text-gray-800">
+          <div>
+            <div className="flex flex-col md:flex-row md:items-center justify-between mb-6 gap-4">
+              <h1 className="text-3xl font-bold text-gray-900">Bot Analytics Dashboard</h1>
+
+              {/* Навигация табов */}
+              <div className="flex flex-wrap gap-1 bg-gray-200/50 p-1 rounded-lg">
+                {MARKETS.map((market) => (
+                  <button
+                    key={market}
+                    onClick={() => handleTabChange(market)}
+                    className={`px-6 py-2 rounded-md font-medium text-sm transition-all duration-200 ${activeTab === market
+                        ? 'bg-white text-blue-600 shadow-sm'
+                        : 'text-gray-500 hover:text-gray-700'
+                      }`}
+                  >
+                    {market}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Саб-табы: сводный дашборд / лента сделок (Сессия 6, п.1) */}
+            <div className="flex gap-1 bg-gray-200/50 p-1 rounded-lg mb-6 w-fit">
+              <button
+                onClick={() => setView('summary')}
+                className={`px-4 py-1.5 rounded-md font-medium text-sm transition-all duration-200 ${view === 'summary' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+              >
+                Summary
+              </button>
+              <button
+                onClick={() => setView('trades')}
+                className={`px-4 py-1.5 rounded-md font-medium text-sm transition-all duration-200 ${view === 'trades' ? 'bg-white text-blue-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}
+              >
+                Сделки
+              </button>
+            </div>
+
+            {actionError && (
+              <div className="bg-red-50 border border-red-200 text-red-700 text-sm rounded-lg p-3 mb-4">
+                {actionError}
+              </div>
+            )}
+
+            {/* Отрисовка контента */}
+            {view === 'summary'
+              ? renderContent()
+              : (
+                <TradesView
+                  trades={trades}
+                  loading={tradesLoading}
+                  onOpenStream={openStream}
+                  onOpenAttempt={openAttempt}
+                  onCloseEarly={closeEarly}
+                  closingId={closingId}
+                />
+              )}
+          </div>
+
+          {streamDetail && (
+            <DetailModal onClose={() => setStreamDetail(null)} title={`Поток: ${streamDetail.streamKey}`}>
+              <StreamDetailBody detail={streamDetail} onOpenAttempt={openAttempt} onCloseEarly={closeEarly} closingId={closingId} />
+            </DetailModal>
+          )}
+
+          {attemptDetail && (
+            <DetailModal onClose={() => setAttemptDetail(null)} title={`Попытка ${attemptDetail.data ? '#' + attemptDetail.data.attempt.attemptNumber : ''}`}>
+              <AttemptDetailBody detail={attemptDetail} onCloseEarly={closeEarly} closingId={closingId} />
+            </DetailModal>
+          )}
+
+          {/* Интерактивный футер с информацией об автообновлении */}
+          <footer className="mt-12 pt-6 border-t border-gray-200 text-center text-xs text-gray-500">
+            <div
+              onClick={toggleAutoRefresh}
+              className="inline-flex items-center gap-2 cursor-pointer select-none bg-gray-100 hover:bg-gray-200 text-gray-600 px-4 py-2 rounded-full transition-colors"
+              title="Нажмите, чтобы включить/отключить автообновление"
+            >
+              <span className={`w-2 h-2 rounded-full ${isAutoRefreshEnabled ? 'bg-green-500 animate-pulse' : 'bg-red-400'}`}></span>
+              {isAutoRefreshEnabled ? (
+                <span>
+                  Обновлено {timeSinceUpdate} сек. назад • Следующее через {secondsLeft} сек. <span className="text-gray-400">(нажмите для паузы)</span>
+                </span>
+              ) : (
+                <span className="font-medium text-amber-700">
+                  Автообновление: отключено <span className="text-gray-400">(нажмите, чтобы включить)</span>
+                </span>
+              )}
+            </div>
+          </footer>
+        </div>
+      );
+    }
+
+    // --- Сессия 6: статус-бейдж, лента сделок, модалка drill-down ---
+    function statusBadgeClass(status) {
+      if (status === 'win' || status === 'active') return 'bg-green-100 text-green-700';
+      if (status === 'pending_resolve') return 'bg-blue-100 text-blue-700';
+      if (status === 'closed_early') return 'bg-amber-100 text-amber-700';
+      if (status === 'skipped' || status === 'unfilled') return 'bg-gray-100 text-gray-600';
+      return 'bg-red-100 text-red-700';
+    }
+
+    function TradesView({ trades, loading, onOpenStream, onOpenAttempt, onCloseEarly, closingId }) {
+      if (loading && !trades) return <div className="py-12 text-center text-gray-500 font-sans">Загрузка сделок...</div>;
+      if (!trades || trades.length === 0) return <div className="py-12 text-center text-gray-400 font-sans">Сделок пока нет.</div>;
+
+      return (
+        <div className="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+          <div className="p-6 border-b border-gray-100">
+            <h2 className="text-xl font-semibold text-gray-800">Лента сделок (все потоки, активные + история)</h2>
+            <p className="text-xs text-gray-400 mt-1">Отдельная лёгкая ручка /analytics/trades — не влияет на загрузку Summary.</p>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse">
+              <thead>
+                <tr className="bg-gray-50 text-gray-600 text-sm">
+                  <th className="p-4 font-medium">Stream / Attempt / Step</th>
+                  <th className="p-4 font-medium">Mode</th>
+                  <th className="p-4 font-medium">Status</th>
+                  <th className="p-4 font-medium">Side</th>
+                  <th className="p-4 font-medium">Entry Price</th>
+                  <th className="p-4 font-medium">Amount</th>
+                  <th className="p-4 font-medium">Profit</th>
+                  <th className="p-4 font-medium">Event</th>
+                  <th className="p-4 font-medium">When</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {trades.map((t) => (
+                  <tr key={t.id} className="hover:bg-gray-50 transition-colors align-top">
+                    <td className="p-4 text-xs">
+                      <button className="font-medium hover:underline hover:text-blue-600 block" onClick={() => onOpenStream(t.streamKey)}>
+                        {t.streamKey}
+                      </button>
+                      <button className="text-gray-400 hover:underline hover:text-blue-600" onClick={() => onOpenAttempt(t.attemptId)}>
+                        попытка #{t.attemptNumber ?? '?'} / шаг {t.stepNumber}
+                      </button>
+                    </td>
+                    <td className="p-4 text-xs font-semibold">
+                      <span className={`px-2 py-0.5 rounded ${t.isSmoke ? 'bg-gray-100 text-gray-600' : 'bg-purple-100 text-purple-700'}`}>
+                        {t.isSmoke ? 'SMOKE' : 'LIVE'}
+                      </span>
+                      {t.stakePredicted && (
+                        <span
+                          title="Сумма ставки взята из pre_resolve-предсказания исхода предыдущего шага по Chainlink, официальный резолв Gamma ещё не подтверждал её на момент открытия."
+                          className="ml-1 px-2 py-0.5 rounded bg-indigo-100 text-indigo-700 whitespace-nowrap"
+                        >
+                          прогноз
+                        </span>
+                      )}
+                    </td>
+                    <td className="p-4">
+                      <span className={`px-2 py-1 rounded-md text-xs font-semibold uppercase ${statusBadgeClass(t.status)}`}>
+                        {t.status}
+                      </span>
+                    </td>
+                    <td className="p-4 text-sm">{t.chosenOutcome ?? '—'}</td>
+                    <td className="p-4 text-sm">{t.entryPrice != null ? `¢${(t.entryPrice * 100).toFixed(2)}` : '—'}</td>
+                    <td className="p-4 text-sm">
+                      <div>${Number(t.filledAmount ?? t.betAmount ?? 0).toFixed(2)}</div>
+                      {t.fillRatio != null && t.fillRatio < 0.999 && (
+                        <div className="text-xs text-amber-600">{(t.fillRatio * 100).toFixed(0)}% fill</div>
+                      )}
+                    </td>
+                    <td className={`p-4 text-sm font-medium ${t.profit == null ? 'text-gray-400' : t.profit >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                      {t.profit != null ? `${t.profit >= 0 ? '+' : ''}$${t.profit.toFixed(2)}` : '—'}
+                      {t.profitPct != null && (
+                        <div className="text-xs font-normal text-gray-400">{t.profitPct >= 0 ? '+' : ''}{t.profitPct.toFixed(1)}%</div>
+                      )}
+                    </td>
+                    <td className="p-4 text-sm">
+                      <a href={t.eventUrl} target="_blank" rel="noreferrer" className="text-blue-600 hover:underline">
+                        Событие ↗
+                      </a>
+                    </td>
+                    <td className="p-4 text-xs text-gray-500 whitespace-nowrap">
+                      {new Date(t.createdAt).toLocaleString()}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      );
+    }
+
+    function DetailModal({ title, onClose, children }) {
+      return (
+        <div className="fixed inset-0 bg-black/40 flex items-start justify-center p-4 md:p-10 z-50 overflow-y-auto" onClick={onClose}>
+          <div
+            className="bg-white rounded-xl shadow-xl max-w-4xl w-full p-6 mt-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-semibold text-gray-900">{title}</h3>
+              <button onClick={onClose} className="text-gray-400 hover:text-gray-700 text-xl leading-none">×</button>
+            </div>
+            {children}
+          </div>
+        </div>
+      );
+    }
+
+    // Компактная таблица шагов — переиспользуется и в StreamDetailBody, и в AttemptDetailBody.
+    function StepsTable({ steps, onOpenAttempt }) {
+      if (!steps || steps.length === 0) return <div className="text-sm text-gray-400 py-4">Ставок пока нет.</div>;
+      return (
+        <div className="overflow-x-auto border border-gray-100 rounded-lg">
+          <table className="w-full text-left border-collapse text-sm">
+            <thead>
+              <tr className="bg-gray-50 text-gray-600">
+                {onOpenAttempt && <th className="p-3 font-medium">Attempt</th>}
+                <th className="p-3 font-medium">Step</th>
+                <th className="p-3 font-medium">Status</th>
+                <th className="p-3 font-medium">Side</th>
+                <th className="p-3 font-medium">Entry</th>
+                <th className="p-3 font-medium">Amount</th>
+                <th className="p-3 font-medium">Profit</th>
+                <th className="p-3 font-medium">Event</th>
+                <th className="p-3 font-medium">When</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {steps.map((s) => (
+                <tr key={s.id}>
+                  {onOpenAttempt && (
+                    <td className="p-3">
+                      <button className="hover:underline hover:text-blue-600" onClick={() => onOpenAttempt(s.attemptId)}>
+                        #{s.attemptNumber ?? '?'}
+                      </button>
+                    </td>
+                  )}
+                  <td className="p-3">{s.stepNumber}</td>
+                  <td className="p-3">
+                    <span className={`px-2 py-0.5 rounded text-xs font-semibold uppercase ${statusBadgeClass(s.status)}`}>{s.status}</span>
+                    {s.stakePredicted && (
+                      <span title="Сумма взята из pre_resolve-предсказания, ещё не подтверждена официальным резолвом Gamma" className="ml-1 px-1.5 py-0.5 rounded text-[10px] bg-indigo-100 text-indigo-700">
+                        прогноз
+                      </span>
+                    )}
+                  </td>
+                  <td className="p-3">{s.chosenOutcome ?? '—'}</td>
+                  <td className="p-3">{s.entryPrice != null ? `¢${(s.entryPrice * 100).toFixed(2)}` : '—'}</td>
+                  <td className="p-3">${Number(s.filledAmount ?? s.betAmount ?? 0).toFixed(2)}</td>
+                  <td className={`p-3 font-medium ${s.profit == null ? 'text-gray-400' : s.profit >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                    {s.profit != null ? `${s.profit >= 0 ? '+' : ''}$${s.profit.toFixed(2)}` : '—'}
+                  </td>
+                  <td className="p-3">
+                    <a href={s.eventUrl} target="_blank" rel="noreferrer" className="text-blue-600 hover:underline">↗</a>
+                  </td>
+                  <td className="p-3 text-xs text-gray-500 whitespace-nowrap">{new Date(s.createdAt).toLocaleString()}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function StreamDetailBody({ detail, onOpenAttempt, onCloseEarly, closingId }) {
+      if (detail.loading) return <div className="py-8 text-center text-gray-500">Загрузка...</div>;
+      if (detail.error) return <div className="py-8 text-center text-red-500">Ошибка: {detail.error}</div>;
+      const { data } = detail;
+      return (
+        <div>
+          <div className="grid grid-cols-3 gap-3 mb-4">
+            <MetricCard title="Попыток на потоке" value={data.attemptsCount} />
+            <MetricCard title="Суммарный профит потока" value={`${data.totalProfit >= 0 ? '+' : ''}$${data.totalProfit.toFixed(2)}`} />
+            <MetricCard title="Активных попыток" value={data.attempts.filter((a) => a.status === 'active').length} />
+          </div>
+          <h4 className="text-sm font-semibold text-gray-600 mb-2">Попытки</h4>
+          <div className="space-y-2 mb-6">
+            {data.attempts.map((a) => (
+              <div key={a.id} className="flex items-center justify-between border border-gray-100 rounded-lg p-3">
+                <div className="flex items-center gap-3">
+                  <button className="font-medium hover:underline hover:text-blue-600" onClick={() => onOpenAttempt(a.id)}>#{a.attemptNumber}</button>
+                  <span className={`px-2 py-0.5 rounded text-xs font-semibold uppercase ${statusBadgeClass(a.status)}`}>{a.status}</span>
+                  <span className="text-xs text-gray-500">{a.reachedStep}/{a.targetSteps} шагов, стейк ${Number(a.currentStake).toFixed(2)}</span>
                 </div>
-            );
-        }
+                {a.status === 'active' && (
+                  <button
+                    disabled={closingId === a.id}
+                    onClick={() => onCloseEarly(a.id)}
+                    className="px-2 py-1 rounded-md text-xs font-semibold bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100 disabled:opacity-50"
+                  >
+                    {closingId === a.id ? 'Закрываю…' : 'Закрыть досрочно'}
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+          <h4 className="text-sm font-semibold text-gray-600 mb-2">Ставки (история + активные)</h4>
+          <StepsTable steps={data.trades} onOpenAttempt={onOpenAttempt} />
+        </div>
+      );
+    }
 
-        // Вспомогательные компоненты
-        function MetricCard({ title, value, subtext }) {
-            return (
-                <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-100 flex flex-col justify-center">
-                    <span className="text-sm text-gray-500 font-medium mb-1">{title}</span>
-                    <span className="text-2xl font-bold text-gray-900">{value}</span>
-                    {subtext && <span className="text-xs text-gray-400 mt-1">{subtext}</span>}
-                </div>
-            );
-        }
+    function AttemptDetailBody({ detail, onCloseEarly, closingId }) {
+      if (detail.loading) return <div className="py-8 text-center text-gray-500">Загрузка...</div>;
+      if (detail.error) return <div className="py-8 text-center text-red-500">Ошибка: {detail.error}</div>;
+      const { attempt, steps } = detail.data;
+      return (
+        <div>
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-3">
+              <span className={`px-3 py-1 rounded-full text-xs font-semibold uppercase ${statusBadgeClass(attempt.status)}`}>{attempt.status}</span>
+              <span className="text-sm text-gray-600">{attempt.streamKey} — {attempt.isSmoke ? 'SMOKE' : 'LIVE'}</span>
+            </div>
+            {attempt.status === 'active' && (
+              <button
+                disabled={closingId === attempt.id}
+                onClick={() => onCloseEarly(attempt.id)}
+                className="px-3 py-1.5 rounded-md text-xs font-semibold bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100 disabled:opacity-50"
+              >
+                {closingId === attempt.id ? 'Закрываю…' : 'Закрыть досрочно (зафиксировать профит)'}
+              </button>
+            )}
+          </div>
+          <div className="mb-4">
+            <div className="flex items-center gap-3 mb-2">
+              <span className="text-xs text-gray-500 w-16">{attempt.reachedStep}/{attempt.targetSteps}</span>
+              <ProgressBar reached={attempt.reachedStep} target={attempt.targetSteps} />
+            </div>
+            <p className="text-xs text-gray-500">Текущий стейк ${Number(attempt.currentStake).toFixed(2)} (базовый ${Number(attempt.baseStake).toFixed(2)}) — начата {new Date(attempt.createdAt).toLocaleString()}{attempt.finishedAt ? `, завершена ${new Date(attempt.finishedAt).toLocaleString()}` : ''}</p>
+          </div>
+          <h4 className="text-sm font-semibold text-gray-600 mb-2">Шаги</h4>
+          <StepsTable steps={steps} />
+        </div>
+      );
+    }
 
-        function ProgressBar({ reached, target }) {
-            const percentage = Math.min((reached / target) * 100, 100);
-            return (
-                <div className="w-full bg-gray-100 rounded-full h-2.5 overflow-hidden">
-                    <div
-                        className="bg-blue-600 h-2.5 rounded-full transition-all duration-500 ease-in-out"
-                        style={{ width: `${percentage}%` }}
-                    />
-                </div>
-            );
-        }
+    // Вспомогательные компоненты
+    function MetricCard({ title, value, subtext }) {
+      return (
+        <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-100 flex flex-col justify-center">
+          <span className="text-sm text-gray-500 font-medium mb-1">{title}</span>
+          <span className="text-2xl font-bold text-gray-900">{value}</span>
+          {subtext && <span className="text-xs text-gray-400 mt-1">{subtext}</span>}
+        </div>
+      );
+    }
 
-        // Рендерим приложение
-        const root = ReactDOM.createRoot(document.getElementById('root'));
-        root.render(<AnalyticsDashboard />);
-    </script>
+    function ProgressBar({ reached, target }) {
+      const percentage = Math.min((reached / target) * 100, 100);
+      return (
+        <div className="w-full bg-gray-100 rounded-full h-2.5 overflow-hidden">
+          <div
+            className="bg-blue-600 h-2.5 rounded-full transition-all duration-500 ease-in-out"
+            style={{ width: `${percentage}%` }}
+          />
+        </div>
+      );
+    }
 
-    <style>
-        .animate-fade-in {
-            animation: fadeIn 0.3s ease-in-out;
-        }
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(5px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-    </style>
+    // Рендерим приложение
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<AnalyticsDashboard />);
+  </script>
+
+  <style>
+    .animate-fade-in {
+      animation: fadeIn 0.3s ease-in-out;
+    }
+
+    @keyframes fadeIn {
+      from {
+        opacity: 0;
+        transform: translateY(5px);
+      }
+
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+  </style>
 </body>
+
 </html>

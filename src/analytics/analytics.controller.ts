@@ -239,24 +239,48 @@ export class AnalyticsController {
   // тяжёлую сводку и позволяет фронту дёргать это чаще/пагинированно.
   // ---------------------------------------------------------------------
   @Get('trades')
-  async getTrades(
-    @Query('limit') limit = '100',
-    @Query('streamKey') streamKey?: string,
-    @Query('status') status?: string,
-  ) {
-    const qb = this.marketLogRepo
-      .createQueryBuilder('log')
-      .leftJoin(Attempt, 'attempt', 'attempt.id = log.attemptId')
-      .addSelect('attempt.attemptNumber', 'attemptNumber')
-      .orderBy('log.createdAt', 'DESC')
-      .limit(Math.min(parseInt(limit, 10) || 100, 300));
+async getTrades(
+  @Query('page') page = '1',
+  @Query('limit') limit = '100',
+  @Query('streamKey') streamKey?: string,
+  @Query('status') status?: string,
+) {
+  const parsedPage = Math.max(parseInt(page, 10) || 1, 1);
+  const requestedLimit = parseInt(limit, 10) || 100;
+  
+  const finalLimit = Math.min(Math.max(requestedLimit, 1), 1000);
+  const skip = (parsedPage - 1) * finalLimit;
 
-    if (streamKey) qb.andWhere('log.assetPrefix = :streamKey', { streamKey });
-    if (status) qb.andWhere('log.status = :status', { status });
+  const qb = this.marketLogRepo
+    .createQueryBuilder('log')
+    .leftJoin(Attempt, 'attempt', 'attempt.id = log.attemptId')
+    .addSelect('attempt.attemptNumber', 'attemptNumber')
+    .orderBy('log.createdAt', 'DESC')
+    .skip(skip)
+    .take(finalLimit);
 
-    const { entities, raw } = await qb.getRawAndEntities();
-    return entities.map((log, i) => toTradeDto(log, parseInt(raw[i]?.attemptNumber, 10) || undefined));
-  }
+  if (streamKey) qb.andWhere('log.assetPrefix = :streamKey', { streamKey });
+  if (status) qb.andWhere('log.status = :status', { status });
+
+  const [{ entities, raw }, total] = await Promise.all([
+    qb.getRawAndEntities(),
+    qb.getCount(),
+  ]);
+
+  const data = entities.map((log, i) =>
+    toTradeDto(log, parseInt(raw[i]?.attemptNumber, 10) || undefined),
+  );
+
+  return {
+    data,
+    meta: {
+      total,
+      page: parsedPage,
+      limit: finalLimit,
+      totalPages: Math.ceil(total / finalLimit),
+    },
+  };
+}
 
   // Сессия 6, п.3: "событие" в терминах пользователя = поток (streamKey) —
   // все ставки этого потока по ВСЕМ его попыткам (история + активные).
