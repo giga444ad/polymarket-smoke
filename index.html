@@ -29,10 +29,10 @@
 
     // Статическая конфигурация стратегий — только для отображения в дашборде.
     const STRATEGY_CONFIG = {
-      "BTC-V1": { name: "ATR + Expected Move / Narrow", entry: "0.90–0.99", lastEntry: "45s", limits: "0.90 / 0.95 / 0.99", atr: true, expectedMove: true, drift: false, timeInZone: false, safetyK: "1.25", atrRatio: "0.25", driftLookback: "15s", zoneRatio: "0.65" },
-      "BTC-V2": { name: "Drift + Time in Zone / Narrow", entry: "0.90–0.99", lastEntry: "45s", limits: "0.90 / 0.95 / 0.99", atr: false, expectedMove: false, drift: true, timeInZone: true, safetyK: "1.25", atrRatio: "0.25", driftLookback: "15s", zoneRatio: "0.65" },
-      "BTC-V3": { name: "ATR + Expected Move / Expanded", entry: "0.88–0.99", lastEntry: "60s", limits: "0.92 / 0.97 / 0.999", atr: true, expectedMove: true, drift: false, timeInZone: false, safetyK: "1.25", atrRatio: "0.25", driftLookback: "15s", zoneRatio: "0.65" },
-      "BTC-V4": { name: "Drift + Time in Zone / Expanded", entry: "0.88–0.99", lastEntry: "60s", limits: "0.92 / 0.97 / 0.999", atr: false, expectedMove: false, drift: true, timeInZone: true, safetyK: "1.25", atrRatio: "0.25", driftLookback: "15s", zoneRatio: "0.65" }
+      "BTC-V1": { name: "45-30-15", entry: "0.90–0.99", lastEntry: "45s", limits: "0.90 / 0.95 / 0.99", atr: true, expectedMove: false, drift: true, timeInZone: true, safetyK: "1.25", atrRatio: "0.25", driftLookback: "15s", zoneRatio: "0.65" },
+      "BTC-V2": { name: "60-30-15", entry: "0.90–0.99", lastEntry: "60s", limits: "0.90 / 0.95 / 0.99", atr: true, expectedMove: false, drift: true, timeInZone: true, safetyK: "1.25", atrRatio: "0.15", driftLookback: "15s", zoneRatio: "0.65" },
+      "BTC-V3": { name: "75-45-30", entry: "0.90–0.99", lastEntry: "75s", limits: "0.90 / 0.95 / 0.99", atr: true, expectedMove: false, drift: true, timeInZone: true, safetyK: "1.25", atrRatio: "0.3", driftLookback: "15s", zoneRatio: "0.65" },
+      "BTC-V4": { name: "90-60-30", entry: "0.90–0.99", lastEntry: "90s", limits: "0.90 / 0.95 / 0.99", atr: true, expectedMove: false, drift: true, timeInZone: true, safetyK: "1.25", atrRatio: "0.35", driftLookback: "15s", zoneRatio: "0.65" }
     };
 
     function StrategyConfigCard({ config, tab }) {
