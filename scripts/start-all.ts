@@ -9,7 +9,7 @@ function run(name, cmd, args) {
   return proc;
 }
 
-const main = run('main', 'node', ['dist/main.js']);
+const main = run('main', 'node', ['dist/src/main.js']);
 const recorder = run('recorder', 'node', ['dist/scripts/tick-recorder.js']);
 
 process.on('SIGTERM', () => { main.kill('SIGTERM'); recorder.kill('SIGTERM'); process.exit(0); });
