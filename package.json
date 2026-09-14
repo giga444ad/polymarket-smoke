@@ -9,12 +9,12 @@
     "node": ">=22.0.0"
   },
   "scripts": {
-    "build": "nest build && tsc -p tsconfig.scripts.json",
+    "build": "nest build",
     "format": "prettier --write \"src/**/*.ts\"",
     "start": "nest start",
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",
-    "start:prod": "node scripts/start-all.js",
+    "start:prod": "node dist/scripts/start-all.js",
     "measure:depth": "tsx scripts/measure-book-depth.ts",
     "ticks:record": "tsx scripts/tick-recorder.ts"
   },
