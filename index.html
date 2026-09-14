@@ -22,7 +22,7 @@
         const { useEffect, useState, useRef, useCallback } = React;
 
         // Массив всех доступных рынков.
-        const MARKETS = ['BTC', 'SOL', 'ETH', 'HYPE'];
+        const MARKETS = ['BTC', 'SOL', 'ETH', 'DOGE'];
         const REFRESH_INTERVAL_SEC = 60;
 
         function AnalyticsDashboard() {
@@ -56,7 +56,7 @@
             const [secondsLeft, setSecondsLeft] = useState(REFRESH_INTERVAL_SEC);
             const [isAutoRefreshEnabled, setIsAutoRefreshEnabled] = useState(true);
 
-            // Базовый URL бэкенда текущего таба (BTC/SOL/ETH/HYPE — разные деплои) —
+            // Базовый URL бэкенда текущего таба (BTC/SOL/ETH/DOGE — разные деплои) —
             // используется и старой fetchData, и новыми ручками (trades/streams/attempts).
             const baseUrl = `https://polymarket-smoke-${activeTab.toLowerCase()}.up.railway.app`;
 
