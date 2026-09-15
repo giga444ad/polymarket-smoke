@@ -16,7 +16,8 @@
     "start:debug": "nest start --debug --watch",
     "start:prod": "node dist/scripts/start-all.js",
     "measure:depth": "tsx scripts/measure-book-depth.ts",
-    "ticks:record": "tsx scripts/tick-recorder.ts"
+    "ticks:record": "tsx scripts/tick-recorder.ts",
+    "check:edge": "npx ts-node scripts/calibrate-edge.ts"
   },
   "dependencies": {
     "@nestjs/common": "^11.2.3",
