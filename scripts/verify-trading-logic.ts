@@ -53,6 +53,11 @@ const fakePriceFeed: any = {
   getPriceAt: () => ({ price: null, tickAt: null, lagMs: null }),
   // Сессия 13: Time-in-Zone фильтр — дефолт "недоступно" (буфер не достаёт).
   getTimeInZoneRatio: () => null,
+  // Сессия 18: мок обязан реализовывать весь IPriceSource, иначе
+  // captureDiagnostics падает. null = "фича недоступна" -> p_model честно
+  // не считается (fail-closed), что для этих тестов и требуется.
+  getAtrRobust: () => null,
+  getSmoothnessRatio: () => null,
 };
 
 const fakeTrader = {
@@ -259,6 +264,8 @@ async function main() {
       // директиональный дрифт не проверяет (см. отдельный тест ниже).
       getPriceAt: () => ({ price: null, tickAt: null, lagMs: null }),
       getTimeInZoneRatio: () => null,
+      getAtrRobust: () => null,
+      getSmoothnessRatio: () => null,
     };
     const gatedConfig = {
       overrides: { ...fakeConfig.overrides, LAST_ENTRY_WINDOW_SEC: '600', ENTRY_FILTER_ENABLED: 'true', MIN_DISTANCE_ATR_RATIO: '1.5' },
@@ -589,7 +596,7 @@ async function main() {
     const repoWithPending: any = { ...fakeMarketLogRepo, findOne: async () => pendingLog };
 
     // 13a: цена ушла далеко вверх (в сторону YES) на 3x ATR — уверенно предсказываем ВЫИГРЫШ.
-    const confidentUpFeed: any = { getSnapshot: () => ({ price: 0.53, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }) };
+    const confidentUpFeed: any = { getSnapshot: () => ({ price: 0.53, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }), getAtrRobust: () => null, getSmoothnessRatio: () => null };
     const svcPreWin: any = new TradingService(
       fakeConfig as any, fakeGamma as any, fakeClobPublic as any, fakeTrader as any,
       confidentUpFeed, fakeAttemptRepo as any, repoWithPending,
@@ -606,7 +613,7 @@ async function main() {
     );
 
     // 13b: цена ушла в сторону NO (противоположную chosenOutcome) — предсказываем ПРОИГРЫШ, стейк = baseStake.
-    const confidentDownFeed: any = { getSnapshot: () => ({ price: 0.47, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }) };
+    const confidentDownFeed: any = { getSnapshot: () => ({ price: 0.47, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }), getAtrRobust: () => null, getSmoothnessRatio: () => null };
     const svcPreLoss: any = new TradingService(
       fakeConfig as any, fakeGamma as any, fakeClobPublic as any, fakeTrader as any,
       confidentDownFeed, fakeAttemptRepo as any, repoWithPending,
@@ -617,7 +624,7 @@ async function main() {
     console.log(`[Тест 13b] pre_resolve предсказывает ПРОИГРЫШ и сбрасывает стейк на baseStake (5): ${lossPrediction?.betAmount === 5}`);
 
     // 13c: цена почти не сдвинулась (0.2x ATR) — недостаточно уверенно, null (безопасный фолбэк к block).
-    const unsureFeed: any = { getSnapshot: () => ({ price: 0.502, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }) };
+    const unsureFeed: any = { getSnapshot: () => ({ price: 0.502, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }), getAtrRobust: () => null, getSmoothnessRatio: () => null };
     const svcUnsure: any = new TradingService(
       fakeConfig as any, fakeGamma as any, fakeClobPublic as any, fakeTrader as any,
       unsureFeed, fakeAttemptRepo as any, repoWithPending,
@@ -641,6 +648,8 @@ async function main() {
     const closeAtMs = Date.now(); // конкретный "истинный" момент закрытия
     const spyFeed: any = {
       getSnapshot: () => ({ price: 999, priceAt: Date.now(), atr: 0.02, candleCount: 20, source: 'chainlink' }),
+      getAtrRobust: () => null,
+      getSmoothnessRatio: () => null,
       getPriceAt: (streamKey: string, targetMs: number) => {
         console.log(`[Тест 14] getPriceAt вызван с targetMs === closesAt.getTime(): ${targetMs === closeAtMs}`);
         return { price: 101.5, tickAt: targetMs, lagMs: 0 };
@@ -708,7 +717,7 @@ async function main() {
     // intervalSec=300 (btc-updown-5m), timeLeftSec≈50 -> sqrt(50/300)≈0.4082,
     // requiredDelta = atr(0.01) * 0.4082 * SAFETY_K_FACTOR(1.5) ≈ 0.006124.
     writes.length = 0;
-    const tooCloseFeed: any = { getSnapshot: () => ({ price: 0.503, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }), getPriceAt: () => ({ price: null, tickAt: null, lagMs: null }) };
+    const tooCloseFeed: any = { getSnapshot: () => ({ price: 0.503, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }), getPriceAt: () => ({ price: null, tickAt: null, lagMs: null }), getAtrRobust: () => null, getSmoothnessRatio: () => null };
     const blockedSvc = makeGatedSvc({ EXPECTED_MOVE_FILTER_ENABLED: 'true', SAFETY_K_FACTOR: '1.5' }, tooCloseFeed);
     const msBlocked = makeMarketState({ closesAt: new Date(Date.now() + 50_000), referencePrice: 0.5 });
     blockedSvc.onBookUpdate(msBlocked, 'YES', gateBook);
@@ -716,7 +725,7 @@ async function main() {
     console.log('\n[Тест 16] Expected-move: дельта (0.003) меньше требуемого запаса (~0.006) -> заблокировано:', writes.length === 0 && !msBlocked.positioned);
 
     writes.length = 0;
-    const farEnoughFeed: any = { getSnapshot: () => ({ price: 0.51, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }), getPriceAt: () => ({ price: null, tickAt: null, lagMs: null }) };
+    const farEnoughFeed: any = { getSnapshot: () => ({ price: 0.51, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }), getPriceAt: () => ({ price: null, tickAt: null, lagMs: null }), getAtrRobust: () => null, getSmoothnessRatio: () => null };
     const allowedSvc = makeGatedSvc({ EXPECTED_MOVE_FILTER_ENABLED: 'true', SAFETY_K_FACTOR: '1.5' }, farEnoughFeed);
     const msAllowed = makeMarketState({ closesAt: new Date(Date.now() + 50_000), referencePrice: 0.5 });
     allowedSvc.onBookUpdate(msAllowed, 'YES', gateBook);
@@ -729,7 +738,9 @@ async function main() {
     writes.length = 0;
     const fallingFeed: any = {
       getSnapshot: () => ({ price: 0.5, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }),
-      getPriceAt: () => ({ price: 0.52, tickAt: Date.now(), lagMs: 0 }), // цена 10с назад была ВЫШЕ -> падает -> против YES
+      getPriceAt: () => ({ price: 0.52, tickAt: Date.now(), lagMs: 0 }),
+      getAtrRobust: () => null,
+      getSmoothnessRatio: () => null, // цена 10с назад была ВЫШЕ -> падает -> против YES
     };
     const blockedSvc = makeGatedSvc({ DIRECTIONAL_DRIFT_FILTER_ENABLED: 'true', DRIFT_LOOKBACK_SEC: '10' }, fallingFeed);
     const msBlocked = makeMarketState({ closesAt: new Date(Date.now() + 50_000), referencePrice: 0.5 });
@@ -740,7 +751,9 @@ async function main() {
     writes.length = 0;
     const risingFeed: any = {
       getSnapshot: () => ({ price: 0.52, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }),
-      getPriceAt: () => ({ price: 0.5, tickAt: Date.now(), lagMs: 0 }), // цена 10с назад была НИЖЕ -> растёт -> в пользу YES
+      getPriceAt: () => ({ price: 0.5, tickAt: Date.now(), lagMs: 0 }),
+      getAtrRobust: () => null,
+      getSmoothnessRatio: () => null, // цена 10с назад была НИЖЕ -> растёт -> в пользу YES
     };
     const allowedSvc = makeGatedSvc({ DIRECTIONAL_DRIFT_FILTER_ENABLED: 'true', DRIFT_LOOKBACK_SEC: '10' }, risingFeed);
     const msAllowed = makeMarketState({ closesAt: new Date(Date.now() + 50_000), referencePrice: 0.5 });
@@ -754,6 +767,8 @@ async function main() {
     writes.length = 0;
     const zoneLowFeed: any = {
       getSnapshot: () => ({ price: 0.52, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }),
+      getAtrRobust: () => null,
+      getSmoothnessRatio: () => null,
       getTimeInZoneRatio: () => 0.1, // YES держался только 10% прошедшего времени окна
       getPriceAt: () => ({ price: null, tickAt: null, lagMs: null }),
     };
@@ -766,6 +781,8 @@ async function main() {
     writes.length = 0;
     const zoneHighFeed: any = {
       getSnapshot: () => ({ price: 0.52, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }),
+      getAtrRobust: () => null,
+      getSmoothnessRatio: () => null,
       getTimeInZoneRatio: () => 0.9, // YES держался 90% прошедшего времени окна
       getPriceAt: () => ({ price: null, tickAt: null, lagMs: null }),
     };
@@ -780,6 +797,8 @@ async function main() {
       getSnapshot: () => ({ price: 0.52, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }),
       getTimeInZoneRatio: () => null, // буфер не достаёт до начала окна
       getPriceAt: () => ({ price: null, tickAt: null, lagMs: null }),
+      getAtrRobust: () => null,
+      getSmoothnessRatio: () => null,
     };
     const failClosedSvc = makeGatedSvc({ TIME_IN_ZONE_FILTER_ENABLED: 'true', MIN_ZONE_RATIO: '0.65' }, zoneNullFeed);
     const msFailClosed = makeMarketState({ closesAt: new Date(Date.now() + 50_000), referencePrice: 0.5, windowStartMs: Date.now() - 250_000 });

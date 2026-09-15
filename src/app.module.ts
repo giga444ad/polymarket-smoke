@@ -10,8 +10,10 @@ import { PriceCandle } from './entities/price-candle.entity';
 import { ActiveWindow } from './entities/active-window.entity';
 import { PriceTick } from './entities/price-tick.entity';
 import { PolymarketPriceTick } from './entities/polymarket-price-tick.entity';
+import { EdgeScoreSample } from './entities/edge-score-sample.entity';
 import { TradingModule } from './trading/trading.module';
 import { AnalyticsModule } from './analytics/analytics.module';
+import { BacktestModule } from './backtest/backtest.module';
 
 @Module({
   imports: [
@@ -23,7 +25,7 @@ import { AnalyticsModule } from './analytics/analytics.module';
       username: process.env.POSTGRES_USER || 'postgres',
       password: process.env.POSTGRES_PASSWORD || 'postgres',
       database: process.env.POSTGRES_DB || 'polymarket_bot',
-      entities: [Attempt, MarketLog, PriceCandle, ActiveWindow, PriceTick, PolymarketPriceTick],
+      entities: [Attempt, MarketLog, PriceCandle, ActiveWindow, PriceTick, PolymarketPriceTick, EdgeScoreSample],
       // Только для смоук/дев-контура: сам создаёт таблицы по сущностям.
       // Для боевого использования лучше завести нормальные миграции.
       synchronize: process.env.TYPEORM_SYNC !== 'false',
@@ -50,6 +52,7 @@ import { AnalyticsModule } from './analytics/analytics.module';
 
     TradingModule,
     AnalyticsModule,
+    BacktestModule,
   ],
 })
 export class AppModule {}

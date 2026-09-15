@@ -511,6 +511,65 @@ export class PriceFeedService implements OnModuleInit, OnModuleDestroy {
     return sum / sample.length;
   }
 
+  /**
+   * ATR-робаст (Сессия 17, разбор прод-кейса позднего разворота — см.
+   * CONTEXT.md): обычный computeAtr — это `mean(high-low)` за последние
+   * `atrCandles` СЕКУНДНЫХ свечей (при дефолтном FEED_CANDLE_MS=1000 и
+   * FEED_ATR_CANDLES=20 это всего 20 секунд истории). Если резкий спайк
+   * (сильное движение за 1 секунду) попал в это окно, среднее раздувается
+   * ИМ ЖЕ на все последующие ~20с — то есть ATR-гейт становится временно
+   * "слепым" (дистанция/ATR занижается) ИМЕННО в окне сразу после
+   * волатильного события, хотя интуитивно это и есть момент повышенного
+   * риска позднего разворота. Это НЕ баг гейта (сам гейт математически
+   * честно делит на то ATR, что ему дали) — это слабость самой метрики на
+   * таком коротком окне.
+   *
+   * Медиана вместо среднего — стандартный робастный приём: один
+   * экстремальный бар не может сдвинуть медиану больше чем на позицию
+   * соседнего значения, в отличие от среднего, которое тянется к выбросу
+   * пропорционально его величине. Считается ПАРАЛЛЕЛЬНО с обычным ATR как
+   * ЧИСТО ДИАГНОСТИЧЕСКОЕ поле (см. EdgeScoreSample) — ничего в live-гейте
+   * реальных денег (entry-gate.engine.ts) этот метод пока не меняет.
+   */
+  getAtrRobust(streamKey: string): number | null {
+    const state = this.states.get(streamKey);
+    if (!state || state.closed.length < state.atrCandles) return null;
+    const sample = state.closed.slice(-state.atrCandles).map((c) => Math.abs(c.high - c.low)).sort((a, b) => a - b);
+    const mid = Math.floor(sample.length / 2);
+    return sample.length % 2 === 0 ? (sample[mid - 1] + sample[mid]) / 2 : sample[mid];
+  }
+
+  /**
+   * Smoothness Ratio (Сессия 17, см. CONTEXT.md — кейс "цена последние 2-3
+   * минуты плавно идёт вверх после сильного движа вниз, за 45с до закрытия
+   * разворачивает наш вход"). Идея пользователя: отличать ГЛАДКОЕ
+   * направленное движение (моментум, скорее продолжится) от ШУМНОГО
+   * дребезга (скорее откатится) — то, что Directional-drift (скорость
+   * дельты) и ATR-рацио (амплитуда) по отдельности не различают: оба могут
+   * дать одинаковое число что при плавном тренде, что при рваном движении
+   * туда-сюда с тем же чистым смещением.
+   *
+   * |netDisplacement| / sum(|consecutive tick deltas|) за [sinceMs, nowMs]:
+   * 1.0 — цена шла строго в одну сторону без единого отката (идеально
+   * гладко); ближе к 0 — цена ходила туда-сюда и просто СЛУЧАЙНО оказалась
+   * там, где оказалась (реальный путь намного длиннее чистого смещения).
+   * Возвращает null, если тиков в окне меньше двух или буфер не достаёт до
+   * sinceMs (та же fail-closed философия, что и у getTimeInZoneRatio).
+   */
+  getSmoothnessRatio(streamKey: string, sinceMs: number, nowMs: number): number | null {
+    const state = this.states.get(streamKey);
+    if (!state) return null;
+    const ticks = state.recentTicks.filter((t) => t.ts >= sinceMs && t.ts <= nowMs);
+    if (ticks.length < 2) return null;
+    const netDisplacement = ticks[ticks.length - 1].price - ticks[0].price;
+    let sumAbsDelta = 0;
+    for (let i = 1; i < ticks.length; i++) {
+      sumAbsDelta += Math.abs(ticks[i].price - ticks[i - 1].price);
+    }
+    if (sumAbsDelta <= 0) return null;
+    return Math.abs(netDisplacement) / sumAbsDelta;
+  }
+
   private deriveTicker(streamKey: string): string {
     // "btc-updown-5m" -> "btc". Для нестандартных активов (напр. часовой
     // "bitcoin-up-or-down") задай явный маппинг через FEED_SYMBOL_OVERRIDES.

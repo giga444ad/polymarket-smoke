@@ -12,8 +12,9 @@ import { LiveBook, MarketWsStream, Outcome } from '../polymarket/market-ws-strea
 import { cumulativeUsdAtOrBelow, walkAsksForFill } from '../polymarket/book-fill.util';
 import { PriceFeedService } from '../polymarket/price-feed.service';
 import { parseStreamsConfig, StreamDefinition } from './stream-config';
-
-type LimitTier = 'T1' | 'T2' | 'T3';
+import { EntryGateEngine, EntryDiagnostics, GateContext } from './entry-gate.engine';
+import { EdgeWeights, DEFAULT_EDGE_WEIGHTS } from './edge-score.util';
+import { LimitTier, computeTier as computeTierPure, pickFavorite as pickFavoritePure, roundToTick as roundToTickPure, limitOrderTargetUsd as limitOrderTargetUsdPure } from './market-decision.util';
 
 type PendingGateMode = 'block' | 'pre_resolve' | 'open';
 
@@ -27,39 +28,6 @@ interface RestingOrder {
   // фактическое исполнение может случиться намного позже, вплоть до
   // истечения окна, см. BACKLOG "нужно время отправки ордера и его осуществления").
   placedAt: Date;
-}
-
-interface EntryDiagnostics {
-  referencePrice: number | null;
-  priceAtEntry: number | null;
-  atrAtEntry: number | null;
-  atrRatioAtEntry: number | null;
-  // Источник цены ('chainlink' | 'binance' | 'bybit' | null) — Chainlink это
-  // буквально то, чем Polymarket резолвит крипто-маркеты; binance/bybit —
-  // лишь приближение (см. PriceFeedService и README).
-  priceSource: string | null;
-
-  // --- Сессия 13: доп. фильтры входа (обсуждение с Gemini, см. CONTEXT.md).
-  // Все четыре поля считаются ВСЕГДА (независимо от того, включён ли
-  // соответствующий *_FILTER_ENABLED) — та же SHADOW-логика, что и у
-  // исходного ATR-гейта на старте проекта: сначала копим статистику по
-  // market_logs, потом калибруем пороги и включаем блокировку осознанно. ---
-
-  // Текущий час UTC на момент входа — для BLACKOUT_HOURS_UTC.
-  blackoutHourAtEntry: number | null;
-  // Требуемый запас цены от референса: atrAtEntry * sqrt(t_rem/intervalSec) * SAFETY_K_FACTOR
-  // (Expected Move, см. EXPECTED_MOVE_FILTER_ENABLED) — масштабирование в
-  // ТЕХ ЖЕ единицах времени, что и сам ATR (целое окно потока), а не
-  // смешение с фиксированной "1-минутной" волатильностью (см. комментарий
-  // у SAFETY_K_FACTOR в .env.example — почему именно так).
-  requiredDeltaAtEntry: number | null;
-  // Скорость изменения СИГНАТУРНОЙ (не абсолютной) дельты цена-референс за
-  // последние DRIFT_LOOKBACK_SEC секунд: (priceNow-ref) - (pricePast-ref).
-  // Положительно = дельта растёт в сторону YES, отрицательно = в сторону NO.
-  driftRateAtEntry: number | null;
-  // Доля прошедшего времени текущего окна, когда цена была на стороне
-  // ВЫБРАННОГО исхода относительно референса (см. MIN_ZONE_RATIO).
-  zoneRatioAtEntry: number | null;
 }
 
 interface MarketState {
@@ -202,6 +170,20 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
   private driftLookbackSec: number;
   private timeInZoneFilterEnabled: boolean;
   private minZoneRatio: number;
+  // Сессия 18 — см. edge-score.util.ts.
+  private edgeGateEnabled: boolean;
+  private edgeWeights: EdgeWeights;
+  private edgeMargin: number;
+  private edgeSmoothnessLookbackSec: number;
+  // Движок ATR-гейта (Сессия 16) — вынесен в отдельный класс без привязки к
+  // NestJS/MarketState (см. entry-gate.engine.ts), чтобы модуль бэктеста мог
+  // ЧЕСТНО переиспользовать РОВНО ТУ ЖЕ логику принятия решения о входе, а
+  // не переписывать её "по мотивам" (см. BACKTEST-PLAN.md — требование
+  // пользователя дословно об этом). Живой путь (TradingService) и бэктест
+  // (BacktestRunnerService) отличаются только тем, ЧТО подставляется как
+  // IPriceSource/IClock (живой PriceFeedService+Date.now() здесь, реплей
+  // исторических тиков там) — сама логика гейта не продублирована.
+  private readonly gateEngine: EntryGateEngine;
   // Порог "зависшего" резолва — сколько может провисеть pending_resolve лог,
   // прежде чем мы начнём предупреждать в логах/на фронте (не блокирует торговлю).
   private staleResolveWarnMs: number;
@@ -236,6 +218,42 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
   // прогрессия/прогресс для каждого потока (п.3 бэклога).
   private currentAttempts = new Map<string, Attempt>();
   private activeMarkets = new Map<string, MarketState>();
+
+  /**
+   * Сессия 17 — единственная точка входа для EdgeSamplerService (см.
+   * edge-sampler.service.ts). Отдаёт СНИМОК того, что нужно для
+   * диагностического сэмплирования, НЕ давая внешнему коду доступа к
+   * MarketState целиком (там живут restingOrder/positioned и прочее
+   * состояние, трогать которое снаружи TradingService не должен никто).
+   * Намеренно не отдаёт сам объект MarketState — только копию нужных полей.
+   */
+  getActiveMarketsForSampling(): {
+    assetPrefix: string;
+    slug: string;
+    closesAt: Date;
+    referencePrice: number | null;
+    windowStartMs: number | null;
+    intervalSec: number;
+    favoriteOutcome: Outcome | null;
+    favoriteBestAsk: number | null;
+  }[] {
+    const out: ReturnType<TradingService['getActiveMarketsForSampling']> = [];
+    for (const ms of this.activeMarkets.values()) {
+      if (ms.finalized) continue;
+      const favoriteOutcome = this.pickFavorite(ms.books);
+      out.push({
+        assetPrefix: ms.assetPrefix,
+        slug: ms.slug,
+        closesAt: ms.closesAt,
+        referencePrice: ms.referencePrice,
+        windowStartMs: ms.windowStartMs,
+        intervalSec: ms.intervalSec,
+        favoriteOutcome,
+        favoriteBestAsk: favoriteOutcome ? (ms.books[favoriteOutcome]?.bestAsk ?? null) : null,
+      });
+    }
+    return out;
+  }
   // streamKey -> id логов, ещё не зарезолвленных (status='pending_resolve').
   // Заполняется в writeLog, чистится в resolvePendingMarkets, восстанавливается
   // из БД в onModuleInit (переживает рестарт процесса) — см. pendingGateMode.
@@ -354,6 +372,41 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     this.driftLookbackSec = parseInt(this.config.get<string>('DRIFT_LOOKBACK_SEC', '10'), 10);
     this.timeInZoneFilterEnabled = this.config.get<string>('TIME_IN_ZONE_FILTER_ENABLED', 'false') === 'true';
     this.minZoneRatio = parseFloat(this.config.get<string>('MIN_ZONE_RATIO', '0.65'));
+
+    // --- Сессия 18: edge-модель (см. edge-score.util.ts). Веса РУЧНЫЕ, не
+    // откалиброванные — поэтому edgeGateEnabled по умолчанию false: p_model
+    // считается и логируется всегда (shadow), но реальный вход блокирует
+    // только при явном EDGE_GATE_ENABLED=true. ---
+    this.edgeGateEnabled = this.config.get<string>('EDGE_GATE_ENABLED', 'false') === 'true';
+    this.edgeMargin = parseFloat(this.config.get<string>('EDGE_MARGIN', '0.02'));
+    this.edgeSmoothnessLookbackSec = parseInt(this.config.get<string>('EDGE_SMOOTHNESS_LOOKBACK_SEC', '30'), 10);
+    this.edgeWeights = {
+      bias: parseFloat(this.config.get<string>('EDGE_W_BIAS', String(DEFAULT_EDGE_WEIGHTS.bias))),
+      z: parseFloat(this.config.get<string>('EDGE_W_Z', String(DEFAULT_EDGE_WEIGHTS.z))),
+      drift: parseFloat(this.config.get<string>('EDGE_W_DRIFT', String(DEFAULT_EDGE_WEIGHTS.drift))),
+      zone: parseFloat(this.config.get<string>('EDGE_W_ZONE', String(DEFAULT_EDGE_WEIGHTS.zone))),
+      smoothSigned: parseFloat(this.config.get<string>('EDGE_W_SMOOTH', String(DEFAULT_EDGE_WEIGHTS.smoothSigned))),
+    };
+
+    this.gateEngine = new EntryGateEngine(
+      {
+        entryFilterEnabled: this.entryFilterEnabled,
+        minDistanceAtrRatio: this.minDistanceAtrRatio,
+        blackoutHoursFilterEnabled: this.blackoutHoursFilterEnabled,
+        blackoutHoursUtc: this.blackoutHoursUtc,
+        expectedMoveFilterEnabled: this.expectedMoveFilterEnabled,
+        safetyKFactor: this.safetyKFactor,
+        directionalDriftFilterEnabled: this.directionalDriftFilterEnabled,
+        driftLookbackSec: this.driftLookbackSec,
+        timeInZoneFilterEnabled: this.timeInZoneFilterEnabled,
+        minZoneRatio: this.minZoneRatio,
+        edgeGateEnabled: this.edgeGateEnabled,
+        edgeWeights: this.edgeWeights,
+        edgeMargin: this.edgeMargin,
+        edgeSmoothnessLookbackSec: this.edgeSmoothnessLookbackSec,
+      },
+      this.priceFeed,
+    );
   }
 
   async onModuleInit() {
@@ -414,6 +467,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
           .join('; ') +
         `. ` +
         `ATR-гейт входа: ${this.entryFilterEnabled ? `ВКЛЮЧЁН (мин. ${this.minDistanceAtrRatio}x ATR, при недоступной диагностике — пропуск шага, не вход вслепую)` : 'выключен (только диагностика в логах)'}. ` +
+        `Edge-модель (Сессия 18): p_model считается всегда (shadow); как ГЕЙТ ${this.edgeGateEnabled ? `ВКЛЮЧЕНА — маржа ${this.edgeMargin}, веса bias=${this.edgeWeights.bias}/z=${this.edgeWeights.z}/drift=${this.edgeWeights.drift}/zone=${this.edgeWeights.zone}/smooth=${this.edgeWeights.smoothSigned} (ВНИМАНИЕ: веса ручные, не откалиброваны на истории)` : 'выключена (EDGE_GATE_ENABLED=false — реальные входы не блокирует)'}. `,
         `Доп. фильтры (Сессия 13): blackout-hours=${this.blackoutHoursFilterEnabled ? `ВКЛ (${[...this.blackoutHoursUtc].join(',') || 'список пуст'})` : 'выкл'}, ` +
         `expected-move=${this.expectedMoveFilterEnabled ? `ВКЛ (k=${this.safetyKFactor})` : 'выкл'}, ` +
         `directional-drift=${this.directionalDriftFilterEnabled ? `ВКЛ (lookback=${this.driftLookbackSec}с)` : 'выкл'}, ` +
@@ -958,38 +1012,30 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     void this.placeOrReplaceLimit(marketState, favorite, tier, desiredPrice, fb.tickSize);
   }
 
+  // Сессия 16: pickFavorite/computeTier/roundToTick/limitOrderTargetUsd не
+  // зависят ни от Nest DI, ни от MarketState как такового — чистые функции,
+  // вынесены в market-decision.util.ts и переиспользуются 1-в-1 модулем
+  // бэктеста (см. BacktestRunnerService). Обёртки-методы оставлены с той же
+  // сигнатурой, чтобы не трогать остальной код TradingService/тесты.
   private pickFavorite(books: Record<Outcome, LiveBook>): Outcome | null {
-    const yes = books.YES.bestBid;
-    const no = books.NO.bestBid;
-    if (yes == null && no == null) return null;
-    if (yes == null) return 'NO';
-    if (no == null) return 'YES';
-    return yes >= no ? 'YES' : 'NO';
+    return pickFavoritePure({ YES: { bestBid: books.YES.bestBid }, NO: { bestBid: books.NO.bestBid } });
   }
 
   private computeTier(timeLeftSec: number, marketState: MarketState): LimitTier {
     const t2 = marketState.tier2Seconds ?? this.tier2Seconds;
     const t3 = marketState.tier3Seconds ?? this.tier3Seconds;
-    if (timeLeftSec > t2) return 'T1';
-    if (timeLeftSec > t3) return 'T2';
-    return 'T3';
+    return computeTierPure(timeLeftSec, t2, t3);
   }
 
   private roundToTick(price: number, tickSizeStr: string): number {
-    const tick = parseFloat(tickSizeStr) || 0.01;
-    const decimals = (tickSizeStr.split('.')[1] ?? '').length || 2;
-    let rounded = Math.round(price / tick) * tick;
-    const max = 1 - tick;
-    rounded = Math.min(Math.max(rounded, tick), max);
-    return Number(rounded.toFixed(decimals));
+    return roundToTickPure(price, tickSizeStr);
   }
 
   /** Сколько $ нужно набрать нашей резюм-лимиткой, чтобы удовлетворить минимум биржи
    *  (не капая эту сумму обратно до стейка шага — иначе проверка допустимого перерасхода
    *  в вызывающем коде никогда не сработает). */
   private limitOrderTargetUsd(marketState: MarketState, price: number): number {
-    const minUsd = marketState.minOrderSize * price;
-    return Math.max(marketState.betAmount, minUsd);
+    return limitOrderTargetUsdPure(marketState.betAmount, marketState.minOrderSize, price);
   }
 
   // ---------------------------------------------------------------------
@@ -1000,168 +1046,39 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
   // же таймфрейма (ATR теперь считается в масштабе окна потока, не в
   // фиксированных 20 секундах — см. PriceFeedService).
   // ---------------------------------------------------------------------
-  private captureDiagnostics(marketState: MarketState, outcome: Outcome, timeLeftSec: number): EntryDiagnostics {
-    const snap = this.priceFeed.getSnapshot(marketState.assetPrefix);
-    const referencePrice = marketState.referencePrice;
-    const priceAtEntry = snap.price;
-    const atrAtEntry = snap.atr;
-    let atrRatioAtEntry: number | null = null;
-    if (referencePrice != null && priceAtEntry != null && atrAtEntry != null && atrAtEntry > 0) {
-      atrRatioAtEntry = Math.abs(priceAtEntry - referencePrice) / atrAtEntry;
-    }
+  /**
+   * Сессия 16: тонкая обёртка над EntryGateEngine.captureDiagnostics —
+   * собирает GateContext из MarketState и делегирует всю фактическую логику
+   * (ровно ту же, что раньше жила прямо здесь) в переиспользуемый движок,
+   * см. entry-gate.engine.ts. Оставлена как метод именно с этой сигнатурой,
+   * чтобы не трогать вызывающий код и существующие тесты.
+   */
+  private captureDiagnostics(marketState: MarketState, outcome: Outcome, timeLeftSec: number, checkPrice: number | null = null): EntryDiagnostics {
+    return this.gateEngine.captureDiagnostics(this.toGateContext(marketState, outcome, timeLeftSec, checkPrice));
+  }
 
-    // --- Сессия 13: 4 доп. диагностики, считаются ВСЕГДА (не только когда
-    // соответствующий фильтр включён) — SHADOW-режим для калибровки, та же
-    // логика, что и у исходного ATR-гейта на старте проекта. ---
-    const blackoutHourAtEntry = new Date().getUTCHours();
-
-    let requiredDeltaAtEntry: number | null = null;
-    if (atrAtEntry != null && atrAtEntry > 0 && marketState.intervalSec > 0) {
-      // Expected Move: atrAtEntry уже посчитан в масштабе ЦЕЛОГО окна этого
-      // потока (см. PriceFeedService — не 60-секундная свеча), поэтому
-      // масштабируем sqrt(t) в ТЕХ ЖЕ единицах (доля timeLeftSec от
-      // intervalSec), а не по фиксированной "1-минутной" волатильности —
-      // иначе получили бы ровно ту же ошибку смешения временных масштабов,
-      // которую чинили в Сессии 5 (см. CONTEXT.md).
-      requiredDeltaAtEntry = atrAtEntry * Math.sqrt(Math.max(0, timeLeftSec) / marketState.intervalSec) * this.safetyKFactor;
-    }
-
-    let driftRateAtEntry: number | null = null;
-    if (referencePrice != null && priceAtEntry != null) {
-      const past = this.priceFeed.getPriceAt(marketState.assetPrefix, Date.now() - this.driftLookbackSec * 1000);
-      if (past.price != null) {
-        // Сигнатурная (не абсолютная) дельта — знак важен: положительно
-        // значит дельта растёт в сторону YES, отрицательно — в сторону NO.
-        driftRateAtEntry = (priceAtEntry - referencePrice) - (past.price - referencePrice);
-      }
-    }
-
-    let zoneRatioAtEntry: number | null = null;
-    if (referencePrice != null && marketState.windowStartMs != null) {
-      zoneRatioAtEntry = this.priceFeed.getTimeInZoneRatio(
-        marketState.assetPrefix,
-        marketState.windowStartMs,
-        Date.now(),
-        referencePrice,
-        outcome,
-      );
-    }
-
+  private toGateContext(marketState: MarketState, outcome: Outcome, timeLeftSec: number, checkPrice: number | null = null): GateContext {
     return {
-      referencePrice,
-      priceAtEntry,
-      atrAtEntry,
-      atrRatioAtEntry,
-      priceSource: snap.source,
-      blackoutHourAtEntry,
-      requiredDeltaAtEntry,
-      driftRateAtEntry,
-      zoneRatioAtEntry,
+      streamKey: marketState.assetPrefix,
+      outcome,
+      referencePrice: marketState.referencePrice,
+      intervalSec: marketState.intervalSec,
+      windowStartMs: marketState.windowStartMs,
+      timeLeftSec,
+      // Сессия 18: если конкретная цена сделки не передана — берём best ask
+      // выбранной стороны как текущую implied-вероятность рынка.
+      checkPrice: checkPrice ?? marketState.books[outcome]?.bestAsk ?? null,
     };
   }
 
+  /**
+   * Сессия 16: тонкая обёртка над EntryGateEngine.evaluateEntryGate — см.
+   * комментарий у captureDiagnostics выше. Сигнатура и поведение идентичны
+   * тому, что было здесь раньше (перенесена только реализация).
+   */
   private evaluateEntryGate(marketState: MarketState, outcome: Outcome): { allow: boolean; diagnostics: EntryDiagnostics; reason: string | null } {
     const timeLeftSec = Math.max(0, (marketState.closesAt.getTime() - Date.now()) / 1000);
-    const diagnostics = this.captureDiagnostics(marketState, outcome, timeLeftSec);
-
-    if (this.entryFilterEnabled) {
-      if (diagnostics.atrRatioAtEntry == null) {
-        // Гейт включён, но диагностика недоступна (фид не отдал ни одного тика
-        // до этого момента, либо ATR ещё не прогрелся) — раньше это было
-        // fail-open (пропускали не глядя). Теперь фейл-клоуз: лучше упустить
-        // шаг, чем войти вслепую без понимания, насколько уверенно движение.
-        return {
-          allow: false,
-          diagnostics,
-          reason:
-            'ATR-гейт включён, но диагностика недоступна (нет цены/ATR по внешнему фиду на момент входа) — ' +
-            'пропускаем шаг: упустить сделку лучше, чем рисковать капиталом вслепую.',
-        };
-      }
-      if (diagnostics.atrRatioAtEntry < this.minDistanceAtrRatio) {
-        return {
-          allow: false,
-          diagnostics,
-          reason:
-            `ATR-гейт: дистанция до референса ${diagnostics.atrRatioAtEntry.toFixed(2)}x ATR ` +
-            `меньше требуемых ${this.minDistanceAtrRatio}x — похоже на болтанку у границы, а не уверенное движение.`,
-        };
-      }
-    }
-
-    // --- Сессия 13: 4 доп. фильтра, каждый проверяется НЕЗАВИСИМО от
-    // остальных и от entryFilterEnabled выше, только если включён своим ENV. ---
-
-    if (this.blackoutHoursFilterEnabled && diagnostics.blackoutHourAtEntry != null && this.blackoutHoursUtc.has(diagnostics.blackoutHourAtEntry)) {
-      return {
-        allow: false,
-        diagnostics,
-        reason:
-          `Blackout-фильтр: текущий час ${diagnostics.blackoutHourAtEntry} UTC входит в BLACKOUT_HOURS_UTC ` +
-          `(историческая повышенная доля поздних разворотов в этот час) — пропуск шага.`,
-      };
-    }
-
-    if (this.expectedMoveFilterEnabled) {
-      if (diagnostics.requiredDeltaAtEntry == null || diagnostics.priceAtEntry == null || diagnostics.referencePrice == null) {
-        return {
-          allow: false,
-          diagnostics,
-          reason: 'Expected-move фильтр включён, но диагностика недоступна (нет ATR/цены по фиду) — пропуск шага.',
-        };
-      }
-      const delta = Math.abs(diagnostics.priceAtEntry - diagnostics.referencePrice);
-      if (delta < diagnostics.requiredDeltaAtEntry) {
-        return {
-          allow: false,
-          diagnostics,
-          reason:
-            `Expected-move фильтр: дельта ${delta.toFixed(4)} меньше требуемого запаса ${diagnostics.requiredDeltaAtEntry.toFixed(4)} ` +
-            `(ATR×√(t_rem/intervalSec)×${this.safetyKFactor}) — похоже на шум, а не на уверенное движение.`,
-        };
-      }
-    }
-
-    if (this.directionalDriftFilterEnabled) {
-      if (diagnostics.driftRateAtEntry == null) {
-        return {
-          allow: false,
-          diagnostics,
-          reason: `Directional-drift фильтр включён, но история дельты недоступна (буфер не достаёт на ${this.driftLookbackSec}с назад) — пропуск шага.`,
-        };
-      }
-      const adverse = outcome === 'YES' ? diagnostics.driftRateAtEntry < 0 : diagnostics.driftRateAtEntry > 0;
-      if (adverse) {
-        return {
-          allow: false,
-          diagnostics,
-          reason:
-            `Directional-drift фильтр: дельта схлопывается к референсу против стороны ${outcome} ` +
-            `(скорость ${diagnostics.driftRateAtEntry.toFixed(4)} за ${this.driftLookbackSec}с) — похоже на встречный импульс, вход отменён.`,
-        };
-      }
-    }
-
-    if (this.timeInZoneFilterEnabled) {
-      if (diagnostics.zoneRatioAtEntry == null) {
-        return {
-          allow: false,
-          diagnostics,
-          reason: 'Time-in-Zone фильтр включён, но буфер тиков не достаёт до начала окна — пропуск шага.',
-        };
-      }
-      if (diagnostics.zoneRatioAtEntry < this.minZoneRatio) {
-        return {
-          allow: false,
-          diagnostics,
-          reason:
-            `Time-in-Zone фильтр: сторона ${outcome} держалась только ${(diagnostics.zoneRatioAtEntry * 100).toFixed(1)}% ` +
-            `прошедшего времени окна (нужно ${(this.minZoneRatio * 100).toFixed(0)}%) — похоже на прострел против доминирующей стороны.`,
-        };
-      }
-    }
-
-    return { allow: true, diagnostics, reason: null };
+    return this.gateEngine.evaluateEntryGate(this.toGateContext(marketState, outcome, timeLeftSec));
   }
 
   // ---------------------------------------------------------------------
@@ -1722,6 +1639,9 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       requiredDeltaAtEntry,
       driftRateAtEntry,
       zoneRatioAtEntry,
+      pModelAtEntry,
+      impliedProbAtEntry,
+      edgeWouldEnter,
     } = log;
 
     if (referencePrice == null || priceAtEntry == null) {
@@ -1758,6 +1678,18 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     if (blackoutHourAtEntry != null) extras.push(`час UTC=${blackoutHourAtEntry}`);
     if (extras.length > 0) {
       parts.push(`Доп. диагностика (Сессия 13): ${extras.join(', ')}.`);
+    }
+
+    // Сессия 18: edge-модель — пишем ВСЕГДА, когда посчиталась, даже если
+    // EDGE_GATE_ENABLED=false, чтобы по логам сливов было видно, отсеяла бы
+    // их модель или нет (именно этот ретро-анализ и нужен для калибровки).
+    if (pModelAtEntry != null) {
+      parts.push(
+        `Edge-модель (Сессия 18): p_model=${pModelAtEntry.toFixed(3)}` +
+          (impliedProbAtEntry != null ? `, implied(цена)=${impliedProbAtEntry.toFixed(3)}` : ', implied недоступна') +
+          (edgeWouldEnter != null ? `, вход по модели: ${edgeWouldEnter ? 'ДА' : 'НЕТ (модель отсеяла бы)'}` : '') +
+          '.',
+      );
     }
 
     if (priceAtClose != null) {

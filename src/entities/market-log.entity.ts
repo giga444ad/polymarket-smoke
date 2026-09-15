@@ -221,4 +221,23 @@ export class MarketLog {
   // ВЫБРАННОГО исхода относительно референса (Time-in-Zone, см. MIN_ZONE_RATIO).
   @Column({ type: 'double precision', nullable: true })
   zoneRatioAtEntry: number | null;
+
+  // --- Сессия 18: edge-модель (см. edge-score.util.ts). Заполняются ВСЕГДА
+  // (shadow), независимо от EDGE_GATE_ENABLED — чтобы по истории сделок
+  // можно было ретроспективно оценить, что модель отсеяла бы, и на этом же
+  // наборе потом калибровать веса. ---
+  @Column({ type: 'double precision', nullable: true })
+  atrRobustAtEntry: number | null;
+
+  @Column({ type: 'double precision', nullable: true })
+  smoothnessAtEntry: number | null;
+
+  @Column({ type: 'double precision', nullable: true })
+  pModelAtEntry: number | null;
+
+  @Column({ type: 'double precision', nullable: true })
+  impliedProbAtEntry: number | null;
+
+  @Column({ type: 'boolean', nullable: true })
+  edgeWouldEnter: boolean | null;
 }

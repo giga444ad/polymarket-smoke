@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Backtest</title>
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-50 p-6 text-sm">
+  <div class="max-w-5xl mx-auto space-y-4">
+    <h1 class="text-xl font-bold">Бэктест (реплей price_ticks / polymarket_price_ticks)</h1>
+    <p class="text-gray-600">
+      Никаких живых запросов к Gamma/CLOB — только уже накопленная история
+      (см. <code>scripts/tick-recorder.ts</code>, Сессия 15). Гейт входа/тиры/фильтры —
+      ровно та же логика, что и в бою (<code>EntryGateEngine</code>), см. BACKTEST-PLAN.md.
+    </p>
+
+    <div class="bg-white rounded shadow p-4 space-y-3">
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <label class="flex flex-col">Stream key
+          <input id="streamKey" class="border rounded px-2 py-1" value="btc-updown-5m">
+        </label>
+        <label class="flex flex-col">С (ISO или unix мс)
+          <input id="from" class="border rounded px-2 py-1" placeholder="2026-09-01T00:00:00Z">
+        </label>
+        <label class="flex flex-col">По (ISO или unix мс)
+          <input id="to" class="border rounded px-2 py-1" placeholder="2026-09-08T00:00:00Z">
+        </label>
+        <label class="flex flex-col">assumedMinOrderSize
+          <input id="minOrderSize" class="border rounded px-2 py-1" value="5">
+        </label>
+      </div>
+
+      <div>
+        <label class="block mb-1">ENV-оверрайды (JSON-объект, необязательно) — например
+          <code>{"MIN_DISTANCE_ATR_RATIO":"2","EXPECTED_MOVE_FILTER_ENABLED":"true"}</code>
+        </label>
+        <textarea id="envOverrides" class="border rounded w-full px-2 py-1 h-20 font-mono text-xs"></textarea>
+      </div>
+
+      <button id="runBtn" class="bg-blue-600 text-white px-4 py-2 rounded hover:bg-blue-700">Запустить</button>
+      <span id="status" class="ml-3 text-gray-500"></span>
+    </div>
+
+    <div id="summaryBox" class="bg-white rounded shadow p-4 hidden">
+      <h2 class="font-semibold mb-2">Сводка</h2>
+      <div id="summaryGrid" class="grid grid-cols-3 md:grid-cols-6 gap-3 text-center mb-3"></div>
+      <div id="limitations" class="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded p-2 space-y-1"></div>
+    </div>
+
+    <div id="tradesBox" class="bg-white rounded shadow p-4 overflow-x-auto hidden">
+      <h2 class="font-semibold mb-2">Сделки</h2>
+      <table class="min-w-full text-xs">
+        <thead>
+          <tr class="text-left border-b">
+            <th class="p-1">closesAt</th>
+            <th class="p-1">outcome</th>
+            <th class="p-1">entry</th>
+            <th class="p-1">type</th>
+            <th class="p-1">status</th>
+            <th class="p-1">profit</th>
+            <th class="p-1">ATR ratio</th>
+            <th class="p-1">skip/причина</th>
+          </tr>
+        </thead>
+        <tbody id="tradesBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+<script>
+function fmt(n) { return n == null ? '—' : (Math.round(n * 10000) / 10000).toString(); }
+function fmtDate(ms) { return new Date(ms).toISOString(); }
+
+document.getElementById('runBtn').addEventListener('click', async () => {
+  const statusEl = document.getElementById('status');
+  const streamKey = document.getElementById('streamKey').value.trim();
+  const from = document.getElementById('from').value.trim();
+  const to = document.getElementById('to').value.trim();
+  const assumedMinOrderSize = Number(document.getElementById('minOrderSize').value) || 5;
+  let envOverrides;
+  const rawOverrides = document.getElementById('envOverrides').value.trim();
+  try {
+    envOverrides = rawOverrides ? JSON.parse(rawOverrides) : undefined;
+  } catch (e) {
+    statusEl.textContent = 'ENV-оверрайды: невалидный JSON — ' + e.message;
+    return;
+  }
+
+  statusEl.textContent = 'Считаю...';
+  document.getElementById('summaryBox').classList.add('hidden');
+  document.getElementById('tradesBox').classList.add('hidden');
+
+  try {
+    const res = await fetch('/backtest/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ streamKey, from, to, envOverrides, assumedMinOrderSize }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      statusEl.textContent = 'Ошибка: ' + (data.message || res.statusText);
+      return;
+    }
+    statusEl.textContent = 'Готово.';
+    renderSummary(data);
+    renderTrades(data.trades);
+  } catch (e) {
+    statusEl.textContent = 'Ошибка запроса: ' + e.message;
+  }
+});
+
+function renderSummary(data) {
+  const grid = document.getElementById('summaryGrid');
+  const cells = [
+    ['Окон', data.windowsTotal],
+    ['Выигрыши', data.wins],
+    ['Проигрыши', data.losses],
+    ['Пропуски', data.skipped],
+    ['Неисполнено', data.unfilled],
+    ['Профит $', fmt(data.totalProfit)],
+    ['Ср. вход', fmt(data.avgEntryPrice)],
+    ['Источник цены', data.usedPriceSource || 'нет данных'],
+    ['price_ticks', data.dataQuality.priceTicksLoaded],
+    ['pm_ticks', data.dataQuality.polymarketTicksLoaded],
+    ['окон без референса', data.dataQuality.windowsWithoutReferencePrice],
+  ];
+  grid.innerHTML = cells.map(([label, val]) =>
+    `<div class="bg-gray-50 rounded p-2"><div class="text-gray-500">${label}</div><div class="font-semibold">${val}</div></div>`
+  ).join('');
+
+  const lim = document.getElementById('limitations');
+  lim.innerHTML = '<div class="font-semibold">Ограничения этого прогона:</div>' +
+    data.limitations.map((l) => `<div>• ${l}</div>`).join('');
+
+  document.getElementById('summaryBox').classList.remove('hidden');
+}
+
+function renderTrades(trades) {
+  const body = document.getElementById('tradesBody');
+  body.innerHTML = trades.map((t) => {
+    const color = t.status === 'win' ? 'text-green-700' : t.status === 'loss' ? 'text-red-700' : 'text-gray-500';
+    return `<tr class="border-b">
+      <td class="p-1">${fmtDate(t.closesAtMs)}</td>
+      <td class="p-1">${t.chosenOutcome ?? '—'}</td>
+      <td class="p-1">${fmt(t.entryPrice)}</td>
+      <td class="p-1">${t.orderType ?? '—'}${t.limitTier ? ' (' + t.limitTier + ')' : ''}</td>
+      <td class="p-1 ${color} font-semibold">${t.status}</td>
+      <td class="p-1">${fmt(t.profit)}</td>
+      <td class="p-1">${fmt(t.atrRatioAtEntry)}</td>
+      <td class="p-1 text-gray-500">${t.skipReason ?? ''}</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('tradesBox').classList.remove('hidden');
+}
+</script>
+</body>
+</html>
