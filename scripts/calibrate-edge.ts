@@ -32,6 +32,7 @@
  *   npx ts-node scripts/calibrate-edge.ts
  * Читает переменные подключения из тех же POSTGRES_* ENV, что и сам бот.
  */
+import 'dotenv/config';
 import { Client } from 'pg';
 import { computeEdgeFeatures, EdgeFeatures } from '../src/trading/edge-score.util';
 
@@ -56,6 +57,13 @@ const TARGET_TIME_LEFT_SEC = parseFloat(process.env.CALIBRATE_TARGET_TIME_LEFT_S
 const TRAIN_RATIO = parseFloat(process.env.CALIBRATE_TRAIN_RATIO ?? '0.7');
 
 async function main() {
+  if (!process.env.POSTGRES_HOST) {
+    console.error(
+      'POSTGRES_HOST не задан — .env не найден или запущен не из корня проекта. ' +
+        'Проверь, что файл .env лежит рядом с package.json и содержит POSTGRES_HOST/POSTGRES_DB/POSTGRES_USER/POSTGRES_PASSWORD.',
+    );
+    process.exit(1);
+  }
   const client = new Client({
     host: process.env.POSTGRES_HOST,
     port: parseInt(process.env.POSTGRES_PORT ?? '5432', 10),
