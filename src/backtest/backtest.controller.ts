@@ -1,4 +1,7 @@
-import { Body, Controller, Post } from '@nestjs/common';
+import { Body, Controller, Post, UseGuards } from '@nestjs/common';
+import { RolesGuard } from '../auth/guards/roles.guard';
+import { Roles } from '../auth/decorators/roles.decorator';
+import { Role } from '../auth/role.enum';
 import { BacktestRunnerService } from './backtest-runner.service';
 import { BacktestRunRequest } from './backtest.types';
 
@@ -6,15 +9,10 @@ import { BacktestRunRequest } from './backtest.types';
 export class BacktestController {
   constructor(private readonly runner: BacktestRunnerService) {}
 
-  /**
-   * BACKTEST-PLAN.md, п.2.4. Тело запроса — см. BacktestRunRequest:
-   *   { "streamKey": "btc-updown-5m", "from": "2026-09-01T00:00:00Z", "to": "2026-09-08T00:00:00Z",
-   *     "envOverrides": { "MIN_DISTANCE_ATR_RATIO": "2", "EXPECTED_MOVE_FILTER_ENABLED": "true" } }
-   *
-   * Данные берутся ТОЛЬКО из уже накопленной истории (`price_ticks`/
-   * `polymarket_price_ticks`, см. Сессия 15/tick-recorder) — никаких живых
-   * сетевых запросов к Gamma/CLOB не выполняется.
-   */
+  // Бэктест может дёргать envOverrides и гоняет тяжёлые запросы по всей
+  // истории тиков — ограничиваем admin, а не открываем viewer'ам.
+  @UseGuards(RolesGuard)
+  @Roles(Role.ADMIN)
   @Post('run')
   async run(@Body() body: BacktestRunRequest) {
     return this.runner.run(body);

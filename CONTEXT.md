@@ -706,3 +706,33 @@ cancelRestingIfAny(...)` (в LIVE — реальный сетевой запро
   `polymarket_price_ticks`, нет сохранённого официального исхода Gamma,
   нет реинвест-прогрессии между окнами и т.д.) — см. `CHANGES-session-16.md`
   и поле `limitations` в каждом ответе API.
+
+## Сессия 17 — разделение фронт/бек, JWT-аутентификация, security-ревью
+
+Полное описание архитектуры и порядок деплоя — `README-AUTH.md` (в этом же
+репозитории). Коротко:
+
+- Добавлен `src/auth/` (User-сущность, роли admin/viewer, JWT). Один сервис
+  (`IS_MAIN=true`, публичный домен `api.axiomis.ru`) хранит пользователей и
+  валидирует JWT локально; остальные три (`IS_MAIN=false`) ходят за
+  валидацией на него (`RemoteJwtGuard`, кэш 30с) — 4 сервиса/4 БД не
+  перестраивались.
+- Регистрации нет — пользователи заводятся вручную: `npx tsx
+  scripts/create-user.ts <username> <password> <admin|viewer>`.
+- Все ручки (кроме `/api/health` и `/api/auth/login` на IS_MAIN) требуют
+  `Authorization: Bearer <jwt>`; `close-early` и `backtest/run` — только
+  роль `admin`.
+- Security-ревью `main.ts`: убран `CORS origin: '*' + credentials: true`
+  (был открыт всем), добавлены `helmet`, белый список `CORS_ORIGIN`,
+  глобальный rate-limit (`ThrottlerGuard`) + отдельный жёсткий лимит на
+  `/auth/login`, `ValidationPipe({ whitelist, forbidNonWhitelisted })`,
+  единый префикс `/api`.
+- Старый монолитный `index.html`/`public/*.html` (React без сборки) вынесен
+  из бэкенда в отдельный проект `axiomis-dashboard` (Vite + React + TS, node
+  22, react-router, axios) — деплоится отдельно на Vercel, ходит на 4
+  бэкенда по `VITE_BACKENDS`, логин на `VITE_AUTH_BASE_URL`. Функциональность
+  портирована: табы бэкенд/поток, сводка, попытки, разбивка по активу,
+  сделки с пагинацией, close-early (только для роли admin).
+- `npx tsc --noEmit` и `npx tsx scripts/verify-trading-logic.ts` — зелёные,
+  логика самого бота (TradingService/EntryGateEngine/etc.) не тронута ни
+  единой строкой.
