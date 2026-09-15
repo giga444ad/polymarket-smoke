@@ -8,6 +8,7 @@
 Цель — набрать почти-гарантированный исход (¢99+) по одному из двух
 бинарных outcome (YES/NO), реинвестируя выигрыш в следующий шаг.
 
+
 Стек: TypeScript / NestJS, TypeORM + PostgreSQL, WebSocket (Polymarket CLOB
 market-стрим + внешний ценовой фид), React-дашборд без сборки
 (`index.html`, babel standalone в браузере).
