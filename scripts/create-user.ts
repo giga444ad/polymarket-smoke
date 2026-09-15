@@ -9,6 +9,7 @@
  *
  * Идемпотентно: если username уже существует — обновит пароль и роль.
  */
+import 'dotenv/config';
 import 'reflect-metadata';
 import * as bcrypt from 'bcrypt';
 import { DataSource } from 'typeorm';
