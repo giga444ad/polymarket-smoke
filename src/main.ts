@@ -36,7 +36,7 @@ async function bootstrap() {
 
   app.enableCors({
     origin: parseCorsOrigins(),
-    methods: 'GET,HEAD,POST',
+    methods: 'GET,HEAD,POST,PATCH',
     credentials: false,
     maxAge: 600,
   });

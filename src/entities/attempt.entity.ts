@@ -40,6 +40,18 @@ export class Attempt {
   @Column({ type: 'int', default: 500 })
   targetSteps: number;
 
+  // Цель попытки в деньгах (см. TARGET_PROFIT_USD) — альтернативный критерий
+  // досрочного завершения попытки, наряду с targetSteps. Считается именно
+  // ПРИБЫЛЬ этой попытки (см. realizedProfit ниже), а не совокупный баланс/
+  // банкролл. Какой из двух критериев (targetSteps vs targetProfitUsd)
+  // реально проверяется на каждом шаге — решает StreamRuntimeConfig.closeMode
+  // (динамически, через БД/дашборд). Оба поля всегда живут и обновляются на
+  // Attempt одновременно, независимо от того, какой режим сейчас активен —
+  // если режим переключат на полпути попытки, ни currentStep, ни
+  // realizedProfit не сбрасываются и не теряются.
+  @Column({ type: 'double precision', default: 20 })
+  targetProfitUsd: number;
+
   // Базовый стейк потока (из конфига потока на момент создания попытки) —
   // сюда сбрасывается currentStake при проигрыше (новая попытка).
   @Column({ type: 'double precision', default: 5 })
@@ -52,6 +64,14 @@ export class Attempt {
   // после проигрыша.
   @Column({ type: 'double precision', default: 5 })
   currentStake: number;
+
+  // Накопленная ПРИБЫЛЬ этой попытки (сумма log.profit по всем win-шагам,
+  // проигрыш попытку и так завершает) — не путать с currentStake (это
+  // размер следующей ставки) и не путать с общим банкроллом (тот считается
+  // по ВСЕМ попыткам сразу, см. /analytics/summary). Именно это поле
+  // сравнивается с targetProfitUsd в режиме closeMode='profit'.
+  @Column({ type: 'double precision', default: 0 })
+  realizedProfit: number;
 
   @Index()
   @Column({ type: 'varchar', length: 32, default: 'active' })

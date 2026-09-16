@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { Attempt } from '../entities/attempt.entity';
+import { StreamRuntimeConfig } from '../entities/stream-runtime-config.entity';
 import { MarketLog } from '../entities/market-log.entity';
 import { PriceCandle } from '../entities/price-candle.entity';
 import { ActiveWindow } from '../entities/active-window.entity';
@@ -15,7 +16,7 @@ import { CandleHistoryService } from '../polymarket/candle-history.service';
 import { EdgeSamplerService } from './edge-sampler.service';
 
 @Module({
-  imports: [TypeOrmModule.forFeature([Attempt, MarketLog, PriceCandle, ActiveWindow, EdgeScoreSample])],
+  imports: [TypeOrmModule.forFeature([Attempt, MarketLog, PriceCandle, ActiveWindow, EdgeScoreSample, StreamRuntimeConfig])],
   controllers: [TradingController],
   providers: [
     TradingService,

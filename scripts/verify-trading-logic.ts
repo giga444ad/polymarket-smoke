@@ -94,6 +94,15 @@ const fakeAttemptRepo = {
   }),
 };
 
+// Сессия 18: closeMode всегда 'steps' в этих тестах (findOne -> null ->
+// getCloseMode дефолтится на 'steps') — существующие сценарии проверяют
+// именно старую step-based логику, режим 'profit' проверяется отдельно.
+const fakeStreamConfigRepo: any = {
+  findOne: async () => null,
+  find: async () => [],
+  upsert: async () => {},
+};
+
 let fakeLogIdSeq = 0;
 const updates: any[] = [];
 const fakeMarketLogRepo: any = {
@@ -167,6 +176,7 @@ async function main() {
     fakePriceFeed as any,
     fakeAttemptRepo as any,
     fakeMarketLogRepo as any,
+    fakeStreamConfigRepo as any,
   );
   // currentAttempt раньше был единственным полем — теперь Map<streamKey, Attempt>
   // (независимая прогрессия на поток, см. BACKLOG п.3).
@@ -275,7 +285,7 @@ async function main() {
     };
     const gatedSvc: any = new TradingService(
       gatedConfig as any, fakeGamma as any, fakeClobPublic as any, fakeTrader as any,
-      dynamicFeed, fakeAttemptRepo as any, fakeMarketLogRepo as any,
+      dynamicFeed, fakeAttemptRepo as any, fakeMarketLogRepo as any, fakeStreamConfigRepo as any,
     );
 
     const ms = makeMarketState({ closesAt: new Date(Date.now() + 280_000), referencePrice: 0.99 });
@@ -440,6 +450,64 @@ async function main() {
     );
   }
 
+  // --- Тест 21 (Сессия 18, "частичный фикс"): closeMode='profit' — попытка
+  //     должна закрыться по НАКОПЛЕННОЙ ПРИБЫЛИ, а не по числу шагов, даже
+  //     если currentStep всё ещё далёк от targetSteps=500. Проверяем ровно
+  //     то, что реально отличается от прежнего поведения (Тест 6-8 выше
+  //     проверяют default 'steps'-режим и НЕ трогали closeMode). ---
+  {
+    fakeStreamConfigRepo.findOne = async () => ({ streamKey: 'btc-updown-5m', closeMode: 'profit' });
+    const profitAttempt: any = {
+      id: 'attempt-profit-1',
+      attemptNumber: 1,
+      streamKey: 'btc-updown-5m',
+      status: 'active',
+      currentStep: 0,
+      targetSteps: 500, // заведомо далеко — если бы сработал старый steps-путь, тест бы упал
+      targetProfitUsd: 1,
+      realizedProfit: 0,
+      baseStake: 5,
+      currentStake: 5,
+      isSmoke: true,
+    };
+    fakeAttemptRepo.findOneOrFail = async () => profitAttempt;
+    const log: any = {
+      id: 'log-profit-1',
+      slug: 'btc-updown-5m-4000',
+      chosenOutcome: 'YES',
+      entryPrice: 0.5,
+      betAmount: 100,
+      filledAmount: 100,
+      assetPrefix: 'btc-updown-5m',
+      attemptId: 'attempt-profit-1',
+    };
+    fakeMarketLogRepo.find = async () => [log];
+    fakeGamma.fetchOutcome = async () => ({ slug: log.slug, closed: true, yesWon: true, noWon: false });
+    await svc.resolvePendingMarkets();
+    const updated = svc.currentAttempts.get('btc-updown-5m');
+    console.log(
+      '\n[Тест 21] closeMode=profit: попытка закрыта по прибыли ($100 >= цель $1), а НЕ по шагам (1/500):',
+      updated?.status === 'completed_target' && Math.abs((updated?.realizedProfit ?? 0) - 100) < 1e-9,
+    );
+
+    // Контроль: тот же сценарий, но closeMode='steps' (дефолт) — с теми же
+    // цифрами попытка НЕ должна закрываться (currentStep=1 << targetSteps=500),
+    // несмотря на ту же огромную прибыль. Доказывает, что переключатель
+    // реально что-то переключает, а не просто всегда смотрит на прибыль.
+    fakeStreamConfigRepo.findOne = async () => null; // -> дефолт 'steps'
+    const stepsAttempt: any = { ...profitAttempt, id: 'attempt-profit-2', currentStep: 0, realizedProfit: 0, status: 'active' };
+    fakeAttemptRepo.findOneOrFail = async () => stepsAttempt;
+    const log2: any = { ...log, id: 'log-profit-2', slug: 'btc-updown-5m-4001', attemptId: 'attempt-profit-2' };
+    fakeMarketLogRepo.find = async () => [log2];
+    fakeGamma.fetchOutcome = async () => ({ slug: log2.slug, closed: true, yesWon: true, noWon: false });
+    await svc.resolvePendingMarkets();
+    const updated2 = svc.currentAttempts.get('btc-updown-5m');
+    console.log(
+      '[Тест 21b] closeMode=steps (дефолт): та же прибыль $100 НЕ закрывает попытку раньше 500 шагов:',
+      updated2?.status === 'active' && Math.abs((updated2?.realizedProfit ?? 0) - 100) < 1e-9,
+    );
+  }
+
   writes.length = 0;
   // --- Тест 9: окно входа — не пытаемся войти раньше LAST_ENTRY_WINDOW_SEC,
   //     даже если стакан даёт отличную цену (см. реальный инцидент — оба
@@ -459,6 +527,7 @@ async function main() {
       fakePriceFeed as any,
       fakeAttemptRepo as any,
       fakeMarketLogRepo as any,
+    fakeStreamConfigRepo as any,
     );
     gatedSvc.currentAttempts.set('btc-updown-5m', {
       id: 'attempt-1',
@@ -503,6 +572,7 @@ async function main() {
       fakePriceFeed as any, // всегда возвращает price:null — "фид не отдал ни одного тика"
       fakeAttemptRepo as any,
       fakeMarketLogRepo as any,
+    fakeStreamConfigRepo as any,
     );
     gatedSvc.currentAttempts.set('btc-updown-5m', {
       id: 'attempt-1',
@@ -547,6 +617,7 @@ async function main() {
       fakePriceFeed as any,
       fakeAttemptRepo as any,
       fakeMarketLogRepo as any,
+    fakeStreamConfigRepo as any,
     );
     svcBlocked.pendingGateMode = 'block';
     svcBlocked.pendingByStream.set('btc-updown-5m', new Set(['log-1']));
@@ -599,7 +670,7 @@ async function main() {
     const confidentUpFeed: any = { getSnapshot: () => ({ price: 0.53, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }), getAtrRobust: () => null, getSmoothnessRatio: () => null };
     const svcPreWin: any = new TradingService(
       fakeConfig as any, fakeGamma as any, fakeClobPublic as any, fakeTrader as any,
-      confidentUpFeed, fakeAttemptRepo as any, repoWithPending,
+      confidentUpFeed, fakeAttemptRepo as any, repoWithPending, fakeStreamConfigRepo as any,
     );
     svcPreWin.preResolveMinAtrRatio = 2;
     svcPreWin.preResolveMaxChain = 1;
@@ -616,7 +687,7 @@ async function main() {
     const confidentDownFeed: any = { getSnapshot: () => ({ price: 0.47, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }), getAtrRobust: () => null, getSmoothnessRatio: () => null };
     const svcPreLoss: any = new TradingService(
       fakeConfig as any, fakeGamma as any, fakeClobPublic as any, fakeTrader as any,
-      confidentDownFeed, fakeAttemptRepo as any, repoWithPending,
+      confidentDownFeed, fakeAttemptRepo as any, repoWithPending, fakeStreamConfigRepo as any,
     );
     svcPreLoss.preResolveMinAtrRatio = 2;
     svcPreLoss.preResolveMaxChain = 1;
@@ -627,7 +698,7 @@ async function main() {
     const unsureFeed: any = { getSnapshot: () => ({ price: 0.502, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }), getAtrRobust: () => null, getSmoothnessRatio: () => null };
     const svcUnsure: any = new TradingService(
       fakeConfig as any, fakeGamma as any, fakeClobPublic as any, fakeTrader as any,
-      unsureFeed, fakeAttemptRepo as any, repoWithPending,
+      unsureFeed, fakeAttemptRepo as any, repoWithPending, fakeStreamConfigRepo as any,
     );
     svcUnsure.preResolveMinAtrRatio = 2;
     svcUnsure.preResolveMaxChain = 1;
@@ -658,6 +729,7 @@ async function main() {
     const svcClose: any = new TradingService(
       fakeConfig as any, fakeGamma as any, fakeClobPublic as any, fakeTrader as any,
       spyFeed, fakeAttemptRepo as any, fakeMarketLogRepo as any,
+    fakeStreamConfigRepo as any,
     );
     const ms = makeMarketState({
       closesAt: new Date(closeAtMs),
@@ -686,7 +758,7 @@ async function main() {
         return this.overrides[key] ?? def;
       },
     };
-    const svc: any = new TradingService(cfg as any, fakeGamma as any, fakeClobPublic as any, fakeTrader as any, feed, fakeAttemptRepo as any, fakeMarketLogRepo as any);
+    const svc: any = new TradingService(cfg as any, fakeGamma as any, fakeClobPublic as any, fakeTrader as any, feed, fakeAttemptRepo as any, fakeMarketLogRepo as any, fakeStreamConfigRepo as any);
     svc.currentAttempts.set('btc-updown-5m', { id: 'attempt-1', streamKey: 'btc-updown-5m', currentStep: 0, targetSteps: 500, baseStake: 5, currentStake: 5 });
     return svc;
   }

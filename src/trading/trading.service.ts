@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { LessThan, Repository } from 'typeorm';
 import { Attempt } from '../entities/attempt.entity';
+import { StreamRuntimeConfig, CloseMode } from '../entities/stream-runtime-config.entity';
 import { ChosenOutcome, MarketLog, MarketLogStatus, OrderKind } from '../entities/market-log.entity';
 import { ActiveWindow } from '../entities/active-window.entity';
 import { GammaMarketService } from '../polymarket/gamma-market.service';
@@ -139,6 +140,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
   private maxOverspendMultiplier: number;
   private minFillRatio: number;
   private targetSteps: number;
+  private targetProfitUsd: number;
   private discoveryPollMs: number;
   private resolvePollMs: number;
 
@@ -284,6 +286,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     private readonly priceFeed: PriceFeedService,
     @InjectRepository(Attempt) private readonly attemptRepo: Repository<Attempt>,
     @InjectRepository(MarketLog) private readonly marketLogRepo: Repository<MarketLog>,
+    @InjectRepository(StreamRuntimeConfig) private readonly streamConfigRepo: Repository<StreamRuntimeConfig>,
     @InjectRepository(ActiveWindow) private readonly activeWindowRepo?: Repository<ActiveWindow>,
   ) {
     this.isSmoke = this.config.get<string>('SMOKE_START', 'true') === 'true';
@@ -305,6 +308,11 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     );
     this.minFillRatio = parseFloat(this.config.get<string>('MIN_FILL_RATIO', '0.5'));
     this.targetSteps = parseInt(this.config.get<string>('TARGET_STEPS', '500'), 10);
+    // Дефолт цели по прибыли (см. "частичный фикс" — Сессия 18): применяется
+    // ТОЛЬКО при создании новой попытки, как и targetSteps. Дальнейшее
+    // переключение режима (steps/profit) — динамическое, через
+    // StreamRuntimeConfig/дашборд, ENV тут не участвует.
+    this.targetProfitUsd = parseFloat(this.config.get<string>('TARGET_PROFIT_USD', '20'));
     this.discoveryPollMs = parseInt(this.config.get<string>('MARKET_DISCOVERY_POLL_MS', '1500'), 10);
     this.resolvePollMs = parseInt(this.config.get<string>('RESOLVE_POLL_INTERVAL_MS', '10000'), 10);
 
@@ -502,6 +510,8 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       streamKey: stream.streamKey,
       currentStep: 0,
       targetSteps: this.targetSteps,
+      targetProfitUsd: this.targetProfitUsd,
+      realizedProfit: 0,
       baseStake: stream.baseStake,
       currentStake: stream.baseStake,
       status: 'active',
@@ -509,6 +519,67 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       finishedAt: null,
     });
     return this.attemptRepo.save(attempt);
+  }
+
+  /**
+   * Режим закрытия попытки на поток (Сессия 18, "частичный фикс") — какой
+   * критерий из двух (targetSteps vs targetProfitUsd) реально триггерит
+   * завершение попытки. Хранится в БД (StreamRuntimeConfig), меняется на
+   * лету через PATCH /trading/settings/:streamKey, без редеплоя. Если строки
+   * нет — 'steps' (поведение по умолчанию, как было всегда).
+   */
+  async getCloseMode(streamKey: string): Promise<CloseMode> {
+    const row = await this.streamConfigRepo.findOne({ where: { streamKey } });
+    return row?.closeMode === 'profit' ? 'profit' : 'steps';
+  }
+
+  /** Режимы по ВСЕМ известным потокам сразу — для экрана настроек. */
+  async getCloseModes(): Promise<Array<{ streamKey: string; closeMode: CloseMode }>> {
+    const rows = await this.streamConfigRepo.find();
+    const byKey = new Map(rows.map((r) => [r.streamKey, r.closeMode]));
+    return this.streams.map((s) => ({ streamKey: s.streamKey, closeMode: byKey.get(s.streamKey) ?? 'steps' }));
+  }
+
+  async setCloseMode(streamKey: string, closeMode: CloseMode): Promise<void> {
+    if (!this.streamByKey.has(streamKey)) {
+      throw new NotFoundException(`Неизвестный поток "${streamKey}".`);
+    }
+    await this.streamConfigRepo.upsert({ streamKey, closeMode }, ['streamKey']);
+    this.logger.log(`[${streamKey}] Режим закрытия попытки переключён на "${closeMode}".`);
+  }
+
+  /**
+   * Ручной патч ТЕКУЩЕГО прогресса попытки (не дефолтов потока) — см.
+   * PATCH /trading/attempts/:id. Каждое поле независимо опционально;
+   * обновляем только то, что реально передали, остальное не трогаем.
+   * Держим this.currentAttempts в актуальном состоянии, если патчим именно
+   * активную попытку потока — иначе следующий resolvePendingMarkets мог бы
+   * поработать со старым закэшированным значением.
+   */
+  async patchAttempt(
+    id: string,
+    patch: { currentStep?: number; realizedProfit?: number; targetSteps?: number; targetProfitUsd?: number },
+  ): Promise<Attempt> {
+    const attempt = await this.attemptRepo.findOne({ where: { id } });
+    if (!attempt) {
+      throw new NotFoundException(`Попытка ${id} не найдена.`);
+    }
+    if (patch.currentStep !== undefined) attempt.currentStep = patch.currentStep;
+    if (patch.realizedProfit !== undefined) attempt.realizedProfit = patch.realizedProfit;
+    if (patch.targetSteps !== undefined) attempt.targetSteps = patch.targetSteps;
+    if (patch.targetProfitUsd !== undefined) attempt.targetProfitUsd = patch.targetProfitUsd;
+    const saved = await this.attemptRepo.save(attempt);
+
+    if (attempt.status === 'active' && this.currentAttempts.get(attempt.streamKey)?.id === attempt.id) {
+      this.currentAttempts.set(attempt.streamKey, saved);
+    }
+    this.logger.log(
+      `[${attempt.streamKey}] Попытка #${attempt.attemptNumber} вручную отредактирована: ` +
+        `${Object.entries(patch)
+          .map(([k, v]) => `${k}=${v}`)
+          .join(', ')}.`,
+    );
+    return saved;
   }
 
   /**
@@ -544,6 +615,8 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       streamKey: attempt.streamKey,
       currentStep: 0,
       targetSteps: attempt.targetSteps,
+      targetProfitUsd: attempt.targetProfitUsd,
+      realizedProfit: 0,
       baseStake,
       currentStake: baseStake,
       status: 'active',
@@ -1586,11 +1659,22 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
               `чтобы частичный филл не "съедал" прогрессию.`,
           );
         }
-        if (attempt.currentStep >= attempt.targetSteps) {
+        // Накапливаем прибыль ПОПЫТКИ (не банкролла) — считается независимо
+        // от того, какой режим сейчас активен, чтобы переключение
+        // steps<->profit на полпути попытки ничего не теряло (Сессия 18).
+        attempt.realizedProfit = (attempt.realizedProfit ?? 0) + log.profit;
+
+        const closeMode = await this.getCloseMode(streamKey);
+        const reachedByMode =
+          closeMode === 'profit' ? attempt.realizedProfit >= attempt.targetProfitUsd : attempt.currentStep >= attempt.targetSteps;
+
+        if (reachedByMode) {
           attempt.status = 'completed_target';
           attempt.finishedAt = new Date();
           this.logger.log(
-            `[GOAL] [${streamKey}] Попытка #${attempt.attemptNumber} (${attempt.isSmoke ? 'smoke' : 'live'}) дошла до ${attempt.targetSteps} шага!`,
+            closeMode === 'profit'
+              ? `[GOAL] [${streamKey}] Попытка #${attempt.attemptNumber} (${attempt.isSmoke ? 'smoke' : 'live'}) достигла цели по прибыли $${attempt.targetProfitUsd.toFixed(2)} (факт $${attempt.realizedProfit.toFixed(2)})!`
+              : `[GOAL] [${streamKey}] Попытка #${attempt.attemptNumber} (${attempt.isSmoke ? 'smoke' : 'live'}) дошла до ${attempt.targetSteps} шага!`,
           );
         }
         await this.attemptRepo.save(attempt);
@@ -1609,6 +1693,8 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
           streamKey,
           currentStep: 0,
           targetSteps: this.targetSteps,
+          targetProfitUsd: this.targetProfitUsd,
+          realizedProfit: 0,
           baseStake,
           currentStake: baseStake, // сброс прогрессии на базовый стейк потока
           status: 'active',

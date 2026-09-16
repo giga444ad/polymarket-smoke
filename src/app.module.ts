@@ -7,6 +7,7 @@ import { APP_GUARD } from '@nestjs/core';
 import { join } from 'path';
 
 import { Attempt } from './entities/attempt.entity';
+import { StreamRuntimeConfig } from './entities/stream-runtime-config.entity';
 import { MarketLog } from './entities/market-log.entity';
 import { PriceCandle } from './entities/price-candle.entity';
 import { ActiveWindow } from './entities/active-window.entity';
@@ -29,7 +30,7 @@ import { BacktestModule } from './backtest/backtest.module';
       username: process.env.POSTGRES_USER || 'postgres',
       password: process.env.POSTGRES_PASSWORD || 'postgres',
       database: process.env.POSTGRES_DB || 'polymarket_bot',
-      entities: [Attempt, MarketLog, PriceCandle, ActiveWindow, PriceTick, PolymarketPriceTick, EdgeScoreSample, User],
+      entities: [Attempt, MarketLog, PriceCandle, ActiveWindow, PriceTick, PolymarketPriceTick, EdgeScoreSample, User, StreamRuntimeConfig],
       // Только для смоук/дев-контура: сам создаёт таблицы по сущностям.
       // Для боевого использования лучше завести нормальные миграции.
       synchronize: process.env.TYPEORM_SYNC !== 'false',
