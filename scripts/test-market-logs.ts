@@ -1,36 +1,44 @@
 import "reflect-metadata";
-import { DataSource } from "typeorm";
+import { DataSource, DataSourceOptions } from "typeorm";
 import * as dotenv from "dotenv";
 
 dotenv.config();
 
-const configs = {
-  V2: {
-    host: process.env.V2_POSTGRES_HOST,
-    port: Number(process.env.V2_POSTGRES_PORT || 5432),
-    username: process.env.V2_POSTGRES_USER,
-    password: process.env.V2_POSTGRES_PASSWORD,
-    database: process.env.V2_POSTGRES_DB,
-  },
-  V3: {
-    host: process.env.V3_POSTGRES_HOST,
-    port: Number(process.env.V3_POSTGRES_PORT || 5432),
-    username: process.env.V3_POSTGRES_USER,
-    password: process.env.V3_POSTGRES_PASSWORD,
-    database: process.env.V3_POSTGRES_DB,
-  },
-  V4: {
-    host: process.env.V4_POSTGRES_HOST,
-    port: Number(process.env.V4_POSTGRES_PORT || 5432),
-    username: process.env.V4_POSTGRES_USER,
-    password: process.env.V4_POSTGRES_PASSWORD,
-    database: process.env.V4_POSTGRES_DB,
-  },
-};
+// ============================================================================
+// НАСТРОЙКА И СПИСОК ВЕРСИЙ
+// Добавляйте сюда нужные теги: ["V3", "V4", "V5", "V6"]
+// ============================================================================
+const CONFIG_TAGS = ["V3", "V4"] as const;
 
 const FIXED_STAKE = 5;
+const SLOTS_PER_DAY = 288;
 
-type ConfigName = keyof typeof configs;
+type ConfigName = string;
+
+/**
+ * Унифицированное получение конфигурации Postgres по тегу.
+ * Формирует имена переменных окружения по шаблону: ${TAG}_POSTGRES_...
+ */
+function getPGConfig(tag: string): DataSourceOptions {
+  const host = process.env[`${tag}_POSTGRES_HOST`];
+  const port = Number(process.env[`${tag}_POSTGRES_PORT`] || 5432);
+  const username = process.env[`${tag}_POSTGRES_USER`];
+  const password = process.env[`${tag}_POSTGRES_PASSWORD`];
+  const database = process.env[`${tag}_POSTGRES_DB`];
+
+  if (!host || !username || !database) {
+    console.warn(`[WARNING] Missing Postgres credentials for tag: ${tag}`);
+  }
+
+  return {
+    type: "postgres",
+    host,
+    port,
+    username,
+    password,
+    database,
+  };
+}
 
 interface Trade {
   id: number;
@@ -62,16 +70,8 @@ async function getTrades(
   from?: string,
   to?: string
 ): Promise<Trade[]> {
-  const cfg = configs[name];
-
-  const ds = new DataSource({
-    type: "postgres",
-    host: cfg.host,
-    port: cfg.port,
-    username: cfg.username,
-    password: cfg.password,
-    database: cfg.database,
-  });
+  const pgConfig = getPGConfig(name);
+  const ds = new DataSource(pgConfig);
 
   await ds.initialize();
 
@@ -163,16 +163,6 @@ function percentile(values: number[], p: number): number {
   return a[lower] + (a[upper] - a[lower]) * (index - lower);
 }
 
-/**
- * Нормализация progression.
- *
- * Если реальная ставка была $X и реальная прибыль была $P,
- * то прибыль при условной ставке $5:
- *
- * normalizedProfit = P / X * 5
- *
- * Таким образом размер progression НЕ влияет на результат.
- */
 function normalizedProfit(
   profit: number,
   betAmount: number
@@ -215,6 +205,17 @@ function printPriceBuckets(trades: Trade[]) {
 }
 
 function analyze(name: ConfigName, trades: Trade[]) {
+  const validDates = trades
+    .map(t => (t.orderSentAt ? new Date(t.orderSentAt).getTime() : 0))
+    .filter(d => d > 0)
+    .sort((a, b) => a - b);
+
+  const startTime = validDates.length > 0 ? new Date(validDates[0]) : null;
+  const endTime = validDates.length > 0 ? new Date(validDates[validDates.length - 1]) : null;
+
+  const durationMs = startTime && endTime ? endTime.getTime() - startTime.getTime() : 0;
+  const totalDays = Math.max(durationMs / (1000 * 60 * 60 * 24), 1 / 288);
+
   const scannedMarkets = new Set(
     trades.map(t => t.slug).filter(Boolean)
   ).size;
@@ -318,14 +319,34 @@ function analyze(name: ConfigName, trades: Trade[]) {
     return max;
   })();
 
+  const scannedPerDay = scannedMarkets / totalDays;
+  const skippedPerDay = Math.max(0, SLOTS_PER_DAY - scannedPerDay);
+  const executedPerDay = executed.length / totalDays;
+  const winsPerDay = wins.length / totalDays;
+  const lossesPerDay = losses.length / totalDays;
+  const actualProfitPerDay = actualProfit / totalDays;
+  const normalizedProfitPerDay = normalizedTotalProfit / totalDays;
+
   return {
     name,
+
+    startTime,
+    endTime,
+    totalDays,
 
     scannedMarkets,
     executed: executed.length,
     resolved: resolved.length,
     wins: wins.length,
     losses: losses.length,
+
+    scannedPerDay,
+    skippedPerDay,
+    executedPerDay,
+    winsPerDay,
+    lossesPerDay,
+    actualProfitPerDay,
+    normalizedProfitPerDay,
 
     actualProfit,
     actualROI,
@@ -370,13 +391,30 @@ function analyze(name: ConfigName, trades: Trade[]) {
 }
 
 function printAnalysis(a: ReturnType<typeof analyze>) {
+  const startStr = a.startTime ? a.startTime.toISOString().replace("T", " ").slice(0, 19) : "N/A";
+  const endStr = a.endTime ? a.endTime.toISOString().replace("T", " ").slice(0, 19) : "N/A";
+
   console.log(`
 ${a.name}
 ----------------------------------------
+TIME RANGE
+Start time            : ${startStr}
+End time              : ${endStr}
+Duration              : ${a.totalDays.toFixed(2)} days
+
+TOTAL METRICS
 Markets scanned       : ${a.scannedMarkets}
 Executed              : ${a.executed}
 Resolved              : ${a.resolved}
 Wins / Losses         : ${a.wins} / ${a.losses}
+
+DAILY METRICS (1 day = 288 slots)
+Scanned per day       : ${a.scannedPerDay.toFixed(1)} / 288 (${pct(a.scannedPerDay / SLOTS_PER_DAY)})
+Skipped per day       : ${a.skippedPerDay.toFixed(1)} / 288 (${pct(a.skippedPerDay / SLOTS_PER_DAY)})
+Executions per day    : ${a.executedPerDay.toFixed(1)}
+Wins / Losses per day : ${a.winsPerDay.toFixed(1)} / ${a.lossesPerDay.toFixed(1)}
+Actual profit / day   : ${money(a.actualProfitPerDay)}
+Norm profit / day     : ${money(a.normalizedProfitPerDay)}
 
 ACTUAL PROGRESSION
 Total bet amount      : ${money(a.totalBetAmount)}
@@ -414,14 +452,15 @@ async function main() {
   const to = process.env.ANALYSIS_TO;
 
   if (from || to) {
-    console.log("\nAnalysis period:");
+    console.log("\nAnalysis period filter:");
     console.log(`FROM: ${from || "beginning"}`);
     console.log(`TO  : ${to || "end"}`);
   }
 
   const results: Record<string, ReturnType<typeof analyze>> = {};
 
-  for (const name of ["V2", "V3", "V4"] as ConfigName[]) {
+  // Итерируемся по массиву конфигурационных тегов
+  for (const name of CONFIG_TAGS) {
     console.log(`\nAnalyzing ${name}...`);
 
     const trades = await getTrades(name, from, to);
@@ -433,7 +472,7 @@ async function main() {
   console.log("5m PROGRESSION-ADJUSTED ECONOMICS");
   console.log("========================================");
 
-  for (const name of ["V2", "V3", "V4"] as ConfigName[]) {
+  for (const name of CONFIG_TAGS) {
     printAnalysis(results[name]);
   }
 
@@ -442,21 +481,22 @@ async function main() {
   console.log("========================================");
 
   console.log(
-    "\nConfig | ActualProfit | ActualROI | NormProfit | NormROI | NormProfit/Market | AvgEntry | MaxStake"
+    "\nConfig | Days  | ActProfit/Day | NormProfit/Day | Wins/Day | Loss/Day | Skip/Day | ActualROI | NormROI"
   );
 
-  for (const name of ["V2", "V3", "V4"] as ConfigName[]) {
+  for (const name of CONFIG_TAGS) {
     const a = results[name];
 
     console.log(
       `${name.padEnd(6)} | ` +
-      `${money(a.actualProfit).padStart(12)} | ` +
+      `${a.totalDays.toFixed(1).padStart(5)} | ` +
+      `${money(a.actualProfitPerDay).padStart(13)} | ` +
+      `${money(a.normalizedProfitPerDay).padStart(14)} | ` +
+      `${a.winsPerDay.toFixed(1).padStart(8)} | ` +
+      `${a.lossesPerDay.toFixed(1).padStart(8)} | ` +
+      `${a.skippedPerDay.toFixed(1).padStart(8)} | ` +
       `${pct(a.actualROI).padStart(9)} | ` +
-      `${money(a.normalizedTotalProfit).padStart(10)} | ` +
-      `${pct(a.normalizedROI).padStart(7)} | ` +
-      `${money(a.normalizedProfitPerMarket).padStart(17)} | ` +
-      `${a.avgEntry.toFixed(4).padStart(8)} | ` +
-      `${money(a.maxStake).padStart(8)}`
+      `${pct(a.normalizedROI).padStart(7)}`
     );
   }
 
@@ -464,16 +504,13 @@ async function main() {
   console.log("INTERPRETATION");
   console.log("========================================");
 
-  const ranked = (["V2", "V3", "V4"] as ConfigName[])
-    .sort(
-      (a, b) =>
-        results[b].normalizedProfitPerMarket -
-        results[a].normalizedProfitPerMarket
-    );
-
-  console.log(
-    "\nNormalized profit/market order:"
+  const ranked = [...CONFIG_TAGS].sort(
+    (a, b) =>
+      results[b].normalizedProfitPerMarket -
+      results[a].normalizedProfitPerMarket
   );
+
+  console.log("\nNormalized profit/market order:");
 
   ranked.forEach((name, i) => {
     console.log(
@@ -481,23 +518,6 @@ async function main() {
       money(results[name].normalizedProfitPerMarket)
     );
   });
-
-  console.log(`
-IMPORTANT:
-Normalized profit removes the effect of progression stake size.
-Actual profit preserves the real progression economics.
-
-For choosing the strategy itself, pay particular attention to:
-1. Normalized profit / market
-2. Normalized ROI
-3. Number of executions
-4. Fill rate
-5. Entry price distribution
-
-Actual profit is still relevant for the real bankroll,
-but it is NOT sufficient for comparing the underlying configs
-when progression sizes differ.
-`);
 }
 
 main().catch(err => {
