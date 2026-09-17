@@ -46,6 +46,10 @@ const fakeGamma: any = {
 
 const fakeClobPublic = { getBestQuote: async () => null };
 
+// Всегда "достаточно баланса" — тестам этого файла гейт по реальному
+// балансу CLOB не нужен (isSmoke=true во всех сценариях этого файла).
+const fakeBalanceService: any = { getUsdBalance: async () => Number.POSITIVE_INFINITY };
+
 const fakePriceFeed: any = {
   getSnapshot: () => ({ price: null, priceAt: null, atr: null, candleCount: 0, source: null }),
   // Сессия 11: реалистичный дефолт для тестов, которые НЕ подставляют свой —
@@ -174,6 +178,7 @@ async function main() {
     fakeClobPublic as any,
     fakeTrader as any,
     fakePriceFeed as any,
+    fakeBalanceService as any,
     fakeAttemptRepo as any,
     fakeMarketLogRepo as any,
     fakeStreamConfigRepo as any,
@@ -285,7 +290,7 @@ async function main() {
     };
     const gatedSvc: any = new TradingService(
       gatedConfig as any, fakeGamma as any, fakeClobPublic as any, fakeTrader as any,
-      dynamicFeed, fakeAttemptRepo as any, fakeMarketLogRepo as any, fakeStreamConfigRepo as any,
+      dynamicFeed, fakeBalanceService as any, fakeAttemptRepo as any, fakeMarketLogRepo as any, fakeStreamConfigRepo as any,
     );
 
     const ms = makeMarketState({ closesAt: new Date(Date.now() + 280_000), referencePrice: 0.99 });
@@ -525,6 +530,7 @@ async function main() {
       fakeClobPublic as any,
       fakeTrader as any,
       fakePriceFeed as any,
+      fakeBalanceService as any,
       fakeAttemptRepo as any,
       fakeMarketLogRepo as any,
     fakeStreamConfigRepo as any,
@@ -570,6 +576,7 @@ async function main() {
       fakeClobPublic as any,
       fakeTrader as any,
       fakePriceFeed as any, // всегда возвращает price:null — "фид не отдал ни одного тика"
+      fakeBalanceService as any,
       fakeAttemptRepo as any,
       fakeMarketLogRepo as any,
     fakeStreamConfigRepo as any,
@@ -615,6 +622,7 @@ async function main() {
       fakeClobPublic as any,
       fakeTrader as any,
       fakePriceFeed as any,
+      fakeBalanceService as any,
       fakeAttemptRepo as any,
       fakeMarketLogRepo as any,
     fakeStreamConfigRepo as any,
@@ -670,7 +678,7 @@ async function main() {
     const confidentUpFeed: any = { getSnapshot: () => ({ price: 0.53, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }), getAtrRobust: () => null, getSmoothnessRatio: () => null };
     const svcPreWin: any = new TradingService(
       fakeConfig as any, fakeGamma as any, fakeClobPublic as any, fakeTrader as any,
-      confidentUpFeed, fakeAttemptRepo as any, repoWithPending, fakeStreamConfigRepo as any,
+      confidentUpFeed, fakeBalanceService as any, fakeAttemptRepo as any, repoWithPending, fakeStreamConfigRepo as any,
     );
     svcPreWin.preResolveMinAtrRatio = 2;
     svcPreWin.preResolveMaxChain = 1;
@@ -687,7 +695,7 @@ async function main() {
     const confidentDownFeed: any = { getSnapshot: () => ({ price: 0.47, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }), getAtrRobust: () => null, getSmoothnessRatio: () => null };
     const svcPreLoss: any = new TradingService(
       fakeConfig as any, fakeGamma as any, fakeClobPublic as any, fakeTrader as any,
-      confidentDownFeed, fakeAttemptRepo as any, repoWithPending, fakeStreamConfigRepo as any,
+      confidentDownFeed, fakeBalanceService as any, fakeAttemptRepo as any, repoWithPending, fakeStreamConfigRepo as any,
     );
     svcPreLoss.preResolveMinAtrRatio = 2;
     svcPreLoss.preResolveMaxChain = 1;
@@ -698,7 +706,7 @@ async function main() {
     const unsureFeed: any = { getSnapshot: () => ({ price: 0.502, priceAt: Date.now(), atr: 0.01, candleCount: 20, source: 'chainlink' }), getAtrRobust: () => null, getSmoothnessRatio: () => null };
     const svcUnsure: any = new TradingService(
       fakeConfig as any, fakeGamma as any, fakeClobPublic as any, fakeTrader as any,
-      unsureFeed, fakeAttemptRepo as any, repoWithPending, fakeStreamConfigRepo as any,
+      unsureFeed, fakeBalanceService as any, fakeAttemptRepo as any, repoWithPending, fakeStreamConfigRepo as any,
     );
     svcUnsure.preResolveMinAtrRatio = 2;
     svcUnsure.preResolveMaxChain = 1;
@@ -728,7 +736,7 @@ async function main() {
     };
     const svcClose: any = new TradingService(
       fakeConfig as any, fakeGamma as any, fakeClobPublic as any, fakeTrader as any,
-      spyFeed, fakeAttemptRepo as any, fakeMarketLogRepo as any,
+      spyFeed, fakeBalanceService as any, fakeAttemptRepo as any, fakeMarketLogRepo as any,
     fakeStreamConfigRepo as any,
     );
     const ms = makeMarketState({
@@ -758,7 +766,7 @@ async function main() {
         return this.overrides[key] ?? def;
       },
     };
-    const svc: any = new TradingService(cfg as any, fakeGamma as any, fakeClobPublic as any, fakeTrader as any, feed, fakeAttemptRepo as any, fakeMarketLogRepo as any, fakeStreamConfigRepo as any);
+    const svc: any = new TradingService(cfg as any, fakeGamma as any, fakeClobPublic as any, fakeTrader as any, feed, fakeBalanceService as any, fakeAttemptRepo as any, fakeMarketLogRepo as any, fakeStreamConfigRepo as any);
     svc.currentAttempts.set('btc-updown-5m', { id: 'attempt-1', streamKey: 'btc-updown-5m', currentStep: 0, targetSteps: 500, baseStake: 5, currentStake: 5 });
     return svc;
   }

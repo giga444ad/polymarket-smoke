@@ -12,6 +12,7 @@ import { PolymarketTraderService } from '../polymarket/polymarket-trader.service
 import { LiveBook, MarketWsStream, Outcome } from '../polymarket/market-ws-stream';
 import { cumulativeUsdAtOrBelow, walkAsksForFill } from '../polymarket/book-fill.util';
 import { PriceFeedService } from '../polymarket/price-feed.service';
+import { BalanceService } from '../polymarket/balance.service';
 import { parseStreamsConfig, StreamDefinition } from './stream-config';
 import { EntryGateEngine, EntryDiagnostics, GateContext } from './entry-gate.engine';
 import { EdgeWeights, DEFAULT_EDGE_WEIGHTS } from './edge-score.util';
@@ -41,6 +42,10 @@ interface MarketState {
   yesTokenId: string;
   noTokenId: string;
   negRisk: boolean;
+  // conditionId маркета из Gamma (для клейма после резолва, см. RedeemService).
+  // Может быть null, если Gamma почему-то его не отдала — в этом случае
+  // авторедим этого шага просто не сможет случиться (лог/алерт в RedeemService).
+  conditionId: string | null;
   minOrderSize: number;
   stream: MarketWsStream;
   books: Record<Outcome, LiveBook>;
@@ -124,6 +129,10 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(TradingService.name);
 
   private isSmoke: boolean;
+  // Запас поверх стейка шага, который должен оставаться свободным на CLOB-
+  // балансе, чтобы окно вообще открывалось в лайве (см. BalanceService и
+  // обсуждение "клейм не мгновенный — деньги могут быть ещё не заклеймлены").
+  private minBalanceBufferUsd: number;
   private minMarketPrice: number;
   private maxMarketPrice: number;
   private favoriteBidThreshold: number;
@@ -284,12 +293,14 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     private readonly clobPublic: ClobPublicService,
     private readonly trader: PolymarketTraderService,
     private readonly priceFeed: PriceFeedService,
+    private readonly balanceService: BalanceService,
     @InjectRepository(Attempt) private readonly attemptRepo: Repository<Attempt>,
     @InjectRepository(MarketLog) private readonly marketLogRepo: Repository<MarketLog>,
     @InjectRepository(StreamRuntimeConfig) private readonly streamConfigRepo: Repository<StreamRuntimeConfig>,
     @InjectRepository(ActiveWindow) private readonly activeWindowRepo?: Repository<ActiveWindow>,
   ) {
     this.isSmoke = this.config.get<string>('SMOKE_START', 'true') === 'true';
+    this.minBalanceBufferUsd = parseFloat(this.config.get<string>('MIN_BALANCE_BUFFER_USD', '0'));
     this.minMarketPrice = parseFloat(this.config.get<string>('MIN_MARKET_PRICE', '0.99'));
     this.maxMarketPrice = parseFloat(this.config.get<string>('MAX_MARKET_PRICE', '0.999'));
     this.favoriteBidThreshold = parseFloat(
@@ -717,6 +728,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
         market.yesTokenId,
         market.noTokenId,
         market.negRisk,
+        market.conditionId,
         forcedBetAmount,
         predictedFromLogId,
         startTs,
@@ -831,6 +843,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     yesTokenId: string,
     noTokenId: string,
     negRisk: boolean,
+    conditionId: string | null,
     forcedBetAmount: number | null = null,
     predictedFromLogId: string | null = null,
     windowStartTs: number | null = null,
@@ -859,6 +872,46 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     const betAmount = forcedBetAmount ?? attempt.currentStake;
     const attemptId = attempt.id;
     const attemptStepNumber = attempt.currentStep + 1;
+
+    // Гейт по РЕАЛЬНОМУ балансу CLOB (см. BalanceService и обсуждение
+    // "клейм не мгновенный") — только в лайве, в смоуке баланс не тратится
+    // по-настоящему и всегда достаточен. Явно пропускаем окно, а не пытаемся
+    // исполнить ордер урезанным размером молча — недостача видна в логе и в
+    // marketLogRepo.status='skipped', а не как загадочный низкий fillRatio.
+    if (!this.isSmoke) {
+      const availableUsd = await this.balanceService.getUsdBalance();
+      const required = betAmount + this.minBalanceBufferUsd;
+      if (availableUsd == null) {
+        this.logger.warn(
+          `[${streamKey}] ${slug}: не удалось получить баланс CLOB — открываю окно без гейта по балансу ` +
+            '(лучше urgently проверить вручную, что баланс реально достаточен).',
+        );
+      } else if (availableUsd < required) {
+        this.logger.warn(
+          `[${streamKey}] ${slug}: пропуск окна — недостаточно свободного USDC на CLOB-балансе ` +
+            `($${availableUsd.toFixed(2)} доступно, нужно $${required.toFixed(2)} = стейк $${betAmount.toFixed(2)} ` +
+            `+ буфер $${this.minBalanceBufferUsd.toFixed(2)}). Вероятная причина — выигрыши ещё не заклеймлены ` +
+            '(см. RedeemService) либо баланс аккаунта реально исчерпан.',
+        );
+        await this.marketLogRepo.save(
+          this.marketLogRepo.create({
+            attemptId,
+            stepNumber: attemptStepNumber,
+            assetPrefix: streamKey,
+            slug,
+            closesAt,
+            betAmount,
+            isSmoke: this.isSmoke,
+            executed: false,
+            status: 'skipped',
+            skipReason: `insufficient_balance: available=$${availableUsd.toFixed(2)} required=$${required.toFixed(2)}`,
+            conditionId,
+            negRisk,
+          }),
+        );
+        return;
+      }
+    }
 
     // Фиксируем ориентир по внешнему фиду В МОМЕНТ ОФИЦИАЛЬНОГО СТАРТА ОКНА
     // (windowStartTs), а НЕ "текущую" цену на момент, когда мы вообще успели
@@ -918,6 +971,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       yesTokenId,
       noTokenId,
       negRisk,
+      conditionId,
       minOrderSize,
       stream: null as any,
       books: {
@@ -1499,6 +1553,12 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
         stakePredicted: marketState.stakePredicted,
         predictedFromLogId: marketState.predictedFromLogId,
         isSmoke: this.isSmoke,
+        conditionId: marketState.conditionId,
+        negRisk: marketState.negRisk,
+        // На запись лог ещё не знает исхода (status='pending_resolve' на
+        // executed=true шагах) — redeemStatus проставляется резолвером
+        // (resolvePendingMarkets) в момент, когда исход становится известен.
+        redeemStatus: 'not_applicable',
         chosenOutcome: fields.chosenOutcome,
         chosenTokenId: fields.chosenTokenId ?? null,
         entryPrice: fields.entryPrice ?? null,
@@ -1607,6 +1667,18 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       log.profit = won ? (spentUsd / entryPrice) * (1 - entryPrice) : -spentUsd;
       if (!won) {
         log.failReason = this.buildFailReason(log);
+      }
+      // Клейм актуален только для реальных (не смоук) выигрышей — реальные
+      // деньги на бирже физически заперты в conditional-токене, пока
+      // RedeemService не проведёт redeemPositions через relayer (см. CONTEXT.md,
+      // раздел "Клейм резолва"). Без conditionId клеймить нечем — это может
+      // случиться, если Gamma не отдала его на момент открытия окна; тогда
+      // редим этого шага придётся делать вручную (RedeemService залогирует).
+      if (won && !log.isSmoke) {
+        log.redeemStatus = log.conditionId ? 'pending' : 'failed';
+        if (!log.conditionId) {
+          log.redeemError = 'conditionId отсутствовал на момент открытия окна — авторедим невозможен, клеймить вручную через UI.';
+        }
       }
       await this.marketLogRepo.save(log);
 

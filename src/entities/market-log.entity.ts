@@ -240,4 +240,32 @@ export class MarketLog {
 
   @Column({ type: 'boolean', nullable: true })
   edgeWouldEnter: boolean | null;
+
+  // --- Клейм резолва (редим conditional-токенов через relayer, см. RedeemService) ---
+
+  // conditionId маркета из Gamma (нужен для redeemPositions на CTF/NegRiskAdapter).
+  // Пишем ВСЕГДА, независимо от isSmoke — дёшево, и упрощает ручной аудит.
+  @Column({ type: 'varchar', length: 80, nullable: true })
+  conditionId: string | null;
+
+  // neg-risk маркеты редимятся через другой контракт/сигнатуру — см.
+  // RedeemService, авторедим для них сейчас не реализован.
+  @Column({ type: 'boolean', default: false })
+  negRisk: boolean;
+
+  // 'not_applicable' — смоук либо шаг не выигрышный (клеймить нечего);
+  // 'pending' — выигрыш подтверждён резолвером, ждёт пачки редима;
+  // 'redeemed' — relayer подтвердил исполнение;
+  // 'failed' — relayer вернул ошибку/таймаут (см. redeemError, требует ручного разбора).
+  @Column({ type: 'varchar', length: 16, default: 'not_applicable' })
+  redeemStatus: 'not_applicable' | 'pending' | 'redeemed' | 'failed';
+
+  @Column({ type: 'varchar', length: 128, nullable: true })
+  redeemTransactionId: string | null;
+
+  @Column({ type: 'timestamptz', nullable: true })
+  redeemedAt: Date | null;
+
+  @Column({ type: 'text', nullable: true })
+  redeemError: string | null;
 }

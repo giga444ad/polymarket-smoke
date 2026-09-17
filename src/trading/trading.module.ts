@@ -14,6 +14,8 @@ import { PolymarketTraderService } from '../polymarket/polymarket-trader.service
 import { PriceFeedService } from '../polymarket/price-feed.service';
 import { CandleHistoryService } from '../polymarket/candle-history.service';
 import { EdgeSamplerService } from './edge-sampler.service';
+import { BalanceService } from '../polymarket/balance.service';
+import { RedeemService } from '../polymarket/redeem.service';
 
 @Module({
   imports: [TypeOrmModule.forFeature([Attempt, MarketLog, PriceCandle, ActiveWindow, EdgeScoreSample, StreamRuntimeConfig])],
@@ -28,6 +30,11 @@ import { EdgeSamplerService } from './edge-sampler.service';
     // Сессия 17: чисто диагностический сэмплер (см. edge-sampler.service.ts) —
     // не влияет на реальные ордера, включается флагом EDGE_SAMPLER_ENABLED.
     EdgeSamplerService,
+    // Подготовка к лайву (см. CONTEXT.md, "Клейм резолва" и "Реальный баланс"):
+    // BalanceService — гейт по реальному балансу CLOB перед открытием окна;
+    // RedeemService — автоклейм резолвнутых выигрышей через relayer.
+    BalanceService,
+    RedeemService,
   ],
   exports: [TypeOrmModule],
 })
