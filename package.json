@@ -19,7 +19,8 @@
     "ticks:record": "tsx scripts/tick-recorder.ts",
     "check:edge": "tsx scripts/calibrate-edge.ts",
     "user:create": "tsx scripts/create-user.ts",
-    "backtest:sweep": "tsx scripts/backtest-sweep.ts"
+    "backtest:sweep": "tsx scripts/backtest-sweep.ts",
+    "test:configs": "tsx scripts/test-market-logs.ts"
   },
   "dependencies": {
     "@nestjs/common": "^11.2.3",
