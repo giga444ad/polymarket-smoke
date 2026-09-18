@@ -457,7 +457,15 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     const configRows = await this.streamConfigRepo.find();
     const enabledByKey = new Map(configRows.map((r) => [r.streamKey, r.enabled]));
     for (const stream of this.streams) {
-      this.enabledByStream.set(stream.streamKey, enabledByKey.get(stream.streamKey) ?? true);
+      // Пустая БД (после очистки или на первом деплое) = нет строки для
+      // этого streamKey -> по умолчанию ПАУЗА, а не автозапуск. Раньше было
+      // "?? true" — свежий деплой без единой строки в stream_config сразу
+      // начинал реально торговать, что требовало руками сеять enabled=false
+      // заранее, чтобы стартовать на паузе. Явно записанное значение (true
+      // ИЛИ false) из БД по-прежнему в приоритете — эта смена дефолта не
+      // трогает уже настроенные потоки, только те, для которых в БД вообще
+      // нет строки.
+      this.enabledByStream.set(stream.streamKey, enabledByKey.get(stream.streamKey) ?? false);
     }
 
     // Восстанавливаем pendingByStream из БД — переживает рестарт процесса.
@@ -482,7 +490,8 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
         this.streams
           .map((s) => {
             const a = this.currentAttempts.get(s.streamKey)!;
-            return `${s.streamKey}[попытка #${a.attemptNumber}, шаг ${a.currentStep}/${a.targetSteps}, стейк $${a.currentStake.toFixed(2)}]`;
+            const enabled = this.enabledByStream.get(s.streamKey) ?? false;
+            return `${s.streamKey}[попытка #${a.attemptNumber}, шаг ${a.currentStep}/${a.targetSteps}, стейк $${a.currentStake.toFixed(2)}${enabled ? '' : ', ПАУЗА — включить: PATCH /trading/settings/' + s.streamKey}]`;
           })
           .join('; ') +
         `. Маркет-тейк [¢${this.minMarketPrice * 100}-¢${this.maxMarketPrice * 100}] (минимум заполнения ${this.minFillRatio * 100}%), ` +
