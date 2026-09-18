@@ -1350,6 +1350,10 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       });
       const orderFilledAt = new Date();
 
+      this.logger.log(
+        `[${marketState.assetPrefix}][LIVE] Результат ордера: ${JSON.stringify(result)}`
+      )
+
       if (!result.success) {
         this.logger.warn(`[${marketState.assetPrefix}][LIVE][Market] ${marketState.slug}: ордер не исполнился (success=false), пробуем дальше`);
         return;
