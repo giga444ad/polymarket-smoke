@@ -1416,7 +1416,14 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       const tokenId = outcome === 'YES' ? marketState.yesTokenId : marketState.noTokenId;
       const targetUsd = this.limitOrderTargetUsd(marketState, price);
 
+      // Блокировка текущего тира = "сейчас в эту позицию не входим". Значит и
+      // ранее выставленный resting (напр. T1 @ ¢90) держать нельзя — он живёт
+      // на бирже автономно, в обход гейтов, и исполнится ровно при движении
+      // рынка ПРОТИВ нас (когда ask проваливается до нашего bid). Поэтому при
+      // любом блоке тира снимаем висящий resting. Порядок важен:
+      // cancelRestingIfAny обнуляет skippedLimitTier, поэтому ставим флаг ПОСЛЕ.
       if (targetUsd > marketState.betAmount * this.maxOverspendMultiplier) {
+        await this.cancelRestingIfAny(marketState);
         marketState.skippedLimitTier = tier;
         this.logger.debug(
           `[${marketState.assetPrefix}][Limit] ${marketState.slug}: пропуск тира ${tier} — нужно ~$${targetUsd.toFixed(2)} для минимума биржи, больше допустимого.`,
@@ -1426,10 +1433,11 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
 
       const gate = this.evaluateEntryGate(marketState, outcome);
       if (!gate.allow) {
+        await this.cancelRestingIfAny(marketState);
         marketState.skippedLimitTier = tier;
         this.logEntryGateBlockThrottled(
           marketState,
-          `[${marketState.assetPrefix}][Limit] ${marketState.slug}: тир ${tier} — выставление заблокировано. ${gate.reason}`,
+          `[${marketState.assetPrefix}][Limit] ${marketState.slug}: тир ${tier} — выставление заблокировано (resting снят). ${gate.reason}`,
         );
         return;
       }
