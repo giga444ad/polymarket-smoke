@@ -57,6 +57,12 @@ interface MarketState {
   // чтобы не долбить лог на каждый WS-тик одним и тем же выводом (это и был баг со спамом).
   skippedLimitTier: LimitTier | null;
   lastMarketAttemptAt: number;
+  // Троттл и in-flight-гард для лимит-пути: placeOrReplaceLimit вызывается
+  // void'ом на каждый WS-тик стакана, поэтому без этих двух защит при любой
+  // ошибке постановки (rate-limit, реджект подписи) он уходил в сотни
+  // параллельных запросов/сек к /order (см. боевой лог 09/18 21:18).
+  lastLimitAttemptAt: number;
+  limitInFlight: boolean;
   closeTimer: NodeJS.Timeout;
   // Цена по внешнему ценовому фиду (Binance, proxy) на момент открытия окна —
   // наш локальный ориентир "точки старта" для UP/DOWN. null, если фид ещё не готов.
@@ -1048,6 +1054,8 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       restingOrder: null,
       skippedLimitTier: null,
       lastMarketAttemptAt: 0,
+      lastLimitAttemptAt: 0,
+      limitInFlight: false,
       closeTimer: null as any,
       referencePrice: referenceSnapshot.price,
       marketLogId: null,
@@ -1397,6 +1405,13 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     price: number,
     tickSize: string,
   ): Promise<void> {
+    // Анти-флуд: не даём наложиться параллельным постановкам (метод вызывается
+    // void'ом на каждый тик стакана) и не долбим биржу чаще раза в секунду —
+    // иначе любая ошибка постановки превращается в шторм 429 на /order.
+    if (marketState.limitInFlight) return;
+    if (Date.now() - marketState.lastLimitAttemptAt < 1000) return;
+    marketState.lastLimitAttemptAt = Date.now();
+    marketState.limitInFlight = true;
     try {
       const tokenId = outcome === 'YES' ? marketState.yesTokenId : marketState.noTokenId;
       const targetUsd = this.limitOrderTargetUsd(marketState, price);
@@ -1448,6 +1463,8 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       );
     } catch (err) {
       this.logger.error(`[${marketState.assetPrefix}][Error][Limit] ${marketState.slug}: ${this.errMsg(err)}`);
+    } finally {
+      marketState.limitInFlight = false;
     }
   }
 
