@@ -280,6 +280,11 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
   // (staleResolveWarnMs) — этот лог нужен только для локальной отладки, не
   // для постоянного потока.
   private lastGateSkipLogAt = new Map<string, number>();
+  // Рубильник потока (см. StreamRuntimeConfig.enabled) — кэш в памяти,
+  // читается на каждом discoveryTick (раз в ~1.5с), поэтому не ходим в БД
+  // на каждый тик: грузим один раз в onModuleInit и обновляем синхронно
+  // из setEnabled при PATCH с дашборда.
+  private enabledByStream = new Map<string, boolean>();
   private static readonly GATE_SKIP_LOG_THROTTLE_MS = 30_000;
   private static readonly ENTRY_GATE_LOG_THROTTLE_MS = 15_000;
   // Порог "подозрительно большого" лага найденного тика от истинной границы
@@ -446,6 +451,15 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       this.currentAttempts.set(stream.streamKey, attempt);
     }
 
+    // Рубильник потока — грузим текущее состояние из БД (переживает рестарт:
+    // если поставил на паузу вчера и не включил обратно, после рестарта
+    // останется на паузе, а не тихо оживёт).
+    const configRows = await this.streamConfigRepo.find();
+    const enabledByKey = new Map(configRows.map((r) => [r.streamKey, r.enabled]));
+    for (const stream of this.streams) {
+      this.enabledByStream.set(stream.streamKey, enabledByKey.get(stream.streamKey) ?? true);
+    }
+
     // Восстанавливаем pendingByStream из БД — переживает рестарт процесса.
     // Без этого после рестарта bloqueOrdersIfPending "забыл" бы про шаг,
     // который уже был отправлен до рестарта и всё ещё не зарезолвлен.
@@ -545,10 +559,20 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** Режимы по ВСЕМ известным потокам сразу — для экрана настроек. */
-  async getCloseModes(): Promise<Array<{ streamKey: string; closeMode: CloseMode }>> {
+  async getCloseModes(): Promise<
+    Array<{ streamKey: string; closeMode: CloseMode; enabled: boolean; hasActiveWindow: boolean; pendingSteps: number }>
+  > {
     const rows = await this.streamConfigRepo.find();
-    const byKey = new Map(rows.map((r) => [r.streamKey, r.closeMode]));
-    return this.streams.map((s) => ({ streamKey: s.streamKey, closeMode: byKey.get(s.streamKey) ?? 'steps' }));
+    const byKey = new Map(rows.map((r) => [r.streamKey, r]));
+    return this.streams.map((s) => ({
+      streamKey: s.streamKey,
+      closeMode: byKey.get(s.streamKey)?.closeMode ?? 'steps',
+      enabled: this.enabledByStream.get(s.streamKey) ?? true,
+      // Чтобы на дашборде было видно "пауза, но ждём завершения текущей
+      // сделки" — активное окно и/или ещё не зарезолвленные шаги.
+      hasActiveWindow: this.activeMarkets.has(s.streamKey),
+      pendingSteps: this.pendingByStream.get(s.streamKey)?.size ?? 0,
+    }));
   }
 
   async setCloseMode(streamKey: string, closeMode: CloseMode): Promise<void> {
@@ -557,6 +581,25 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     }
     await this.streamConfigRepo.upsert({ streamKey, closeMode }, ['streamKey']);
     this.logger.log(`[${streamKey}] Режим закрытия попытки переключён на "${closeMode}".`);
+  }
+
+  /**
+   * Рубильник потока (пауза/возобновление) — см. StreamRuntimeConfig.enabled
+   * и гейт в discoveryTick. Не трогает уже открытую позицию: при выключении
+   * discoveryTick просто перестаёт открывать новые окна, а всё, что уже в
+   * процессе (WS-стрим текущего окна, резолв, клейм), доводится до конца
+   * как обычно — отдельными циклами, которые от этого флага не зависят.
+   */
+  async setEnabled(streamKey: string, enabled: boolean): Promise<void> {
+    if (!this.streamByKey.has(streamKey)) {
+      throw new NotFoundException(`Неизвестный поток "${streamKey}".`);
+    }
+    await this.streamConfigRepo.upsert({ streamKey, enabled }, ['streamKey']);
+    this.enabledByStream.set(streamKey, enabled);
+    this.logger.log(
+      `[${streamKey}] Поток ${enabled ? 'возобновлён' : 'поставлен на паузу'} ` +
+        `(активное окно есть: ${this.activeMarkets.has(streamKey)}, незарезолвленных шагов: ${this.pendingByStream.get(streamKey)?.size ?? 0}).`,
+    );
   }
 
   /**
@@ -679,6 +722,18 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
 
   private async discoveryTick(): Promise<void> {
     for (const stream of this.streams) {
+      if (this.enabledByStream.get(stream.streamKey) === false) {
+        // На паузе (см. setEnabled/PATCH /trading/settings) — просто не
+        // открываем НОВОЕ окно. Уже открытая позиция (если есть) продолжает
+        // жить своей жизнью через остальные тики/резолвер/клейм — этот гейт
+        // трогает только точку входа в новое окно, ничего не обрывает.
+        this.logGateSkipThrottled(
+          `${stream.streamKey}:paused`,
+          `[${stream.streamKey}] поток на паузе (enabled=false) — новое окно не открываем.`,
+        );
+        continue;
+      }
+
       const startTs = this.gamma.currentIntervalStartTimestampSec(stream.intervalSec);
       const closeTs = this.gamma.currentIntervalCloseTimestampSec(stream.intervalSec);
       const slug = this.gamma.buildSlugForStart(stream, startTs);

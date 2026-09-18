@@ -20,8 +20,7 @@
     "check:edge": "tsx scripts/calibrate-edge.ts",
     "user:create": "tsx scripts/create-user.ts",
     "backtest:sweep": "tsx scripts/backtest-sweep.ts",
-    "test:configs": "tsx scripts/test-market-logs.ts",
-    "register:api-key": "tsx scripts/register-account.ts"
+    "test:configs": "tsx scripts/test-market-logs.ts"
   },
   "dependencies": {
     "@nestjs/common": "^11.2.3",
@@ -34,8 +33,8 @@
     "@nestjs/throttler": "^6.4.0",
     "@nestjs/typeorm": "^12.0.1",
     "@polymarket/clob-client": "5.8.1",
-    "@polymarket/builder-relayer-client": "0.0.10",
-    "@polymarket/builder-signing-sdk": "^0.0.8",
+    "@polymarket/client": "0.0.0-canary-20260914153900",
+    "ethers-v5": "npm:ethers@^5.8.0",
     "axios": "^1.20.0",
     "bcrypt": "^5.1.1",
     "class-transformer": "^0.5.1",

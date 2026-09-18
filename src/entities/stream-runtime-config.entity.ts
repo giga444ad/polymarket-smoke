@@ -18,6 +18,14 @@ export class StreamRuntimeConfig {
   @Column({ type: 'varchar', length: 16, default: 'steps' })
   closeMode: CloseMode;
 
+  // Ручной рубильник потока (Сессия "полуручной лайв-тест"): при false
+  // discoveryTick перестаёт открывать НОВЫЕ окна для этого потока, но уже
+  // открытая позиция/ещё не зарезолвленный шаг доводится до конца как
+  // обычно (резолв, клейм) — пауза не бросает деньги на середине. Дефолт
+  // true — обратная совместимость с поведением до этой фичи.
+  @Column({ type: 'boolean', default: true })
+  enabled: boolean;
+
   @UpdateDateColumn()
   updatedAt: Date;
 }

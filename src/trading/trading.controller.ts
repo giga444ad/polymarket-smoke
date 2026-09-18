@@ -43,8 +43,13 @@ export class TradingController {
   @Roles(Role.ADMIN)
   @Patch('settings/:streamKey')
   async updateSettings(@Param('streamKey') streamKey: string, @Body() dto: UpdateStreamSettingsDto) {
-    await this.trading.setCloseMode(streamKey, dto.closeMode);
-    return { ok: true, streamKey, closeMode: dto.closeMode };
+    if (dto.closeMode !== undefined) {
+      await this.trading.setCloseMode(streamKey, dto.closeMode);
+    }
+    if (dto.enabled !== undefined) {
+      await this.trading.setEnabled(streamKey, dto.enabled);
+    }
+    return { ok: true, streamKey, closeMode: dto.closeMode, enabled: dto.enabled };
   }
 
   // Ручной патч ТЕКУЩЕГО прогресса конкретной попытки (не дефолтов потока) —

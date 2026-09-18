@@ -16,6 +16,7 @@ import { CandleHistoryService } from '../polymarket/candle-history.service';
 import { EdgeSamplerService } from './edge-sampler.service';
 import { BalanceService } from '../polymarket/balance.service';
 import { RedeemService } from '../polymarket/redeem.service';
+import { PolymarketSecureClientService } from '../polymarket/secure-client.service';
 
 @Module({
   imports: [TypeOrmModule.forFeature([Attempt, MarketLog, PriceCandle, ActiveWindow, EdgeScoreSample, StreamRuntimeConfig])],
@@ -31,8 +32,11 @@ import { RedeemService } from '../polymarket/redeem.service';
     // не влияет на реальные ордера, включается флагом EDGE_SAMPLER_ENABLED.
     EdgeSamplerService,
     // Подготовка к лайву (см. CONTEXT.md, "Клейм резолва" и "Реальный баланс"):
-    // BalanceService — гейт по реальному балансу CLOB перед открытием окна;
-    // RedeemService — автоклейм резолвнутых выигрышей через relayer.
+    // PolymarketSecureClientService — общий @polymarket/client (canary) с
+    // авторизацией по простому Relayer API Key; BalanceService — гейт по
+    // реальному балансу перед открытием окна; RedeemService — автоклейм
+    // резолвнутых выигрышей.
+    PolymarketSecureClientService,
     BalanceService,
     RedeemService,
   ],
