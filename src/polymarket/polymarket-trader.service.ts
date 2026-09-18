@@ -1,24 +1,19 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
-import { ClobClient, OrderType, Side } from '@polymarket/clob-client';
-import { Wallet } from 'ethers';
+import { OrderSide, OrderType } from '@polymarket/client';
+import { PolymarketSecureClientService } from './secure-client.service';
 
 export interface PlaceMarketOrderParams {
   tokenId: string;
-  /** $$$-сумма к покупке (не количество токенов) — см. UserMarketOrder.amount в SDK. */
+  /** $$$-сумма к покупке (не количество токенов) — amount у placeMarketOrder в SDK. */
   amountUsd: number;
   /** Худшая цена, дальше которой не идём (у нас — верхняя граница входа, напр. 0.999). */
   worstPrice: number;
-  tickSize: string;
-  negRisk: boolean;
 }
 
 export interface PlaceLimitOrderParams {
   tokenId: string;
   price: number;
   size: number;
-  tickSize: string;
-  negRisk: boolean;
   /** unix-секунды, после которых биржа сама снимет ордер (обычно = закрытие маркета). */
   expirationUnixSec: number;
 }
@@ -39,155 +34,93 @@ export interface OrderStatus {
 }
 
 /**
+ * Боевая отправка ордеров через НОВЫЙ унифицированный SDK @polymarket/client
+ * (см. secure-client.service.ts — там же разбор авторизации по Relayer API Key).
+ *
+ * ПОЧЕМУ НЕ @polymarket/clob-client:
+ * На конец сентября 2026 архивный @polymarket/clob-client перестал приниматься
+ * биржей — createAndPostMarketOrder/createAndPostOrder возвращают
+ * {"error":"invalid order version, please use the latest clob-client"}.
+ * Официальный quickstart и остальной боевой код проекта (клейм/баланс) уже
+ * работают через @polymarket/client, поэтому и создание ордеров переведено на
+ * тот же клиент (SecureClient из PolymarketSecureClientService).
+ *
  * ВАЖНО (прочитать перед боевым запуском, т.е. SMOKE_START=false):
- *
- * На конец сентября 2026 GitHub-репозиторий Polymarket/clob-client помечен
- * как archived и содержит предупреждение "The client is no longer functional
- * and should not be used for new or existing integrations" — Polymarket
- * рекомендует переходить на новый унифицированный SDK @polymarket/client,
- * который на этот же момент имеет статус beta и API, который ещё меняется.
- * При этом страница docs.polymarket.com/trading/quickstart на тот же момент
- * всё ещё описывала установку именно @polymarket/clob-client — то есть сами
- * официальные источники противоречат друг другу.
- *
- * Поэтому этот сервис нарочно изолирован в один файл и используется ТОЛЬКО
- * когда SMOKE_START=false. Смоук-тест (чтение стакана, вся логика БД/шагов)
- * от этого файла не зависит вообще и будет работать даже если пакет
- * действительно не функционирует.
- *
- * Перед реальным запуском: проверьте актуальное состояние на
- * https://docs.polymarket.com/trading/quickstart и https://github.com/Polymarket/ts-sdk,
- * и обязательно проведите один ручной раунд (create → post → проверить исполнение
- * в личном кабинете) до того, как оставлять бота работать без присмотра ночью.
+ * - tickSize/negRisk новому SDK передавать НЕ нужно — он резолвит их сам.
+ * - GTD-лимитка требует expiration ≥ 3 минут в будущем; в 5-минутном маркете
+ *   это часто нарушается, поэтому при малом остатке времени ставим GTC без
+ *   expiration (бот всё равно снимает резервный ордер сам, см.
+ *   cancelRestingIfAny/finalizeMarket в trading.service.ts).
+ * - SIGNATURE_TYPE=2 (прокси-кошелёк): подпись ордера этим путём вживую ещё
+ *   не гонялась — обязателен один ручной боевой раунд (create → проверить
+ *   исполнение в личном кабинете) до автозапуска без присмотра.
  */
 @Injectable()
 export class PolymarketTraderService {
   private readonly logger = new Logger(PolymarketTraderService.name);
-  private client: ClobClient | null = null;
-  private initPromise: Promise<ClobClient> | null = null;
 
-  constructor(private readonly config: ConfigService) {}
+  /** Минимальный запас времени (сек) до истечения, при котором ещё ставим GTD.
+   *  Ниже порога SDK отвергнет GTD (нужно ≥3 мин) — ставим GTC вместо этого. */
+  private static readonly GTD_MIN_LEAD_SEC = 210;
 
-  /** Лениво инициализирует боевой клиент. Бросает исключение, если не получилось —
-   *  вызывающий код (TradingService) обязан на этой ошибке принудительно уйти в смоук. */
-  async ensureClient(): Promise<ClobClient> {
-    if (this.client) return this.client;
-    if (!this.initPromise) {
-      this.initPromise = this.initClient();
-    }
-    this.client = await this.initPromise;
-    return this.client;
-  }
+  constructor(private readonly secureClientService: PolymarketSecureClientService) {}
 
-  private async initClient(): Promise<ClobClient> {
-    const privateKeyRaw = this.config.get<string>('PRIVATE_KEY');
-    if (!privateKeyRaw) {
-      throw new Error('PRIVATE_KEY не задан в .env — боевая торговля невозможна');
-    }
-    const privateKey = privateKeyRaw.startsWith('0x')
-      ? privateKeyRaw
-      : `0x${privateKeyRaw}`;
-
-    const host = this.config.get<string>(
-      'CLOB_HOST',
-      'https://clob.polymarket.com',
-    );
-    const chainId = 137;
-    const signer = new Wallet(privateKey);
-
-    const signatureType = parseInt(
-      this.config.get<string>('SIGNATURE_TYPE', '0'),
-      10,
-    );
-    const funder =
-      this.config.get<string>('FUNDER_ADDRESS', '') || signer.address;
-
-    const apiKey = this.config.get<string>('POLY_API_KEY', '');
-    const apiSecret = this.config.get<string>('POLY_SECRET', '');
-    const apiPassphrase = this.config.get<string>('POLY_PASSPHRASE', '');
-
-    let creds;
-    if (apiKey && apiSecret && apiPassphrase) {
-      creds = { key: apiKey, secret: apiSecret, passphrase: apiPassphrase };
-      this.logger.log('Использую L2 API ключи из .env');
-    } else {
-      this.logger.log(
-        'L2 API ключи не заданы в .env — пробую derive/createOrDerive через приватный ключ...',
-      );
-      const bootstrapClient = new ClobClient(host, chainId, signer);
-      creds = await bootstrapClient.createOrDeriveApiKey();
-    }
-
-    const client = new ClobClient(
-      host,
-      chainId,
-      signer,
-      creds,
-      signatureType,
-      funder,
-    );
-
-    this.logger.warn(
-      `Боевой CLOB-клиент инициализирован (funder=${funder}, signatureType=${signatureType}). ` +
-        'Реальные ордера будут отправляться на биржу.',
-    );
-
-    return client;
+  /** Прогрев боевого клиента на старте: если авторизация/ключи невалидны — бросит,
+   *  и вызывающий (TradingService.onModuleInit) принудительно уйдёт в SMOKE. */
+  async ensureClient(): Promise<void> {
+    await this.secureClientService.getClient();
   }
 
   /**
    * Правило A (агрессивный вход): "рыночный" ордер с потолком цены.
    * У Polymarket нет чистого market-ордера без ценового потолка — ближайший
    * аналог это FAK (fill-and-kill = IOC): берёт всё, что есть в стакане по
-   * цене <= worstPrice, остаток снимает сам. amount передаём в $$$, а не в
-   * штуках токена — так работает UserMarketOrder в SDK.
+   * цене <= maxPrice, остаток снимает сам. amount передаём в $$$, а не в
+   * штуках токена.
    */
   async placeMarketBuy(params: PlaceMarketOrderParams): Promise<PlaceOrderResult> {
-    const client = await this.ensureClient();
+    const client = await this.secureClientService.getClient();
 
-    const resp: any = await client.createAndPostMarketOrder(
-      {
-        tokenID: params.tokenId,
-        price: params.worstPrice,
-        amount: params.amountUsd,
-        side: Side.BUY,
-        orderType: OrderType.FAK,
-      },
-      { tickSize: params.tickSize as any, negRisk: params.negRisk },
-      OrderType.FAK,
-    );
+    const resp = await client.placeMarketOrder({
+      assetId: params.tokenId,
+      side: OrderSide.BUY,
+      amount: params.amountUsd,
+      maxPrice: params.worstPrice,
+      orderType: OrderType.FAK,
+    });
 
     return this.toResult(resp);
   }
 
   /**
    * Правило B (лимитка на случай отсутствия предложений): GTD-ордер
-   * (good-till-date) с истечением ровно на закрытии маркета — если не
-   * успели сами отменить/переставить, биржа снимет его сама и деньги не
-   * повиснут в воздухе после резолва маркета.
+   * (good-till-date) с истечением ровно на закрытии маркета. Если до закрытия
+   * осталось меньше GTD_MIN_LEAD_SEC — SDK отверг бы GTD, поэтому ставим GTC
+   * без expiration; висящий ордер всё равно снимается ботом при
+   * пересборке/финализации окна.
    */
   async placeLimitBuy(params: PlaceLimitOrderParams): Promise<PlaceOrderResult> {
-    const client = await this.ensureClient();
+    const client = await this.secureClientService.getClient();
 
-    const resp: any = await client.createAndPostOrder(
-      {
-        tokenID: params.tokenId,
-        price: params.price,
-        size: params.size,
-        side: Side.BUY,
-        expiration: params.expirationUnixSec,
-      },
-      { tickSize: params.tickSize as any, negRisk: params.negRisk },
-      OrderType.GTD,
-    );
+    const nowSec = Math.floor(Date.now() / 1000);
+    const useGtd =
+      params.expirationUnixSec - nowSec >= PolymarketTraderService.GTD_MIN_LEAD_SEC;
+
+    const resp = await client.placeLimitOrder({
+      assetId: params.tokenId,
+      price: params.price,
+      size: params.size,
+      side: OrderSide.BUY,
+      ...(useGtd ? { expiration: params.expirationUnixSec } : {}),
+    });
 
     return this.toResult(resp);
   }
 
   async cancelOrder(orderId: string): Promise<void> {
-    const client = await this.ensureClient();
     try {
-      await client.cancelOrder({ orderID: orderId });
+      const client = await this.secureClientService.getClient();
+      await client.cancelOrder({ orderId });
     } catch (err) {
       // Ордер мог уже исполниться/истечь сам — это не критично, просто логируем.
       this.logger.warn(`Не удалось отменить ордер ${orderId}: ${this.errMsg(err)}`);
@@ -195,14 +128,14 @@ export class PolymarketTraderService {
   }
 
   async getOrderStatus(orderId: string): Promise<OrderStatus | null> {
-    const client = await this.ensureClient();
     try {
-      const order = await client.getOrder(orderId);
+      const client = await this.secureClientService.getClient();
+      const order = await client.fetchOrder({ orderId });
       return {
         id: order.id,
         status: order.status,
-        originalSize: parseFloat(order.original_size),
-        sizeMatched: parseFloat(order.size_matched),
+        originalSize: parseFloat(order.originalSize),
+        sizeMatched: parseFloat(order.sizeMatched),
       };
     } catch (err) {
       this.logger.warn(`Не удалось получить статус ордера ${orderId}: ${this.errMsg(err)}`);
@@ -211,9 +144,21 @@ export class PolymarketTraderService {
   }
 
   private toResult(resp: any): PlaceOrderResult {
+    if (resp?.ok === false) {
+      this.logger.warn(
+        `Ордер отвергнут биржей: code=${resp?.code ?? '?'} message=${resp?.message ?? '?'}`,
+      );
+      return {
+        orderId: null,
+        success: false,
+        takingAmount: null,
+        makingAmount: null,
+        raw: resp,
+      };
+    }
     return {
-      orderId: resp?.orderID ?? resp?.orderId ?? null,
-      success: resp?.success !== false,
+      orderId: resp?.orderId ?? null,
+      success: true,
       takingAmount: resp?.takingAmount ?? null,
       makingAmount: resp?.makingAmount ?? null,
       raw: resp,

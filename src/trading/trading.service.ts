@@ -1345,8 +1345,6 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
         tokenId,
         amountUsd: marketState.betAmount,
         worstPrice: this.maxMarketPrice,
-        tickSize: book.tickSize,
-        negRisk: marketState.negRisk,
       });
       const orderFilledAt = new Date();
 
@@ -1436,8 +1434,6 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
         tokenId,
         price,
         size,
-        tickSize,
-        negRisk: marketState.negRisk,
         expirationUnixSec: Math.floor(marketState.closesAt.getTime() / 1000),
       });
 
