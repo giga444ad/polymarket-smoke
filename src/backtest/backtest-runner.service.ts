@@ -521,6 +521,8 @@ export class BacktestRunnerService {
       // live, поэтому прогон на истории воспроизводит ровно ту конфигурацию
       // edge-модели, с которой бот торгует (включая edgeGateEnabled).
       edgeGateEnabled: get('EDGE_GATE_ENABLED', 'false') === 'true',
+      edgeMinPModelActive: get('EDGE_MIN_PMODEL_ACTIVE', 'false') === 'true',
+      edgeMinPModel: parseFloat(get('EDGE_MIN_PMODEL', '0.9')),
       edgeMargin: parseFloat(get('EDGE_MARGIN', '0.02')),
       edgeSmoothnessLookbackSec: parseInt(get('EDGE_SMOOTHNESS_LOOKBACK_SEC', '30'), 10),
       edgeWeights: {

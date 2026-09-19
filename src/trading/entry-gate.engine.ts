@@ -129,6 +129,16 @@ export interface EntryGateConfig {
   edgeWeights: EdgeWeights;
   edgeMargin: number;
   edgeSmoothnessLookbackSec: number;
+  // Сессия 20: режим edge-гейта.
+  //  - edgeMinPModelActive=false (дефолт) — VALUE-гейт: пускаем, если
+  //    p_model > implied_price + edgeMargin (перевес над рынком). На ¢90-99
+  //    структурно режет почти всё (p_model не может побить ¢99) — см. разбор.
+  //  - edgeMinPModelActive=true — CONFIDENCE FLOOR: пускаем, если
+  //    p_model > edgeMinPModel (абсолютный порог уверенности), без сравнения
+  //    с ценой. Отсекает только реально неуверенные входы, ¢99 при высоком
+  //    p_model пропускает. Подходит для скальпинга почти-верных исходов.
+  edgeMinPModelActive: boolean;
+  edgeMinPModel: number;
 }
 
 export interface GateResult {
@@ -325,22 +335,43 @@ export class EntryGateEngine {
     // посчитаны выше ВСЕГДА (shadow) — включение этого блока лишь решает,
     // используются ли они для реальной блокировки входа.
     if (this.cfg.edgeGateEnabled) {
-      if (diagnostics.pModelAtEntry == null || diagnostics.impliedProbAtEntry == null) {
+      if (diagnostics.pModelAtEntry == null) {
         return {
           allow: false,
           diagnostics,
           reason:
-            'Edge-гейт включён, но p_model недоступен (не хватает фич — ATR-робаст/дрейф/zone/smoothness или цены сделки) — пропуск шага.',
+            'Edge-гейт включён, но p_model недоступен (не хватает фич — ATR-робаст/дрейф/zone/smoothness) — пропуск шага.',
         };
       }
-      if (!diagnostics.edgeWouldEnter) {
-        return {
-          allow: false,
-          diagnostics,
-          reason:
-            `Edge-гейт: p_model ${diagnostics.pModelAtEntry.toFixed(3)} не превышает implied-цену ` +
-            `${diagnostics.impliedProbAtEntry.toFixed(3)} + маржу ${this.cfg.edgeMargin} — модель не видит достаточного преимущества над рынком.`,
-        };
+      if (this.cfg.edgeMinPModelActive) {
+        // CONFIDENCE FLOOR: p_model выше абсолютного порога уверенности, без сравнения с ценой.
+        if (diagnostics.pModelAtEntry <= this.cfg.edgeMinPModel) {
+          return {
+            allow: false,
+            diagnostics,
+            reason:
+              `Edge-floor: p_model ${diagnostics.pModelAtEntry.toFixed(3)} ниже порога уверенности ` +
+              `${this.cfg.edgeMinPModel} — модель недостаточно уверена в исходе, пропуск шага.`,
+          };
+        }
+      } else {
+        // VALUE-гейт (как было): p_model должен побить цену + маржу.
+        if (diagnostics.impliedProbAtEntry == null) {
+          return {
+            allow: false,
+            diagnostics,
+            reason: 'Edge-гейт (value-режим) включён, но цена сделки недоступна — пропуск шага.',
+          };
+        }
+        if (!diagnostics.edgeWouldEnter) {
+          return {
+            allow: false,
+            diagnostics,
+            reason:
+              `Edge-гейт: p_model ${diagnostics.pModelAtEntry.toFixed(3)} не превышает implied-цену ` +
+              `${diagnostics.impliedProbAtEntry.toFixed(3)} + маржу ${this.cfg.edgeMargin} — модель не видит достаточного преимущества над рынком.`,
+          };
+        }
       }
     }
 

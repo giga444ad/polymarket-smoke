@@ -193,6 +193,8 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
   private minZoneRatio: number;
   // Сессия 18 — см. edge-score.util.ts.
   private edgeGateEnabled: boolean;
+  private edgeMinPModelActive: boolean;
+  private edgeMinPModel: number;
   private edgeWeights: EdgeWeights;
   private edgeMargin: number;
   private edgeSmoothnessLookbackSec: number;
@@ -419,6 +421,8 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
     // считается и логируется всегда (shadow), но реальный вход блокирует
     // только при явном EDGE_GATE_ENABLED=true. ---
     this.edgeGateEnabled = this.config.get<string>('EDGE_GATE_ENABLED', 'false') === 'true';
+    this.edgeMinPModelActive = this.config.get<string>('EDGE_MIN_PMODEL_ACTIVE', 'false') === 'true';
+    this.edgeMinPModel = parseFloat(this.config.get<string>('EDGE_MIN_PMODEL', '0.9'));
     this.edgeMargin = parseFloat(this.config.get<string>('EDGE_MARGIN', '0.02'));
     this.edgeSmoothnessLookbackSec = parseInt(this.config.get<string>('EDGE_SMOOTHNESS_LOOKBACK_SEC', '30'), 10);
     this.edgeWeights = {
@@ -445,6 +449,8 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
         edgeWeights: this.edgeWeights,
         edgeMargin: this.edgeMargin,
         edgeSmoothnessLookbackSec: this.edgeSmoothnessLookbackSec,
+        edgeMinPModelActive: this.edgeMinPModelActive,
+        edgeMinPModel: this.edgeMinPModel,
       },
       this.priceFeed,
     );
@@ -526,7 +532,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
           .join('; ') +
         `. ` +
         `ATR-гейт входа: ${this.entryFilterEnabled ? `ВКЛЮЧЁН (мин. ${this.minDistanceAtrRatio}x ATR, при недоступной диагностике — пропуск шага, не вход вслепую)` : 'выключен (только диагностика в логах)'}. ` +
-        `Edge-модель (Сессия 18): p_model считается всегда (shadow); как ГЕЙТ ${this.edgeGateEnabled ? `ВКЛЮЧЕНА — маржа ${this.edgeMargin}, веса bias=${this.edgeWeights.bias}/z=${this.edgeWeights.z}/drift=${this.edgeWeights.drift}/zone=${this.edgeWeights.zone}/smooth=${this.edgeWeights.smoothSigned} (ВНИМАНИЕ: веса ручные, не откалиброваны на истории)` : 'выключена (EDGE_GATE_ENABLED=false — реальные входы не блокирует)'}. `,
+        `Edge-модель (Сессия 18): p_model считается всегда (shadow); как ГЕЙТ ${this.edgeGateEnabled ? `ВКЛЮЧЕНА в режиме ${this.edgeMinPModelActive ? `CONFIDENCE-FLOOR (p_model > ${this.edgeMinPModel})` : `VALUE (p_model > цена + маржа ${this.edgeMargin})`}, веса bias=${this.edgeWeights.bias}/z=${this.edgeWeights.z}/drift=${this.edgeWeights.drift}/zone=${this.edgeWeights.zone}/smooth=${this.edgeWeights.smoothSigned}` : 'выключена (EDGE_GATE_ENABLED=false — реальные входы не блокирует)'}. `,
         `Доп. фильтры (Сессия 13): blackout-hours=${this.blackoutHoursFilterEnabled ? `ВКЛ (${[...this.blackoutHoursUtc].join(',') || 'список пуст'})` : 'выкл'}, ` +
         `expected-move=${this.expectedMoveFilterEnabled ? `ВКЛ (k=${this.safetyKFactor})` : 'выкл'}, ` +
         `directional-drift=${this.directionalDriftFilterEnabled ? `ВКЛ (lookback=${this.driftLookbackSec}с)` : 'выкл'}, ` +
