@@ -21,6 +21,7 @@
     "user:create": "tsx scripts/create-user.ts",
     "backtest:sweep": "tsx scripts/backtest-sweep.ts",
     "em:sweep": "tsx scripts/em-sweep.ts",
+    "sim:strategy": "tsx scripts/sim-strategy.ts",
     "test:configs": "tsx scripts/test-market-logs.ts"
   },
   "dependencies": {

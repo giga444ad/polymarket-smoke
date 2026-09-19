@@ -19,6 +19,7 @@ import { AuthModule } from './auth/auth.module';
 import { TradingModule } from './trading/trading.module';
 import { AnalyticsModule } from './analytics/analytics.module';
 import { BacktestModule } from './backtest/backtest.module';
+import { SimulatorModule } from './simulator/simulator.module';
 
 @Module({
   imports: [
@@ -69,6 +70,7 @@ import { BacktestModule } from './backtest/backtest.module';
     TradingModule,
     AnalyticsModule,
     BacktestModule,
+    SimulatorModule,
   ],
   providers: [
     {
