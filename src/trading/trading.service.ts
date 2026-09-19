@@ -291,6 +291,13 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
   // на каждый тик: грузим один раз в onModuleInit и обновляем синхронно
   // из setEnabled при PATCH с дашборда.
   private enabledByStream = new Map<string, boolean>();
+  // streamKey -> slug последнего окна, которое уже пропущено по нехватке
+  // баланса. discoveryTick повторяет попытку каждые ~1.5с для того же slug,
+  // пока не сменится интервал — без этого гварда одно застрявшее окно давало
+  // сотни WARN и skipped-строк в БД (см. боевой лог 09/18). Логируем и пишем
+  // skipped РОВНО ОДИН РАЗ на окно; поток НЕ паузим (причина обычно временная
+  // — выигрыши ещё не заклеймлены, баланс вернётся сам).
+  private balanceSkipSlug = new Map<string, string>();
   private static readonly GATE_SKIP_LOG_THROTTLE_MS = 30_000;
   private static readonly ENTRY_GATE_LOG_THROTTLE_MS = 15_000;
   // Порог "подозрительно большого" лага найденного тика от истинной границы
@@ -559,6 +566,30 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       finishedAt: null,
     });
     return this.attemptRepo.save(attempt);
+  }
+
+  /**
+   * Заводит СЛЕДУЮЩУЮ активную попытку потока со сбросом на базовый стейк —
+   * общий код для двух ситуаций в resolvePendingMarkets: слив (проигрыш) и
+   * достижение цели (completed_target). В обоих случаях предыдущая попытка
+   * уже помечена терминальным статусом и сохранена; здесь только создаём и
+   * возвращаем новую (несохранённую) на её место. targetSteps/targetProfitUsd
+   * берём из текущих ENV-дефолтов (как и было в ветке слива).
+   */
+  private buildNextAttempt(prev: Attempt, streamKey: string, baseStake: number): Attempt {
+    return this.attemptRepo.create({
+      attemptNumber: prev.attemptNumber + 1,
+      streamKey,
+      currentStep: 0,
+      targetSteps: this.targetSteps,
+      targetProfitUsd: this.targetProfitUsd,
+      realizedProfit: 0,
+      baseStake,
+      currentStake: baseStake,
+      status: 'active',
+      isSmoke: prev.isSmoke,
+      finishedAt: null,
+    });
   }
 
   /**
@@ -939,6 +970,20 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       this.logger.error(`[${streamKey}] ${slug}: нет активного Attempt для потока — пропуск окна (не должно происходить).`);
       return;
     }
+    // Страховка: торгуем ТОЛЬКО на активной попытке. Резолвер после цели/слива
+    // всегда переставляет currentAttempts на новую active-попытку, так что в
+    // норме сюда не попадаем — но если по какой-то причине здесь оказалась
+    // завершённая (completed_target/failed/closed_early), НЕ открываем окно на
+    // ней (иначе торговали бы замороженным стейком, а резолвер игнорировал бы
+    // результат). Самовосстановление произойдёт на рестарте через
+    // getOrCreateActiveAttempt.
+    if (attempt.status !== 'active') {
+      this.logger.error(
+        `[${streamKey}] ${slug}: текущая попытка #${attempt.attemptNumber} не активна (status=${attempt.status}) — ` +
+          `пропуск окна (не должно происходить: резолвер обязан был завести новую active-попытку).`,
+      );
+      return;
+    }
     const betAmount = forcedBetAmount ?? attempt.currentStake;
     const attemptId = attempt.id;
     const attemptStepNumber = attempt.currentStep + 1;
@@ -957,11 +1002,16 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
             '(лучше urgently проверить вручную, что баланс реально достаточен).',
         );
       } else if (availableUsd < required) {
+        // Анти-спам: один WARN + одна skipped-строка на окно, а не на каждый
+        // discovery-тик (см. balanceSkipSlug). Поток НЕ паузим — как только
+        // баланс вернётся (клейм/пополнение), следующее окно откроется само.
+        if (this.balanceSkipSlug.get(streamKey) === slug) return;
+        this.balanceSkipSlug.set(streamKey, slug);
         this.logger.warn(
           `[${streamKey}] ${slug}: пропуск окна — недостаточно свободного USDC на CLOB-балансе ` +
             `($${availableUsd.toFixed(2)} доступно, нужно $${required.toFixed(2)} = стейк $${betAmount.toFixed(2)} ` +
             `+ буфер $${this.minBalanceBufferUsd.toFixed(2)}). Вероятная причина — выигрыши ещё не заклеймлены ` +
-            '(см. RedeemService) либо баланс аккаунта реально исчерпан.',
+            '(см. RedeemService) либо баланс аккаунта реально исчерпан. Поток продолжит сам, когда средств хватит.',
         );
         await this.marketLogRepo.save(
           this.marketLogRepo.create({
@@ -1830,16 +1880,27 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
           closeMode === 'profit' ? attempt.realizedProfit >= attempt.targetProfitUsd : attempt.currentStep >= attempt.targetSteps;
 
         if (reachedByMode) {
+          // Цель — ПРОМЕЖУТОЧНАЯ ФИКСАЦИЯ, а не конец торговли: банкуем эту
+          // попытку (completed_target) и СРАЗУ заводим новую с базовым стейком.
+          // Поток НЕ паузим — бот продолжает работать без остановки (раньше
+          // была дыра: после цели currentAttempts держал завершённую попытку,
+          // и openMarket торговал на ней замороженным стейком, а резолвер
+          // такие шаги игнорировал — см. smoke.log 22:47, шаг застыл на 23/80).
           attempt.status = 'completed_target';
           attempt.finishedAt = new Date();
+          await this.attemptRepo.save(attempt);
           this.logger.log(
             closeMode === 'profit'
-              ? `[GOAL] [${streamKey}] Попытка #${attempt.attemptNumber} (${attempt.isSmoke ? 'smoke' : 'live'}) достигла цели по прибыли $${attempt.targetProfitUsd.toFixed(2)} (факт $${attempt.realizedProfit.toFixed(2)})!`
-              : `[GOAL] [${streamKey}] Попытка #${attempt.attemptNumber} (${attempt.isSmoke ? 'smoke' : 'live'}) дошла до ${attempt.targetSteps} шага!`,
+              ? `[GOAL] [${streamKey}] Попытка #${attempt.attemptNumber} (${attempt.isSmoke ? 'smoke' : 'live'}) достигла цели по прибыли $${attempt.targetProfitUsd.toFixed(2)} (факт $${attempt.realizedProfit.toFixed(2)})! Фиксирую и открываю новую попытку.`
+              : `[GOAL] [${streamKey}] Попытка #${attempt.attemptNumber} (${attempt.isSmoke ? 'smoke' : 'live'}) дошла до ${attempt.targetSteps} шага! Фиксирую и открываю новую попытку.`,
           );
+          const next = this.buildNextAttempt(attempt, streamKey, baseStake);
+          const saved = await this.attemptRepo.save(next);
+          this.currentAttempts.set(streamKey, saved);
+        } else {
+          await this.attemptRepo.save(attempt);
+          this.currentAttempts.set(streamKey, attempt);
         }
-        await this.attemptRepo.save(attempt);
-        this.currentAttempts.set(streamKey, attempt);
       } else {
         attempt.status = 'failed';
         attempt.finishedAt = new Date();
@@ -1849,19 +1910,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
             `(профит шага $${log.profit.toFixed(2)}, ${log.resolvedAt.toISOString()}). ${log.failReason ?? ''} Открываю новую попытку (стейк сброшен на базовый $${baseStake.toFixed(2)}).`,
         );
 
-        const next = this.attemptRepo.create({
-          attemptNumber: attempt.attemptNumber + 1,
-          streamKey,
-          currentStep: 0,
-          targetSteps: this.targetSteps,
-          targetProfitUsd: this.targetProfitUsd,
-          realizedProfit: 0,
-          baseStake,
-          currentStake: baseStake, // сброс прогрессии на базовый стейк потока
-          status: 'active',
-          isSmoke: attempt.isSmoke,
-          finishedAt: null,
-        });
+        const next = this.buildNextAttempt(attempt, streamKey, baseStake);
         const saved = await this.attemptRepo.save(next);
         this.currentAttempts.set(streamKey, saved);
       }
