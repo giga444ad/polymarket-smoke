@@ -4,6 +4,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { LessThan, Repository } from 'typeorm';
 import { Attempt } from '../entities/attempt.entity';
 import { MarketLog } from '../entities/market-log.entity';
+import { BalanceService } from '../polymarket/balance.service';
 
 // Ссылка на страницу события на Polymarket (п.2 сессии 6, см. CONTEXT.md).
 // Слаг маркета Polymarket 1-в-1 совпадает со слагом события для этих
@@ -48,6 +49,7 @@ function toTradeDto(log: MarketLog, attemptNumber?: number) {
 export class AnalyticsController {
   constructor(
     private readonly config: ConfigService,
+    private readonly balanceService: BalanceService,
     @InjectRepository(Attempt) private readonly attemptRepo: Repository<Attempt>,
     @InjectRepository(MarketLog)
     private readonly marketLogRepo: Repository<MarketLog>,
@@ -128,11 +130,33 @@ export class AnalyticsController {
       take: 20,
     });
 
+    // Кошельковые значения ТОЛЬКО в лайве (в смоуке кошелька нет). equity =
+    // истинный bankroll (кэш + позиции по рынку), cash = свободный USDC.
+    // Вычисляемый currentBankroll.live — это бухгалтерия (STARTING_BANKROLL +
+    // Σ реализованный профит); он и wallet-числа расходятся из-за
+    // незаклеймленных выигрышей/комиссий — фронт должен показывать как primary
+    // именно walletEquityUsd, а бухгалтерию оставить для сверки/атрибуции.
+    const isSmoke = this.config.get<string>('SMOKE_START', 'true') === 'true';
+    let walletEquityUsd: number | null = null;
+    let walletCashUsd: number | null = null;
+    if (!isSmoke) {
+      [walletEquityUsd, walletCashUsd] = await Promise.all([
+        this.balanceService.getPortfolioValueUsd(),
+        this.balanceService.getUsdBalance(),
+      ]);
+    }
+
     return {
       startingBankroll,
       currentBankroll: {
         smoke: Number((startingBankroll + profitByMode.smoke).toFixed(2)),
         live: Number((startingBankroll + profitByMode.live).toFixed(2)),
+      },
+      // Реальный кошелёк (лайв): equity = кэш + позиции (истинный bankroll),
+      // cash = свободный USDC. null в смоуке или при недоступности API.
+      wallet: {
+        equityUsd: walletEquityUsd != null ? Number(walletEquityUsd.toFixed(2)) : null,
+        cashUsd: walletCashUsd != null ? Number(walletCashUsd.toFixed(2)) : null,
       },
       profit: {
         smoke: Number(profitByMode.smoke.toFixed(2)),

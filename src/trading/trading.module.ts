@@ -40,6 +40,8 @@ import { PolymarketSecureClientService } from '../polymarket/secure-client.servi
     BalanceService,
     RedeemService,
   ],
-  exports: [TypeOrmModule],
+  // BalanceService экспортируется для AnalyticsModule (кошельковый equity в
+  // /analytics/summary) — единый инстанс с кэшем, без второго secure-клиента.
+  exports: [TypeOrmModule, BalanceService],
 })
 export class TradingModule {}
