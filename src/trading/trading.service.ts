@@ -57,6 +57,10 @@ interface MarketState {
   // чтобы не долбить лог на каждый WS-тик одним и тем же выводом (это и был баг со спамом).
   skippedLimitTier: LimitTier | null;
   lastMarketAttemptAt: number;
+  // In-flight-гард маркет-пути (двойная покупка при латенси, см. onBookUpdate):
+  // tryMarketBuy зовётся void'ом, positioned ставится только ПОСЛЕ await'а
+  // ордера — без этого флага сетевой спайк >800мс мог дать два FAK подряд.
+  marketInFlight: boolean;
   // Троттл и in-flight-гард для лимит-пути: placeOrReplaceLimit вызывается
   // void'ом на каждый WS-тик стакана, поэтому без этих двух защит при любой
   // ошибке постановки (rate-limit, реджект подписи) он уходил в сотни
@@ -1104,6 +1108,7 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
       restingOrder: null,
       skippedLimitTier: null,
       lastMarketAttemptAt: 0,
+      marketInFlight: false,
       lastLimitAttemptAt: 0,
       limitInFlight: false,
       closeTimer: null as any,
@@ -1240,8 +1245,18 @@ export class TradingService implements OnModuleInit, OnModuleDestroy {
 
       const now = Date.now();
       if (now - marketState.lastMarketAttemptAt < 800) continue; // не долбим биржу на каждом тике подряд
+      // In-flight-гард: пока предыдущая РЕАЛЬНАЯ маркет-покупка не завершилась,
+      // не запускаем вторую. Троттла 800мс мало: если placeMarketBuy идёт
+      // дольше (сетевой спайк), а positioned ещё не выставлен (ставится ПОСЛЕ
+      // await), следующий тик мог бы выстрелить второй FAK на ту же сторону =
+      // двойной стейк (в UI незаметно из-за суммирования позиций). Флаг
+      // снимаем в .finally, независимо от успеха/ошибки/раннего return внутри.
+      if (marketState.marketInFlight) continue;
       marketState.lastMarketAttemptAt = now;
-      void this.tryMarketBuy(marketState, oc, b);
+      marketState.marketInFlight = true;
+      void this.tryMarketBuy(marketState, oc, b).finally(() => {
+        marketState.marketInFlight = false;
+      });
       return;
     }
 
